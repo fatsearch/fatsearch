@@ -1,0 +1,5 @@
+{"total_count": 2, "incomplete_results": false, "items": [
+  {"full_name": "owner/repo", "html_url": "https://github.com/owner/repo", "description": "A repo", "stargazers_count": 12400, "pushed_at": "2026-10-01T08:00:00Z"},
+  {"full_name": "owner/bare", "html_url": "https://github.com/owner/bare", "description": null, "stargazers_count": 7, "pushed_at": "2025-01-02T00:00:00Z"},
+  {"full_name": "evil/elsewhere", "html_url": "https://evil.example/x", "description": "not a GitHub page", "stargazers_count": 1, "pushed_at": ""}
+]}

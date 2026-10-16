@@ -1,0 +1,4 @@
+# The toolchain the gate (check.sh, CI) is green on; a new rustc is a commit of its own, not a surprise.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

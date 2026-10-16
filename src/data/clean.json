@@ -1,0 +1,36 @@
+{
+  "block": [
+    "p", "div", "section", "article", "main", "ul", "ol", "li", "table", "thead", "tbody", "tfoot", "tr", "td", "th",
+    "blockquote", "pre", "dl", "dt", "dd", "figure", "figcaption", "hr", "header", "footer", "address", "details",
+    "summary", "h1", "h2", "h3", "h4", "h5", "h6", "body", "html", "nav", "aside", "form", "fieldset", "legend",
+    "caption", "center", "dialog", "menu"
+  ],
+  "drop_always": [
+    "head", "script", "style", "template", "svg", "iframe", "object", "embed", "canvas", "select", "option",
+    "input", "textarea", "math", "map"
+  ],
+  "sectioning": ["article", "aside", "main", "nav", "section"],
+  "sectioning_roles": ["article", "complementary", "main", "navigation", "region"],
+  "cookie": ["cookie", "consent", "gdpr", "onetrust", "didomi", "usercentrics", "cookiebot", "qc-cmp", "cmp-banner"],
+  "skip_link": ["login", "signin", "sign-in", "signup", "sign-up", "register", "logout", "share", "vote", "edit"],
+  "magic": [["%PDF", "pdf"], ["PK\u0003\u0004", "zip"]],
+  "text": ["text", "json", "xml"],
+  "lazy_src": ["src", "original", "hires", "lazy", "full", "large", "zoom"],
+  "filler": ["pxl", "pixel", "blank", "spacer", "placeholder", "loading", "transparent"],
+  "image_ext": ["jpg", "jpeg", "png", "webp", "gif", "avif", "bmp", "tif", "tiff", "heic", "jxl", "svg"],
+  "picture_page": ["image", "photo", "picture", "pic", "gallery", "file", "attachment", "media", "original"],
+  "not_content": ["logo", "sprite", "icon", "favicon", "badge", "avatar", "emoji"],
+  "not_content_alt": ["map", "flag"],
+  "share_card": ["og", "opengraph", "share", "social", "card"],
+  "share_host": ["og", "opengraph"],
+  "ad_slot": ["ad", "advertisement"],
+  "said": [["comment", "comments"], ["count", "total"]],
+  "tracking": ["utm_", "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "_ga"],
+  "currency": ["€", "$", "£", "EUR", "USD"],
+  "info": [
+    ["description", ["og:description", "description", "twitter:description"]],
+    ["author", ["author", "article:author", "byl", "parsely-author", "sailthru.author"]],
+    ["published", ["article:published_time", "datepublished", "date", "pubdate", "publish-date", "og:published_time", "parsely-pub-date", "sailthru.date", "dc.date", "uploaddate"]],
+    ["modified", ["article:modified_time"]]
+  ]
+}

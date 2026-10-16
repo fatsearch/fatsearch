@@ -1,0 +1,6 @@
+# Thresholds for the lints denied in Cargo.toml [lints.clippy].
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+too-many-lines-threshold = 60
+excessive-nesting-threshold = 5
+too-many-arguments-threshold = 6

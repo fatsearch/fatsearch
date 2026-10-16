@@ -1,0 +1,64 @@
+{
+ "state": "done",
+ "results": [
+  {
+   "title": "Heidelberg University",
+   "outline": [
+    "Heidelberg University – the oldest in Germany, recognized globally. A leader in science, studies, and innovation."
+   ],
+   "url": "https://www.uni-heidelberg.de/en",
+   "metadata": {
+    "position": 1
+   }
+  },
+  {
+   "title": "Universität Heidelberg",
+   "outline": [
+    "Die Universität Heidelberg – die älteste Universität Deutschlands, weltweit anerkannt. Führend in Forschung, Lehre und Innovation."
+   ],
+   "url": "https://www.uni-heidelberg.de/",
+   "metadata": {
+    "position": 2
+   }
+  },
+  {
+   "title": "Heidelberg University - Wikipedia",
+   "outline": [
+    "3 weeks ago - Heidelberg University (German: Universität Heidelberg) is a public research university, which is the oldest university in Germany, as well as one of the oldest and most prominent higher education institutions in Central and Western Europe."
+   ],
+   "url": "https://en.wikipedia.org/wiki/Heidelberg_University",
+   "metadata": {
+    "position": 3
+   }
+  },
+  {
+   "title": "Apply online! - Heidelberg University",
+   "outline": [
+    "🎓 Heidelberg University is a leading German academic institution ranked among the Top 465 universities worldwide. We are currently preparing for our next major admissions round for the 2027/2028 academic year, which opens on 1 December 2026."
+   ],
+   "url": "https://apply.example.org/",
+   "metadata": {
+    "position": 4
+   }
+  },
+  {
+   "title": "Universidad de Heidelberg - Wikipedia, la enciclopedia libre",
+   "outline": [
+    "March 29, 2026 - La Universidad de Heidelberg (en alemán: Universität Heidelberg) es la universidad más antigua de Alemania y una de las más grandes del país."
+   ],
+   "url": "https://es.wikipedia.org/wiki/Universidad_de_Heidelberg",
+   "metadata": {
+    "position": 5
+   }
+  }
+ ],
+ "params": {
+  "query": "heidelberg university",
+  "location": null,
+  "max_results": 5
+ },
+ "metadata": {
+  "timestamp": 1791786018,
+  "request_id": "1791786017172772443"
+ }
+}

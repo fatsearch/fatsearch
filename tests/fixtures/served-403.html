@@ -1,0 +1,19 @@
+<!doctype html>
+<!-- hand-written, no site markup copied: a Q&A page a provider served under a 403, 1,767 visible chars
+     (over `page_chars`), its title's words shown in the question, user links, an answer with code -->
+<html><head><title>rust - Package with both a library and a binary? - Example Q&amp;A</title><meta property="og:site_name" content="Example Q&amp;A"><meta property="og:title" content="Package with both a library and a binary?"><meta property="og:description" content="I want one Rust package that holds a library with most of the logic, and a small binary that calls it.
+
+How should the manifest look..."></head><body>Package with both a library and a binary?<a href="/questions/ask">Ask a question</a>Asked 3 years ago · Active <a href="?lastactivity">5 months ago</a> · Seen 12k times<a href="/posts/1000/votes"></a>Votes: 42<p>I want one Rust package that holds a library with most of the logic, and a small binary that calls it, so that other projects can use the library while I still ship a command line tool.</p><p>If I read the module docs right, both can live in one package. What should my<code>Cargo.toml</code>file look like, and where do the two source files go?</p><ul><li><a href="/questions/tagged/rust">rust</a></li><li><a href="/questions/tagged/rust-cargo">rust-cargo</a></li></ul><a href="/q/1000">Share</a>Link to this question<a href="/posts/1000/edit">Edit</a>Follow this question<a href="/posts/1000/revisions">edited 2 years ago</a><a href="/users/1/example-editor">Example Editor</a>1,200 points · asked 3 years ago<a href="/users/2/example-asker">Example Asker</a>3,400 points<a href="#">Add a comment</a><h2>3 Answers</h2>Sorted by: <a href="?tab=votes#tab-top">Votes</a>Votes (default) · Newest first · Oldest first<a></a>Votes: 40 · Accepted<a href="/posts/1001/votes"></a><p>Yes. Cargo builds a library from the lib file and a binary from the bin file of the same package; the layout below is all you need.</p><pre><code>$ ls -R
+Cargo.toml src/lib.rs src/main.rs</code></pre><p>Cargo.toml:</p><pre><code>[package]
+name = "mything"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mylib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mybin"
+path = "src/main.rs"</code></pre><p>src/lib.rs:</p><pre><code>pub fn greet() { println!("Hello from the library"); }</code></pre><p>src/main.rs:</p><pre><code>use mylib::greet;
+fn main() { greet(); }</code></pre><p>With the default paths you can even leave both tables out: a lib file and a main file in the same source folder are found on their own, and the binary takes the package name.</p><a href="/a/1001">Share</a>Link to this answer<a href="/posts/1001/edit">Edit</a><a href="/users/3/example-answerer">Example Answerer</a>8,900 points · answered 3 years ago<a></a>Votes: 7<p>One more thing to know: the binary only sees the public items of the library, the same way any other package would, so keep the binary small and put the logic you want to test in the library. Integration tests in the tests folder can then call the library directly.</p><a href="/a/1002">Share</a><a href="/users/4/example-helper">Example Helper</a>640 points · answered 2 years ago</body></html>

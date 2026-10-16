@@ -1,0 +1,80 @@
+# cargo-deny policy (https://embarkstudios.github.io/cargo-deny/). Run: cargo deny check
+[graph]
+all-features = true
+
+[advisories]
+# every RustSec advisory (vulnerable, unmaintained, unsound, yanked) fails the check
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # ttf-parser (unmaintained, no known vulnerability) comes in only through pdf_oxide's font handling;
+    # no maintained drop-in exists for pdf_oxide to switch to. Revisit when pdf_oxide moves off it.
+    { id = "RUSTSEC-2026-0192", reason = "transitive via pdf_oxide, unmaintained only" },
+    # zip-rs yanked the whole 8.x line (no advisory, no yank message). office_oxide 0.1.9, the one pdf_oxide 0.3.78
+    # accepts, needs ^8.6; 0.1.15 (2026-10-15) moved to zip 9 and clears the 7-day cooldown on 2026-10-22: try it then.
+    { crate = "zip@8.6.0", reason = "yanked 8.x line, pinned through pdf_oxide 0.3.78; revisit 2026-10-22" },
+]
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "CC0-1.0", "ISC",
+  "Unicode-3.0", "Unicode-DFS-2016", "Zlib", "MPL-2.0"]
+confidence-threshold = 0.9
+# the list is policy for future deps, not an inventory of today's
+unused-allowed-license = "allow"
+# Mozilla's root CA list as data (via wreq's `webpki-roots` feature); scoped to that crate only
+exceptions = [{ crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] }]
+
+[bans]
+# a second copy of a crate fails; each one below is today's, with who holds the old one (re-check on a bump)
+multiple-versions = "deny"
+wildcards = "deny"
+# ONE TLS stack: btls / btls-sys (BoringSSL, via wreq). A second one is a second attack surface and binary.
+deny = [
+    { crate = "openssl-sys", reason = "TLS is btls-sys (BoringSSL via wreq), one stack only" },
+    { crate = "openssl", reason = "TLS is btls-sys (BoringSSL via wreq), one stack only" },
+    { crate = "native-tls", reason = "TLS is btls-sys (BoringSSL via wreq), one stack only" },
+    { crate = "rustls", reason = "TLS is btls-sys (BoringSSL via wreq), one stack only" },
+    { crate = "aws-lc-sys", reason = "TLS is btls-sys (BoringSSL via wreq), one stack only" },
+    { crate = "ring", reason = "TLS is btls-sys (BoringSSL via wreq), one stack only" },
+    { crate = "boring-sys", reason = "TLS is btls-sys (BoringSSL via wreq), one stack only" },
+]
+skip = [
+    # wreq-util 0.2.0 compresses with brotli 8 / zstd 0.13; compression-codecs and pdf_oxide with brotli 9 / zstd 0.14
+    { crate = "brotli@8.0.4", reason = "wreq-util 0.2.0" },
+    { crate = "brotli-decompressor@5.0.3", reason = "brotli 8 (wreq-util 0.2.0)" },
+    { crate = "alloc-no-stdlib@2.0.4", reason = "brotli 8 (wreq-util 0.2.0)" },
+    { crate = "alloc-stdlib@0.2.4", reason = "brotli 8 (wreq-util 0.2.0)" },
+    { crate = "zstd@0.13.3", reason = "wreq-util 0.2.0" },
+    { crate = "zstd-safe@7.3.0", reason = "zstd 0.13 (wreq-util 0.2.0)" },
+    # image's tiff/gif/png lag pdf_oxide 0.3.78's codecs
+    { crate = "fax@0.2.7", reason = "tiff 0.11.3 (image); pdf_oxide on 0.3" },
+    { crate = "weezl@0.1.12", reason = "gif 0.14.2, tiff 0.11.3 (image); pdf_oxide on 0.2" },
+    { crate = "miniz_oxide@0.8.9", reason = "png 0.18.1 (image); flate2 on 0.9" },
+    # html5ever 0.39 (web_atoms, string_cache) is on phf 0.13; pdf_oxide on 0.14
+    { crate = "phf@0.13.1", reason = "web_atoms 0.2.6 (html5ever)" },
+    { crate = "phf_generator@0.13.1", reason = "phf_codegen, string_cache_codegen (html5ever)" },
+    { crate = "phf_shared@0.13.1", reason = "phf 0.13 (html5ever)" },
+    { crate = "quick-xml@0.41.0", reason = "office_oxide 0.1.9, held for pdf_oxide 0.3.78 (Cargo.toml)" },
+    # build time only: bindgen (btls-sys's bindings) and openssl-macros lag cc and syn 3
+    { crate = "nom@7.1.3", reason = "cexpr 0.6 (bindgen, build of btls-sys)" },
+    { crate = "shlex@1.3.0", reason = "bindgen 0.72.1; cc on 2" },
+    { crate = "syn@2.0.119", reason = "bindgen, openssl-macros, phf_macros, tracing-attributes, … (proc-macros); serde on 3" },
+]
+
+# Build-time code is allowed by name: a NEW crate with a build.rs fails here until it is reviewed and listed
+# (all targets: the Windows/wasm ones count too). `executables` (binaries shipped in a build crate) is left to
+# review, not this list.
+[bans.build]
+executables = "allow"
+allow-build-scripts = [
+    "bindgen", "blake3", "btls-sys", "clang-sys", "crc32fast", "crossbeam-deque", "crossbeam-epoch", "crossbeam-utils",
+    "crunchy", "encoding_rs", "getrandom", "httparse", "iana-time-zone-haiku",
+    "icu_normalizer_data", "icu_properties_data", "libc", "num-traits", "parking_lot_core", "portable-atomic",
+    "portable-atomic-util", "proc-macro2", "pulldown-cmark", "quote", "rayon-core", "ref-cast", "rmcp", "rustversion",
+    "serde", "serde_core", "serde_json", "slotmap", "thiserror", "wasm-bindgen", "wasm-bindgen-shared", "web_atoms",
+    "winapi", "winapi-i686-pc-windows-gnu", "winapi-x86_64-pc-windows-gnu", "zerocopy", "zmij", "zstd-safe", "zstd-sys",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

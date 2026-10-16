@@ -1,0 +1,7 @@
+{
+ "status_code": 200,
+ "headers": {
+  "content-type": "application/json"
+ },
+ "body": "{\"general\": {\"search_engine\": \"google\", \"query\": \"pizza delivery\", \"detected_query\": \"pizza delivery\", \"results_cnt\": 432000000, \"search_time\": 0.36, \"language\": \"en\", \"country_code\": \"US\", \"location\": \"United States\", \"gl\": \"US\", \"mobile\": false, \"basic_view\": false, \"search_type\": \"text\", \"page_title\": \"pizza delivery - Google Search\", \"timestamp\": \"2026-10-12T06:19:18.494Z\"}, \"organic\": [{\"link\": \"https://pizza.example.com/delivery-springfield\", \"source\": \"Example Pizzeria\", \"title\": \"Pizza Delivery in Springfield\", \"description\": \"Example Pizzeria offers fast pizza delivery in Springfield. Call (555) 010-0000 to order now and enjoy delicious, hot pizza at your doorstep.\", \"rank\": 1, \"global_rank\": 4}, {\"link\": \"https://locations.pizzahut.com/ca/san-diego/pizza-delivery\", \"source\": \"Pizza Hut\", \"title\": \"Pizza Delivery in San Diego, CA\", \"description\": \"Order Delivery in San Diego, CA for hot and fresh pizza, pasta, wings, pasta and more. Start your delivery order today!\", \"rank\": 2, \"global_rank\": 5}, {\"link\": \"https://www.papajohns.com/\", \"source\": \"Papa John's\", \"title\": \"Papa Johns Pizza Delivery & Carryout - Best Deals on Pizza ...\", \"description\": \"Enjoy the ease of ordering delicious pizza for delivery or carryout from a Papa Johns near you. Start tracking the speed of your delivery and earn rewards ...\", \"rank\": 3, \"global_rank\": 10}]}"
+}

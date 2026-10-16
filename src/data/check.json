@@ -1,0 +1,34 @@
+{
+  "rules": [
+    {"on": "header", "under": null, "code": "cloudflare_wall", "any": ["cf-mitigated: challenge"]},
+    {"on": "html", "under": 1500, "code": "cloudflare_wall", "any": [
+      "<title>just a moment...", "<title>attention required! | cloudflare", "cf-chl-", "cf_chl_opt",
+      "challenges.cloudflare.com"
+    ]},
+    {"on": "header", "under": 1500, "code": "captcha_wall", "any": ["x-datadome", "server: datadome", "x-px", "x-amzn-waf-action"]},
+    {"on": "html", "under": 1500, "code": "captcha_wall", "any": [
+      "captcha-delivery.com", "px-captcha", "access to this page has been denied", "g-recaptcha", "hcaptcha",
+      "are you a robot", "robot or human", "verify you are human", "verify you are a human",
+      "unusual traffic from your computer", "type the characters you see", "ar jus ne robotas", "awswaf",
+      "challenge.js", "complete the following challenge", "prove your humanity", "prove you are human",
+      "enable javascript and cookies", "js_challenge"
+    ]},
+    {"on": "status", "under": null, "code": "", "any": []},
+    {"on": "text", "under": 4000, "code": "consent_wall", "any": ["before you continue"]}
+  ],
+  "stop": [
+    "the", "and", "for", "with", "from", "this", "that", "your", "you", "are", "was", "were", "have", "has", "will",
+    "not", "but", "all", "our", "about", "into", "what", "when", "how", "why", "who", "more", "page", "home",
+    "official", "site", "online", "free", "best", "new", "buy", "sale", "shop", "store", "per", "kaina",
+    "access", "denied", "forbidden", "error", "blocked", "sorry", "just", "moment", "attention", "required",
+    "captcha", "robot", "human", "verify", "verification", "unavailable", "before", "continue"
+  ],
+  "js_needed": [
+    "enable javascript", "javascript is disabled", "javascript is required", "javascript is not enabled",
+    "requires javascript", "turn on javascript", "please enable js", "without javascript", "ijunkite javascript"
+  ],
+  "render_first": ["cloudflare_wall", "js_shell", "serp_empty", "login_wall"],
+  "no_js_first": ["captcha_wall"],
+  "one_render": ["login_wall"],
+  "sign_in": ["login", "signin", "sign_in", "authenticate", "oauth", "sso"]
+}

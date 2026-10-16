@@ -1,0 +1,3 @@
+max_width = 120
+use_small_heuristics = "Max"
+short_array_element_width_threshold = 40

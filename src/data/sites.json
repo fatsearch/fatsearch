@@ -1,0 +1,15 @@
+{
+  "gov": ["gov", "mil", "gouv", "gob", "go", "govt", "gv"],
+  "doc_ext": [
+    [".pdf", "pdf"], [".zip", "zip"], [".docx", "zip"], [".xlsx", "zip"], [".pptx", "zip"],
+    [".txt", "text"], [".csv", "text"], [".md", "text"], [".json", "json"], [".xml", "xml"]
+  ],
+  "pdf_path": ["/pdf/"],
+  "sld": [
+    "ac", "co", "com", "edu", "go", "gob", "gouv", "gov", "govt", "gv", "ltd", "mil", "ne", "net", "nhs", "or", "org",
+    "plc", "sch"
+  ],
+  "shared": [
+    "github.io", "netlify.app", "vercel.app", "pages.dev", "blogspot.com"
+  ]
+}

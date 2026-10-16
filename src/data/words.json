@@ -1,0 +1,33 @@
+{
+  "reserved": [
+    "more", "up", "all", "full", "json", "guide", "stats", "links", "config", "account", "status", "version",
+    "routes", "setup", "media", "comments", "cards"
+  ],
+  "lists": ["links", "cards"],
+  "alone": ["status", "version", "routes", "setup", "account", "guide"],
+  "aliases": [
+    ["help", "guide"], ["ls", "status"], ["stat", "stats"], ["-V", "version"], ["login", "setup"], ["auth", "setup"],
+    ["signin", "setup"], ["sign-in", "setup"], ["keys", "setup"], ["key", "setup"], ["credentials", "setup"],
+    ["commands", "guide"], ["balance", "account"], ["usage", "account"], ["spend", "account"],
+    ["credits", "account"]
+  ],
+  "elsewhere": [
+    ["logout signup register init doctor whoami exit quit", " is not a fats command · keys: {b} setup · status: {b}"],
+    ["install update upgrade", ": see docs/installation.md in the repo · {b} guide"]
+  ],
+  "verbs": ["read", "open", "get", "grep", "fetch", "search", "filter", "find"],
+  "keys": [
+    "limit", "match", "country", "js", "cost", "fresh", "dry", "json", "fetch", "timeout", "since", "site", "max",
+    "verbose", "provider", "max_bytes", "hedge", "device",
+    "wait", "zone", "from"
+  ],
+  "bools": ["js", "fresh", "dry", "json", "verbose"],
+  "commands": ["stats", "config", "account", "guide", "status", "version", "routes", "setup", "fetch"],
+  "led": ["mcp", "help"],
+  "doc_ext": ["html", "htm", "xhtml", "pdf", "docx"],
+  "media": ["image", "images", "img", "photo", "photos", "picture", "pictures", "pic", "pics", "video", "videos"],
+  "stop": [
+    "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "was", "what", "how", "much", "does",
+    "do", "this", "that", "which", "who", "when", "where", "with", "page", "kiek", "koks", "kokia", "ar"
+  ]
+}

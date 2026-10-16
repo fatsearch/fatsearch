@@ -1,0 +1,54 @@
+# Changelog
+
+All notable changes to `fats` are in this file. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+versions: [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Numbers come from my own runs on one Apple
+Silicon Mac, one run each unless a range is given; provider results move run to run.
+Method: [docs/benchmarks.md](docs/benchmarks.md).
+
+## 0.1.0 - 2026-10-17
+
+First public release.
+
+### Added
+- `fats <url>`: fetch, clean, outline. One `=` line (title, place, counts, tokens, how it was fetched, what it
+  cost), then numbered sections (`u1#3`) the agent reads on demand. Every page is cached; later reads are free.
+- Fetch ladder: plain request first, then Oxylabs (no JS, then JS) and Bright Data. Any one provider key works;
+  with both, the cheaper route goes first. `wait:N`, `timeout:N`, `fresh:true`, `country:xx`, `device:mobile`, `json`.
+- Readers: HTML and PDF (one section per page). Pictures and videos are counted on the `=` line; pixels on request.
+  Office files are stored, not read yet.
+- Honesty: a `!` line names what is missing and the next free move; a render that failed is not offered again;
+  the price glyph `≤$X` is the worst case; nothing is dropped silently.
+- `fats mcp`: stdio MCP server, one tool `fats(cmd)`, ~60-token card. `fats setup` finds, checks and saves keys
+  (mode 600). `fats stats`, `fats config`, `fats guide`, `--dry`.
+- One static binary, ~17 MB, ~4 ms start. No daemon, no browser, no telemetry.
+- Command aliases, all free: `login`, `keys`, `auth` run `fats setup`; `?`, `commands` print the guide;
+  `balance`, `usage`, `spend`, `credits` run `fats account`. Words of other tools (`whoami`, `logout`, `install`,
+  `upgrade`, …) get a `!` line naming the right command, rc 2.
+- Discussion threads: `fats uN comments` lists the top-level comments, most replies first, one row each
+  (`uN#k · replies N · <text>`). `fats uN#k` opens one comment with its direct replies; `uN#k full` reads its
+  whole tree. The outline footer says how many comments this copy served; `N of M comments served` appears only
+  when the page itself states its total, never as a guess. `--help` stays the same card, under 500 bytes.
+- `fats gh <login>` lists that account's repositories by stars, not only repos that mention the name.
+- `fats stats` adds one spend line over all sessions (last 24 h and all time, unverified cuts apart). The ledger
+  sits beside the keys, holds a time and a price per paid record, never a URL or a query, and is never swept.
+
+### Changed
+- Default `wait:` is 30 s (was 5 s): most walled renders finish inside it. A run still going reads `pending`
+  with its free next move (`→ fats uN wait:30`).
+- `timeout:N` is one wall for every call of a command, the plain request included.
+- A batch of URLs runs at most 4 at once; ids are given in input order, `dry:true` prints the same ids, and a URL
+  given twice is fetched once (its second row says `same as above`).
+- The cache lives in the OS cache dir (`~/Library/Caches/fatsearch` on macOS, `~/.cache/fatsearch` on Linux,
+  the local app-data dir on Windows; `FATS_CACHE` overrides it, but not with an empty, relative, `/` or home path).
+  A page is kept 30 min after its last read and at most 60 min after its fetch; a swept id says so and names the
+  refetch. Only a dir fats made itself is ever swept.
+- `limit:N` sets both the results a search fetches and the rows shown, at most 20 rows within the read cap; a
+  larger N says it was capped.
+
+### Fixed
+- An unknown flag (`--login`, `-x`, `rust --fast`) is refused with a `!` line and never becomes a paid web search.
+  Beside an id or a file a dash word is a free filter (`fats u1 -n`). A dash inside a phrase is kept as typed.
+- A run whose process died reads `! abandoned` in `fats jN`, in its page read and in `stats`, with what it spent
+  and a priced next move.
+- A page that moves to a sign-in page is judged by whole words of its new address (`login`, `sign_in`, `oauth`,
+  `sso`, …), so `/authors` or `/docs/authentication` is not a wall; a real sign-in wall is rendered once, not twice.

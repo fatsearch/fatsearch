@@ -1,0 +1,110 @@
+[package]
+name = "fatsearch"
+version = "0.1.0"
+edition = "2024"
+# pinned to rust-toolchain.toml; the oldest toolchain that builds this tree has not been measured yet
+rust-version = "1.99"
+description = "Web pages and documents turned into small, clean, cached Markdown for AI agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fatsearch/fatsearch"
+homepage = "https://fatsearch.com"
+readme = "README.md"
+keywords = ["markdown", "scraping", "llm", "mcp", "cli"]
+categories = ["command-line-utilities", "text-processing", "web-programming::http-client"]
+# Dev-only files: the gate, CI and maintainer scripts. Tests and their fixtures ship.
+exclude = ["/.github/", "/scripts/", "/check.sh"]
+
+# The library keeps the short name the binary has (`use fats::…`); the package is `fatsearch`.
+[lib]
+name = "fats"
+
+[[bin]]
+name = "fats"
+path = "src/main.rs"
+
+[dependencies]
+# Every dependency is pinned with `=` at its Cargo.lock version: a bump is a commit of its own (and passes
+# scripts/cooldown.py), never a side effect of `cargo update`.
+# `fats mcp` image content is base64. Already in the tree via pdf_oxide and rmcp.
+base64 = "=0.23.1"
+blake3 = "=1.8.7"
+# `since:` and the account month: days → a calendar date. Already in the tree via rmcp and pdf_oxide.
+chrono = { version = "=0.4.45", default-features = false, features = ["alloc"] }
+dirs = "=7.0.0"
+# Charset decoding (WHATWG labels, BOM, windows-1250 & co.); already in the tree via wreq and pdf_oxide.
+encoding_rs = "=0.8.42"
+html5ever = "=0.39.0"
+# `fats u3 m1`: a picture's real size from its header; `fats mcp` downscales it to what Claude views. Already in
+# the tree via pdf_oxide (png, jpeg); webp and gif (pure Rust, image-rs) are what this adds.
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# The body trait wreq's Response implements: read a response frame by frame and stop at the size cap
+# (wreq 0.16 has no `chunk()`). Already in the tree via wreq.
+http-body = "=1.1.0"
+# A page's `info` and JSON-LD objects keep document order (a key set again keeps its first place).
+indexmap = { version = "=2.14.2", features = ["serde"] }
+# A server's own Markdown (`text/markdown`, Cloudflare's Markdown for Agents) → HTML for the page cleaner.
+pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
+# PDF text per page. No OCR/ML/rendering features; `legacy-crypto` opens RC4/AES-128 password-less PDFs.
+# Cargo.lock keeps its office_oxide at 0.1.9, the version pdf_oxide 0.3.78 ships with (0.1.13 does not
+# compile with it): after any `cargo update`, run `cargo update -p office_oxide --precise 0.1.9`.
+pdf_oxide = { version = "=0.3.78", default-features = false, features = ["legacy-crypto"] }
+# Size words and the end of a picture's file name in its URL (`clean::key_of`). Already in the tree via pdf_oxide.
+regex = "=1.13.1"
+# `fats mcp`: the official MCP SDK, stdio server only (no macros, no HTTP, no auth).
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io"] }
+# Percent-decoding a link before `links <words>` matches it (already in the tree through `url`).
+percent-encoding = "=2.3.2"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.152", features = ["float_roundtrip", "preserve_order"] }
+# Typo distance for command words (optimal string alignment).
+strsim = "=0.11.1"
+# Network: wreq (BoringSSL, browser TLS/HTTP2 settings), tokio only for its current-thread runtime + timers.
+tokio = { version = "=1.53.2", default-features = false, features = ["rt", "time"] }
+url = "=2.5.8"
+# Browser profiles for wreq (same author); the `emulation` feature carries the certificate decompressors.
+wreq-util = { version = "=0.2.0", default-features = false, features = ["emulation", "emulation-compression"] }
+wreq = { version = "=0.16.1", default-features = false, features = ["webpki-roots", "tokio-rt", "gzip", "brotli", "deflate", "zstd"] }
+
+[features]
+# `provider::fake`: an in-process stand-in for the provider APIs, for tests/redact.rs only. Off in every shipped build.
+fake = []
+
+[[test]]
+name = "redact"
+required-features = ["fake"]
+
+[[test]]
+name = "wait"
+required-features = ["fake"]
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# no symbol table in the shipped binary (-3 MB, same startup, measured). panic stays
+# `unwind`: cache::guarded, fetch::landed and `fats mcp` turn a panic into a record, abort would kill the process.
+strip = "symbols"
+
+# Anti-spaghetti lints. A warning fails only the gate (check.sh and CI set `CARGO_BUILD_WARNINGS=deny`), never
+# a user's `cargo build` on a newer rustc. Thresholds: clippy.toml.
+# A real exception is `#[expect(lint, reason = "…")]`, never a bare `#[allow]`.
+[lints.rust]
+# `forbid` in src/lib.rs and src/main.rs (shipped code); tests/redact.rs sets the env once with a reasoned `expect`.
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+too_many_lines = "deny"
+excessive_nesting = "deny"
+too_many_arguments = "deny"
+let_underscore_must_use = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+many_single_char_names = "deny"
+fn_params_excessive_bools = "deny"
+cast_lossless = "deny"
+needless_pass_by_value = "deny"
+redundant_else = "deny"
+manual_let_else = "deny"

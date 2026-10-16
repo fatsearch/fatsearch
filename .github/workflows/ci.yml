@@ -1,0 +1,57 @@
+# THE gate, `./check.sh full` (fmt, clippy both feature sets, nextest, line budget, cargo deny, the release build, no
+# fake hook, binary size), on every push and pull request. The cooldown check needs crates.io, so check.sh skips it
+# offline and the `cooldown` job below runs it with the network. Actions are pinned by commit SHA (tag in
+# the comment). The tools come prebuilt (install-action) and the build is cached (rust-cache): compiling
+# cargo-deny and nextest from source cost 5 min per run. Everything is fetched first (crates, the advisory
+# database); then the gate runs with
+# CARGO_NET_OFFLINE (cargo itself fetches nothing) AND inside scripts/nonet.sh (no network but loopback), because
+# offline cargo alone does not stop a build script or proc-macro from opening a socket.
+# nonet.sh: macOS = sandbox-exec (verified locally); Linux = a root network namespace (untested until this runs).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # both OSes report; one red must not cancel the other's verdict
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: 1.99.0 # = rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28, prebuilt binaries
+        with:
+          tool: cargo-nextest@0.9.148,cargo-deny@0.20.2
+      - run: cargo fetch --locked && cargo deny fetch
+      - run: scripts/nonet.sh ./check.sh full
+        env:
+          CARGO_NET_OFFLINE: "true"
+  cooldown:
+    # every crate Cargo.lock gained must be ≥ 7 days on crates.io (scripts/cooldown.py), unless waived in a commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: cooldown, with the network
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # a push that creates the branch has no `before` (all zeros): compare with the repository's first commit
+          if [ -z "${BASE//0/}" ]; then BASE=$(git rev-list --max-parents=0 HEAD | tail -n 1); fi
+          if [ "$BASE" = "$(git rev-parse HEAD)" ]; then
+            echo "::notice::cooldown not checked: the first commit has no earlier Cargo.lock to compare with"
+            exit 0
+          fi
+          COOLDOWN_BASE=$BASE python3 scripts/cooldown.py

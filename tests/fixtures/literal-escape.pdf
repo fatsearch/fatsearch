@@ -1,0 +1,56 @@
+%PDF-1.4
+%‚„œ”
+% this file holds the text \x9c literally, as Oxylabs would escape a byte
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 9 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 70 >>
+stream
+BT /F1 12 Tf 72 720 Td (Page one: the walled report starts here) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 9 0 R >> >> >>
+endobj
+6 0 obj
+<< /Length 69 >>
+stream
+BT /F1 12 Tf 72 720 Td (Page two: methods and numbers 42 \\x48) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources << /Font << /F1 9 0 R >> >> >>
+endobj
+8 0 obj
+<< /Length 65 >>
+stream
+BT /F1 12 Tf 72 720 Td (Page three: the conclusion, signed) Tj ET
+endstream
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000089 00000 n 
+0000000138 00000 n 
+0000000207 00000 n 
+0000000333 00000 n 
+0000000453 00000 n 
+0000000579 00000 n 
+0000000698 00000 n 
+0000000824 00000 n 
+0000000939 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+1009
+%%EOF
