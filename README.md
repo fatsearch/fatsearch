@@ -68,6 +68,7 @@ One static binary. **17 MB.** Starts in **4 ms.** No daemon, no browser, no tele
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fatsearch/fatsearch/releases/latest/download/fatsearch-installer.sh | sh
+npm i -g fatsearch                 # or npm ❓ (not published yet): the same release binary
 cargo install --locked --path .    # or from a clone: Rust 1.99, cmake + C compiler + libclang (BoringSSL)
 fats guide                         # the one-screen cheat sheet
 fats setup                         # finds, checks, and saves your provider keys
@@ -103,6 +104,8 @@ codex mcp add fats -- fats mcp
 
 The tool is `fats(cmd)` — same commands as the CLI. The card is ~60 tokens.
 An agent that knows `fats u1#3` knows the whole tool.
+
+MCP Registry name: `mcp-name: io.github.fatsearch/fats`
 
 ## What it reads
 

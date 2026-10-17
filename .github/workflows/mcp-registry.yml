@@ -1,0 +1,38 @@
+# Lists the release in the MCP Registry (registry.modelcontextprotocol.io) from server.json once the Release workflow
+# (release.yml, a tag push) is done. Not `release: published`: release.yml creates the release with GITHUB_TOKEN, and
+# events made with that token start no workflow. Login = GitHub OIDC (the registry grants io.github.fatsearch to
+# this org's workflows), no secret. A package whose version is not live (crates.io is published by hand; npm needs
+# `mcpName` in its package.json) is left out with a notice, so the registry's ownership check cannot fail on it.
+name: MCP Registry
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+permissions: {}
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.event == 'push' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    env:
+      TAG: ${{ github.event.workflow_run.head_branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: |
+          curl -fsSL -o p.tgz https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz
+          echo "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc  p.tgz" | sha256sum -c && tar xzf p.tgz mcp-publisher
+          v=$(jq -r .version server.json) && name=$(jq -r .name server.json) && keep='[]'
+          [ "v$v" = "$TAG" ] || { echo "::error::server.json is $v, the release is $TAG" && exit 1; }
+          for p in $(jq -r '.packages[] | .registryType + ":" + .identifier' server.json); do
+            case $p in
+              cargo:*) curl -fsS -o /dev/null -A fatsearch-mcp-registry "https://crates.io/api/v1/crates/${p#*:}/$v" ;;
+              npm:*) [ "$(npm view "${p#*:}@$v" mcpName 2> /dev/null)" = "$name" ] ;;
+            esac && keep=$(jq -c --arg t "${p%%:*}" '. + [$t]' <<< "$keep") || echo "::notice::${p%%:*} ${p#*:}@$v is not live: left out"
+          done
+          jq --argjson k "$keep" '.packages |= map(select(.registryType as $t | $k | index($t)))' server.json > s.json
+          [ "$(jq '.packages | length' s.json)" -gt 0 ] || { echo "::error::no package of $v is live" && exit 1; }
+          ./mcp-publisher login github-oidc && ./mcp-publisher publish s.json

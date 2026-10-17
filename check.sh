@@ -88,10 +88,20 @@ binary_size() {
     [ "$size" -le $((rec * 105 / 100)) ]
 }
 
+server_json() {
+    # server.json (the MCP registry entry) names the crate's version at the top and in every package: a release
+    # bumps it with Cargo.toml (nothing generates it)
+    local v
+    v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+    echo "Cargo.toml $v · server.json: $(grep -o '"version": "[^"]*"' server.json | tr '\n' ' ')"
+    [ -n "$v" ] && ! grep -o '"version": "[^"]*"' server.json | grep -vqx "\"version\": \"$v\""
+}
+
 gate fmt cargo fmt --check
 gate clippy-fake cargo clippy --locked --all-targets --features fake
 gate test cargo nextest run --locked --features fake --no-fail-fast
 gate linebudget python3 scripts/linebudget.py
+gate server-json server_json
 if [ "$mode" = full ]; then
     gate clippy cargo clippy --locked --all-targets
     # CARGO_NET_OFFLINE set (CI, after `cargo deny fetch`): the advisory database already on disk

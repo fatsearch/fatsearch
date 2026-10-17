@@ -9,7 +9,7 @@ members = ["cargo:."]
 cargo-dist-version = "0.33.0"
 ci = "github"
 hosting = "github"
-installers = ["shell", "powershell", "homebrew"]
+installers = ["shell", "powershell", "homebrew", "npm"]
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Installers put `fats` where `cargo install` does (~/.cargo/bin), so `cargo uninstall fatsearch` and the docs agree
 install-path = "CARGO_HOME"
@@ -21,7 +21,16 @@ github-attestations = true
 # HOMEBREW_TAP_TOKEN (write access to the tap only). If that job fails, the release and its files stay up.
 tap = "fatsearch/homebrew-tap"
 formula = "fatsearch"
-publish-jobs = ["homebrew"]
+# npm: the package `fatsearch` (bin `fats`; `npx fatsearch`), named after the crate. It holds no binary: at
+# install it downloads this release's archive for the platform (an install script, so not with
+# `--ignore-scripts` or offline). Published after the GitHub Release exists with the repo secret NPM_TOKEN
+# (a granular npm token, read/write on `fatsearch` only); dist 0.33.0 has no npm trusted publishing (OIDC).
+publish-jobs = ["homebrew", "npm"]
+
+# The Linux builds run on ubuntu-22.04 and link glibc 2.35 symbols (`strings fats | grep GLIBC_2.`); dist's
+# default floor is 2.31, so the npm and shell installers would install a binary that cannot start on 2.31–2.34.
+[dist.min-glibc-version]
+"*" = "2.35"
 
 # Every action in release.yml pinned by commit SHA (dist writes tags otherwise). Release tag per line;
 # a bump = a new SHA here + `dist generate`.
@@ -30,6 +39,7 @@ publish-jobs = ["homebrew"]
 "actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9" # v7.0.2
 "actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8.0.2
 "actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2
+"actions/setup-node" = "249970729cb0ef3589644e2896645e5dc5ba9c38" # v6.5.0
 
 # The TLS stack compiles BoringSSL with CMake and generates its bindings with bindgen (libclang).
 # macOS runners: Xcode's compiler and libclang; CMake from Homebrew.

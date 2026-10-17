@@ -43,9 +43,7 @@ and LLVM for libclang (`winget install LLVM.LLVM`, then set `LIBCLANG_PATH` to L
 
 ## 2. Install a prebuilt binary
 
-❓ No release has been published by the release workflow yet; until one is, build from source (section 3).
-
-Each GitHub release carries `fats` for macOS (Apple silicon, Intel), Linux (x86_64, ARM64; glibc) and
+Each GitHub release carries `fats` for macOS (Apple silicon, Intel), Linux (x86_64, ARM64; glibc 2.35+) and
 Windows (x86_64), each archive with a `.sha256` checksum and a GitHub build attestation. No Rust toolchain needed.
 
 macOS, Linux:
@@ -72,6 +70,10 @@ The installer always installs the version of the release it came from.
 
 Other ways, same release archives:
 
+- npm ❓ (the package is not published yet): `npm i -g fatsearch` installs `fats`; `npx fatsearch --version`
+  runs it without a global install. The npm package holds no binary: its install script downloads this
+  release's archive for the machine from GitHub into the package folder, so it needs network at install and
+  does not work with `--ignore-scripts`. Node 14.14+. Uninstall: `npm uninstall -g fatsearch`.
 - Homebrew ❓ (the tap is not published yet): `brew install fatsearch/tap/fatsearch` (installs `fats`)
 - cargo-binstall ❓: `cargo binstall fatsearch` takes the release archive; for a version without one (0.1.0) it
   falls back to building from source
@@ -156,6 +158,9 @@ All hosts below start `fats mcp` as a local process. Notes that apply to every o
   instead, use its `env` field (shown below where the host has one); prefer a `${VAR}` reference to a value.
 - **Local files:** over MCP, `fats` reads files only under the server's working directory and its cache.
 - A slow page answers `pending` after 5 s (`wait:`), so tool calls stay short; the reply names the next command.
+- **Without installing** ❓ (the npm package is not published yet): a host with Node can run
+  `npx -y fatsearch mcp` as the command (`"command": "npx", "args": ["-y", "fatsearch", "mcp"]`); the first
+  start downloads the binary. The server is listed in the MCP Registry as `io.github.fatsearch/fats` ❓.
 
 ### Claude Code
 
@@ -293,7 +298,8 @@ cargo uninstall fatsearch                   # removes ~/.cargo/bin/fats
 ```
 
 Installed with the installer script: `rm ~/.cargo/bin/fats` (Windows: `del %USERPROFILE%\.cargo\bin\fats.exe`)
-and the receipt `fatsearch-receipt.json` (section 2). Homebrew: `brew uninstall fatsearch`.
+and the receipt `fatsearch-receipt.json` (section 2). Homebrew: `brew uninstall fatsearch`. npm:
+`npm uninstall -g fatsearch`.
 
 Then delete the two folders it printed (defaults in the table at the top). The key dir holds `oxylabs.key`,
 `brightdata.key`, `brightdata.zone` and the spend ledger `spend.log`. In the cache dir, pages and searches go

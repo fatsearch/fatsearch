@@ -1670,12 +1670,17 @@ fn oxylabs_relayed_site_5xx_is_billed() {
 }
 
 /// `fats setup`: each key checked with its one free read, saved 0600 in the key dir, the zone picked from the
-/// account's Web Unlocker zones; a refused key is not saved; `dry:true` calls nothing. No key ever prints.
+/// account's Web Unlocker zones; a refused key is not saved; `dry:true` calls nothing. No key ever prints. A key
+/// dir that exists at 0755 (an installer wrote its receipt there first) is made 0700.
 #[test]
 fn setup_checks_and_saves_keys() {
     let _l = lock();
     let keys = dir().join("keys");
     std::fs::remove_dir_all(&keys).ok();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o755)
+        .create(&keys)
+        .expect("key dir");
     let calls = CALLS.load(Ordering::SeqCst);
     let (out, rc) = run_rc("setup dry:true");
     assert!(rc == 0 && out.starts_with("= dry setup oxy not checked · bd not checked"), "{out}");
@@ -1700,6 +1705,12 @@ fn setup_checks_and_saves_keys() {
             let mode = std::fs::metadata(keys.join(f)).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
             assert_eq!(mode, 0o600, "{f}");
         }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&keys).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
+        assert_eq!(mode, 0o700, "key dir");
     }
     let (out, rc) = run_rc("setup zone:nope");
     assert_eq!(rc, 1, "{out}");

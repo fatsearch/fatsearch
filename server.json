@@ -1,0 +1,67 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.fatsearch/fats",
+  "title": "fats",
+  "description": "Web pages, PDFs and documents as small, clean, cached Markdown for AI agents",
+  "repository": {
+    "url": "https://github.com/fatsearch/fatsearch",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/fatsearch/fatsearch",
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "fatsearch",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "OXYLABS_WEB_API_KEY",
+          "description": "Oxylabs Web API key (optional: blocked and JS pages, web search)",
+          "isSecret": true
+        },
+        {
+          "name": "BRIGHTDATA_API_KEY",
+          "description": "Bright Data API key (optional: blocked and JS pages, web search)",
+          "isSecret": true
+        }
+      ]
+    },
+    {
+      "registryType": "npm",
+      "identifier": "fatsearch",
+      "version": "0.1.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "OXYLABS_WEB_API_KEY",
+          "description": "Oxylabs Web API key (optional: blocked and JS pages, web search)",
+          "isSecret": true
+        },
+        {
+          "name": "BRIGHTDATA_API_KEY",
+          "description": "Bright Data API key (optional: blocked and JS pages, web search)",
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

@@ -92,16 +92,17 @@ pub fn find(env: &str, file: &str, only: &[&str]) -> Option<(String, &'static st
 }
 
 /// THE owner-only writer (keys in the key dir, a provider's kept error answer, the spend ledger's rows, `append`):
-/// `<dir>/<file>` at 0600, an old file's wider mode too, before the bytes go in; a dir it creates is 0700.
+/// `<dir>/<file>` at 0600, an old file's wider mode too, before the bytes go in; the dir 0700, also one that
+/// exists already (an installer's receipt can make the key dir 0755 before `fats` first runs).
 pub fn save_in(dir: &Path, file: &str, bytes: &[u8], append: bool) -> std::io::Result<()> {
-    let (mut open, mut mkdir) = (std::fs::OpenOptions::new(), std::fs::DirBuilder::new());
+    let mut open = std::fs::OpenOptions::new();
+    std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         open.mode(0o600);
-        mkdir.mode(0o700);
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    mkdir.recursive(true).create(dir)?;
     let mut f = open.write(true).create(true).append(append).truncate(!append).open(dir.join(file))?;
     #[cfg(unix)]
     f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
