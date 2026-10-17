@@ -5,6 +5,17 @@ versions: [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Numbers co
 Silicon Mac, one run each unless a range is given; provider results move run to run.
 Method: [docs/benchmarks.md](docs/benchmarks.md).
 
+## 0.1.1 - 2026-10-17
+
+### Added
+- Prebuilt binaries and installers via cargo-dist: every tagged release builds `fats` for macOS (Apple silicon,
+  Intel), Linux (x86_64, ARM64) and Windows (x86_64) and attaches the archives, `.sha256` checksums, GitHub build
+  attestations and shell / PowerShell installers. A Homebrew formula (`fatsearch/tap/fatsearch`, installs `fats`)
+  is generated too.
+
+### Changed
+- The crate's `homepage` is the GitHub repository (was fatsearch.com, which has no site yet).
+
 ## 0.1.0 - 2026-10-17
 
 First public release.

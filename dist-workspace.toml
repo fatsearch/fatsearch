@@ -1,0 +1,51 @@
+# Release config for `dist` (cargo-dist): a `v*` tag builds `fats` for every target below and uploads the
+# archives, checksums, installers and attestations to the GitHub Release. `.github/workflows/release.yml` is
+# generated from this file (`dist generate`); edit this file, never the workflow. `dist generate --check` = in sync.
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# The dist version CI installs (from its own GitHub Release, by exact version)
+cargo-dist-version = "0.33.0"
+ci = "github"
+hosting = "github"
+installers = ["shell", "powershell", "homebrew"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Installers put `fats` where `cargo install` does (~/.cargo/bin), so `cargo uninstall fatsearch` and the docs agree
+install-path = "CARGO_HOME"
+# No self-updater binary next to `fats`: one binary, nothing running in the background
+install-updater = false
+# SLSA build provenance for every archive: `gh attestation verify <file> --repo fatsearch/fatsearch`
+github-attestations = true
+# Homebrew: the formula `fatsearch` (binary `fats`) is pushed to this tap after the GitHub Release exists, with the repo secret
+# HOMEBREW_TAP_TOKEN (write access to the tap only). If that job fails, the release and its files stay up.
+tap = "fatsearch/homebrew-tap"
+formula = "fatsearch"
+publish-jobs = ["homebrew"]
+
+# Every action in release.yml pinned by commit SHA (dist writes tags otherwise). Release tag per line;
+# a bump = a new SHA here + `dist generate`.
+[dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6.1.0
+"actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9" # v7.0.2
+"actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333" # v8.0.2
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4.2.2
+
+# The TLS stack compiles BoringSSL with CMake and generates its bindings with bindgen (libclang).
+# macOS runners: Xcode's compiler and libclang; CMake from Homebrew.
+[dist.dependencies.homebrew]
+cmake = "*"
+
+# Linux runners: compiler, CMake, libclang.
+[dist.dependencies.apt]
+build-essential = "*"
+cmake = "*"
+libclang-dev = "*"
+
+# Windows runners: CMake and LLVM (libclang, found in C:\Program Files\LLVM without LIBCLANG_PATH) are on the
+# image already, so these are no-ops there; NASM is not, and BoringSSL needs it for its x86_64 assembly
+# (CMake looks for it in %ProgramFiles%\NASM, where the package installs it).
+[dist.dependencies.chocolatey]
+cmake = "*"
+llvm = "*"
+nasm = "*"

@@ -13,6 +13,13 @@ ignore = [
     # zip-rs yanked the whole 8.x line (no advisory, no yank message). office_oxide 0.1.9, the one pdf_oxide 0.3.78
     # accepts, needs ^8.6; 0.1.15 (2026-10-15) moved to zip 9 and clears the 7-day cooldown on 2026-10-22: try it then.
     { crate = "zip@8.6.0", reason = "yanked 8.x line, pinned through pdf_oxide 0.3.78; revisit 2026-10-22" },
+    # All three are about `ZipArchive::extract()`/`ZipStreamReader::extract()` writing files to disk from an untrusted
+    # archive (SUID bits, symlink targets, permissions through symlinks). office_oxide 0.1.9 never calls extract
+    # (`grep -rn '\.extract(' src/` = 0): it reads DOCX/XLSX entries into memory. Same exit as above: zip 9 via
+    # office_oxide 0.1.15 once pdf_oxide accepts it; revisit 2026-10-22.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() to disk, never called by office_oxide; revisit 2026-10-22" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() symlinks, never called by office_oxide; revisit 2026-10-22" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() permissions, never called by office_oxide; revisit 2026-10-22" },
 ]
 
 [licenses]

@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square"></a>
-  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/version-0.1.0-green?style=flat-square"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/version-0.1.1-green?style=flat-square"></a>
 </p>
 
 ---
@@ -67,7 +67,8 @@ One static binary. **17 MB.** Starts in **4 ms.** No daemon, no browser, no tele
 ## Get started
 
 ```sh
-cargo install --locked --path .    # Rust 1.99, cmake + C compiler + libclang (BoringSSL)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fatsearch/fatsearch/releases/latest/download/fatsearch-installer.sh | sh
+cargo install --locked --path .    # or from a clone: Rust 1.99, cmake + C compiler + libclang (BoringSSL)
 fats guide                         # the one-screen cheat sheet
 fats setup                         # finds, checks, and saves your provider keys
 ```
@@ -128,6 +129,15 @@ Method, every run, and the pages: [docs/benchmarks.md](docs/benchmarks.md).
 What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Build
+
+Prebuilt binaries (macOS, Linux, Windows; Windows and other ways in
+[docs/installation.md](docs/installation.md#2-install-a-prebuilt-binary)), no toolchain needed:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fatsearch/fatsearch/releases/latest/download/fatsearch-installer.sh | sh
+```
+
+From source:
 
 ```sh
 cargo build --release --locked

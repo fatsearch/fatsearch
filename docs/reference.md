@@ -50,8 +50,8 @@ fats setup     # optional: find, check and save your provider keys
 fats guide
 ```
 
-This installs one binary, `fats` (the package is `fatsearch`). Nothing is published yet: no crates.io package
-and no prebuilt binaries yet, so build from source.
+This installs one binary, `fats` (the package is `fatsearch`; from crates.io: `cargo install --locked fatsearch`).
+Prebuilt binaries and their installers: [installation.md, section 2](installation.md#2-install-a-prebuilt-binary).
 
 ## Usage
 

@@ -1,18 +1,18 @@
 [package]
 name = "fatsearch"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # pinned to rust-toolchain.toml; the oldest toolchain that builds this tree has not been measured yet
 rust-version = "1.99"
 description = "Web pages and documents turned into small, clean, cached Markdown for AI agents"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fatsearch/fatsearch"
-homepage = "https://fatsearch.com"
+homepage = "https://github.com/fatsearch/fatsearch"
 readme = "README.md"
 keywords = ["markdown", "scraping", "llm", "mcp", "cli"]
 categories = ["command-line-utilities", "text-processing", "web-programming::http-client"]
 # Dev-only files: the gate, CI and maintainer scripts. Tests and their fixtures ship.
-exclude = ["/.github/", "/scripts/", "/check.sh"]
+exclude = ["/.github/", "/scripts/", "/check.sh", "/dist-workspace.toml"]
 
 # The library keeps the short name the binary has (`use fats::…`); the package is `fatsearch`.
 [lib]
@@ -86,6 +86,10 @@ codegen-units = 1
 # no symbol table in the shipped binary (-3 MB, same startup, measured). panic stays
 # `unwind`: cache::guarded, fetch::landed and `fats mcp` turn a panic into a record, abort would kill the process.
 strip = "symbols"
+
+# Release archives (dist-workspace.toml) are built with this profile: the release profile, unchanged.
+[profile.dist]
+inherits = "release"
 
 # Anti-spaghetti lints. A warning fails only the gate (check.sh and CI set `CARGO_BUILD_WARNINGS=deny`), never
 # a user's `cargo build` on a newer rustc. Thresholds: clippy.toml.
