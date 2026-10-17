@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="LICENSE-MIT"><img alt="License" src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square"></a>
-  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/version-0.1.1-green?style=flat-square"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/version-0.1.2-green?style=flat-square"></a>
 </p>
 
 ---

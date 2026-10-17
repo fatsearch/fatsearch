@@ -97,7 +97,7 @@ cargo install --locked --path .
 Or straight from crates.io, no clone: `cargo install --locked fatsearch`.
 Either compiles BoringSSL once (a few minutes) and installs `fats` (the package is named `fatsearch`).
 If `fats` is not found afterwards, add `~/.cargo/bin` to `PATH` (`. "$HOME/.cargo/env"`).
-Check: `fats --version` prints `= fats 0.1.1 · status: fats · guide: fats guide`; `fats guide` = the cheat sheet.
+Check: `fats --version` prints `= fats 0.1.2 · status: fats · guide: fats guide`; `fats guide` = the cheat sheet.
 
 ## 4. Keys (optional)
 
