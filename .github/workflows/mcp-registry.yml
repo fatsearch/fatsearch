@@ -16,7 +16,7 @@ on:
 permissions: {}
 jobs:
   publish:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'push' }}
+    if: ${{ github.repository == 'fatsearch/fatsearch' && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'push') }}
     runs-on: ubuntu-24.04
     permissions:
       id-token: write

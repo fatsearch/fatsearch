@@ -343,7 +343,7 @@ mod tests {
                 ("check", 86),
                 ("sites", 42),
                 ("clean", 167),
-                ("words", 134),
+                ("words", 1587),
                 ("limits", 38)
             ]
         );

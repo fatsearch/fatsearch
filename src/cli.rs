@@ -1043,10 +1043,8 @@ fn job_view(c: &Cache, j: usize) -> Out {
             continue;
         }
         let (meta, doc) = c.page(entry);
-        let what = match doc {
-            Ok(doc) => format!("{} · {}~tok", short(&doc.title, 50), ksize(doc.tokens.clean)),
-            Err(_) => format!("{} · no doc", meta.kind),
-        };
+        let size = |doc: Doc| format!("{} · {}~tok", short(&doc.title, 50), ksize(doc.tokens.clean));
+        let what = doc.map_or_else(|_| format!("{} · no doc", meta.kind), size);
         let prov = if entry.alias { "cache" } else { meta.provider.as_str() };
         rows.push(format!("j{j}.u{u} {prov} {}ms ${:.4} {} | {what}", meta.ms, meta.cost, short(&entry.url, 60)));
     }
@@ -1086,10 +1084,8 @@ struct Loaded {
 /// The ids job `j` sees (None = this session's): (its session's state, true when that is another session).
 /// None = an unknown job.
 fn ids_of(c: &Cache, j: Option<usize>) -> Option<(State, bool)> {
-    let s = match j {
-        Some(j) => c.job(j)?.session,
-        None => return Some((c.st.clone(), false)),
-    };
+    let Some(j) = j else { return Some((c.st.clone(), false)) };
+    let s = c.job(j)?.session;
     // another session's state, read-only, from inside the cache (`Cache::dir`)
     let other = || c.dir(&Entry { dir: s.clone(), ..Entry::default() }).and_then(|d| jload(&d.join("state.json")));
     Some(if s == c.session { (c.st.clone(), false) } else { (other().unwrap_or_default(), true) })
@@ -1593,10 +1589,7 @@ fn routed(c: &mut Cache, run: &Detached, n: usize, seen: fetch::Seen) -> Done {
 fn cached(c: &mut Cache, key: &str, want: Want, cmd: &Cmd) -> Option<Out> {
     let (dir, _) = c.lookup(key).filter(|_| !cmd.fresh())?;
     let n = reserve(c, Entry { dir, alias: true, ..Entry::default() }, want, cmd);
-    Some(match n {
-        Ok(n) => outlined(c, n, false, want.prov),
-        Err(e) => cache_write(e),
-    })
+    Some(n.map_or_else(cache_write, |n| outlined(c, n, false, want.prov)))
 }
 
 /// A local file (or stdin, `-`) → a new id: the stored snapshot when the same bytes came from the same place

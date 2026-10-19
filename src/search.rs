@@ -7,18 +7,10 @@ use crate::lang::{Match, bin, cut};
 use crate::outline::{GREP_CAP, Page, Shown, cap_rows, info_line, is_thin, lead, span};
 
 fn terms_of(words: &[String]) -> Vec<String> {
-    let mut t: Vec<String> = Vec::new();
-    for w in words {
-        let f = fold(w);
-        let f = f.trim_matches(|c| ".,;:!?\"'()".contains(c));
-        if f.chars().count() >= 2 && !crate::lang::WORDS.stop.contains(&f) && !t.iter().any(|x| x == f) {
-            t.push(f.to_string());
-        }
-    }
-    if t.is_empty() {
-        t = words.iter().filter(|w| !w.is_empty()).map(|w| fold(w)).collect();
-    }
-    t
+    let trim = |w: &String| fold(w).trim_matches(|c| ".,;:!?\"'()".contains(c)).to_string();
+    let keep = |f: &String| f.chars().count() >= 2 && !crate::lang::WORDS.stop.contains(&f.as_str());
+    let t = crate::lang::uniq(words.iter().map(trim).filter(keep), String::clone);
+    if t.is_empty() { words.iter().filter(|w| !w.is_empty()).map(|w| fold(w)).collect() } else { t }
 }
 
 fn stem(t: &str) -> &str {

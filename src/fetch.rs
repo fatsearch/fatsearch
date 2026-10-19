@@ -9,10 +9,14 @@
 //! it is tested without a network.
 //! Every page fetch walks the same ladder; `js:true` walks the table's render order (`JS_QUOTE`).
 
-use crate::cache::{Cache, HopRow, Meta};
+use crate::cache::{Cache, HopRow, Meta, guarded, raw_name};
 use crate::clean::{self, Doc};
-use crate::html::Tree;
-use crate::provider::{Ask, Hit, Raw, Tier, spend};
+use crate::html::{Node, Tree, py_space};
+use crate::lang::{At, Cmd, Flag, bang, bin, fix, uniq};
+use crate::outline::{fmt_age, is_thin, lost_page};
+use crate::provider::{
+    Ask, Fail, Hit, Limit, PROVIDERS, REFUSED, Raw, SEARCH_TIMEOUT, Tier, in_process, pages, search_country, spend,
+};
 use crate::settings::limit;
 use std::future::Future;
 use std::pin::Pin;
@@ -59,10 +63,9 @@ pub const SEARCH_HEDGE: Duration = Duration::from_millis(2500);
 /// The hedges in effect, as `dry:true` and `fats config` show them: `hedge search 2.5 s · fetch 5 s · default`,
 /// or the one `hedge:` mod value that sets both.
 pub fn hedges(flag: Option<&str>) -> String {
-    match flag {
-        Some(v) => format!("hedge {v} s · flag hedge:{v}"),
-        None => format!("hedge search {} s · fetch {} s · default", SEARCH_HEDGE.as_secs_f64(), HEDGE.as_secs_f64()),
-    }
+    let default =
+        || format!("hedge search {} s · fetch {} s · default", SEARCH_HEDGE.as_secs_f64(), HEDGE.as_secs_f64());
+    flag.map_or_else(default, |v| format!("hedge {v} s · flag hedge:{v}"))
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
@@ -124,14 +127,12 @@ impl Plan {
 
     /// THE plan of a command's mods (`provider:`, `js:`, `cost:` less what this run `spent`, `timeout:`, `hedge:`),
     /// a page's for `url`, else a search's: what a fetch runs, `dry:true` routes and an arrow quotes (`worst`).
-    pub fn of(cmd: &crate::lang::Cmd, url: Option<&str>, spent: f64) -> Plan {
+    pub fn of(cmd: &Cmd, url: Option<&str>, spent: f64) -> Plan {
         let mode = cmd.get("provider").and_then(Tier::parse).map_or(Mode::Auto, Mode::Only);
         let cap = (cmd.get("cost").and_then(|v| v.parse::<f64>().ok()).unwrap_or(COST_CAP) - spent).max(0.0);
         let timeout = cmd.get("timeout").and_then(|v| v.parse().ok()).map(Duration::from_secs);
-        let mut p = match url {
-            Some(u) => Plan::new(u, mode, cmd.flag("js"), cap, timeout),
-            None => Plan::search(mode, cap, timeout),
-        };
+        let mut p =
+            url.map_or_else(|| Plan::search(mode, cap, timeout), |u| Plan::new(u, mode, cmd.flag("js"), cap, timeout));
         p.hedge = cmd.get("hedge").and_then(|v| v.parse().ok()).map_or(p.hedge, Duration::from_secs);
         p
     }
@@ -184,8 +185,7 @@ impl Plan {
         // behind a `one_render` gate, plain's or a render's, ONE render: it answers every render alike (bd and oxyjs
         // both billed for one shell); a render the provider refused or erred on rendered nothing, so the next may try
         let gate = done.iter().any(|h| CHECK.one_render.contains(&h.code.as_str()));
-        let refused =
-            |t: &Tier| done.iter().any(|h| h.tier == *t && crate::provider::REFUSED.contains(&h.code.as_str()));
+        let refused = |t: &Tier| done.iter().any(|h| h.tier == *t && REFUSED.contains(&h.code.as_str()));
         let one = all.iter().copied().find(|t| t.can("js") && self.keys.contains(t) && !refused(t)).filter(|_| gate);
         let keep = |t: Tier| t.can(job) && self.avoid != Some(t);
         all.into_iter().filter(|&t| keep(t) && one.is_none_or(|o| o == t || !t.can("js"))).collect()
@@ -206,7 +206,7 @@ impl Plan {
         let left = self.agent_left(done);
         let ours = |d: Duration| left.unwrap_or((d * k).min(wall));
         match t {
-            _ if self.search => ours(crate::provider::SEARCH_TIMEOUT),
+            _ if self.search => ours(SEARCH_TIMEOUT),
             Tier::Bd | Tier::OxyJs => ours(t.spec().timeout),
             Tier::Oxy if self.pdf_run(done) || self.hint => ours(PDF_OXY),
             Tier::Plain | Tier::Oxy => (t.spec().timeout * k).min(wall).min(left.unwrap_or(Duration::MAX)),
@@ -306,7 +306,7 @@ pub struct Hop {
     /// `Fail::why`: the token the `!` row adds to the code.
     pub why: String,
     /// The provider's request budget from this answer (`provider::Limit`): stored as two numbers in the hop.
-    pub limit: Option<crate::provider::Limit>,
+    pub limit: Option<Limit>,
     /// When the call landed (`billed`): a thin answer waits the hedge window from here (`next`).
     pub end: Option<Instant>,
     /// The HTML answer's `<html lang>` primary subtag, lower case (`it`); empty = none declared (`langs`).
@@ -315,12 +315,12 @@ pub struct Hop {
 
 impl Hop {
     /// A call the provider failed: its code, status, reason token, budget and (masked) answer.
-    fn failed(tier: Tier, f: crate::provider::Fail) -> Hop {
+    fn failed(tier: Tier, f: Fail) -> Hop {
         Hop { tier, code: f.code.into(), status: f.status, err: f.body, why: f.why, limit: f.limit, ..Hop::default() }
     }
 
-    pub fn row(&self) -> crate::cache::HopRow {
-        crate::cache::HopRow {
+    pub fn row(&self) -> HopRow {
+        HopRow {
             provider: self.tier.spec().name.into(),
             code: self.code.clone(),
             cost: self.cost,
@@ -435,7 +435,7 @@ pub fn next(p: &Plan, done: &[Hop], running: &[(Tier, Duration)]) -> Step {
 /// the run ends at the first timeout, its row buys more time (`fix_arg`).
 fn retries(p: &Plan, done: &[Hop], h: &Hop) -> bool {
     let keyed = p.tiers().into_iter().filter(|t| p.keys.contains(t) && t.spec().price > 0.0 && !refused(done, *t));
-    let paid = crate::lang::uniq(keyed, |t| t.owner());
+    let paid = uniq(keyed, |t| t.owner());
     let transient = matches!(h.code.as_str(), "provider_timeout" | "net_error") && !one_call(p) && p.timeout.is_none();
     let first = done.iter().filter(|d| d.tier == h.tier).count() == 1;
     let time = wall_left(done, h).is_none_or(|w| w >= Duration::from_millis(h.ms));
@@ -462,7 +462,7 @@ fn one_call(p: &Plan) -> bool {
 
 /// A served answer the reader would flag `! thin` (`outline::is_thin`).
 fn thin(h: &Hop) -> bool {
-    h.ok && h.doc.as_ref().is_some_and(crate::outline::is_thin)
+    h.ok && h.doc.as_ref().is_some_and(is_thin)
 }
 
 /// An app page (`no_copy`): a JS shell, and shells or timeouts from two different paid providers (one
@@ -472,8 +472,7 @@ fn thin(h: &Hop) -> bool {
 fn app_page(done: &[Hop]) -> bool {
     let ran = |h: &&Hop| h.tier.spec().price > 0.0 && !ours(&h.code, h.upto, h.timeout_s);
     let paid = |h: &&Hop| ran(h) && matches!(h.code.as_str(), "js_shell" | "provider_timeout");
-    done.iter().any(|h| h.code == "js_shell")
-        && crate::lang::uniq(done.iter().filter(paid), |h| h.tier.owner()).len() > 1
+    done.iter().any(|h| h.code == "js_shell") && uniq(done.iter().filter(paid), |h| h.tier.owner()).len() > 1
 }
 
 /// Time until the longest running call is given up on.
@@ -528,10 +527,8 @@ pub fn drive(p: &Plan, call: &dyn Fn(Tier, &[Hop]) -> Call, mut done: Vec<Hop>, 
             seen((tried.chain(busy).collect::<Vec<_>>().join(" · "), since, until));
         }
         set.abort_all();
-        let gone = |t: Tier| match cut {
-            Some(wait) => Hop::failed(t, crate::provider::late(wait)),
-            None => Hop { tier: t, code: "abandoned".into(), ..Hop::default() },
-        };
+        let abandoned = |t: Tier| Hop { tier: t, code: "abandoned".into(), ..Hop::default() };
+        let gone = |t: Tier| cut.map_or_else(|| abandoned(t), |wait| Hop::failed(t, crate::provider::late(wait)));
         for (t, t0, _, d) in running {
             done.push(cut_why(p, Hop { timeout_s: d.as_secs(), ..billed(t0, false, t.spec().price, gone(t)) }));
         }
@@ -566,7 +563,7 @@ pub fn host_hop(url: &str) -> Option<Hop> {
     };
     let (t0, (tx, rx)) = (Instant::now(), std::sync::mpsc::channel());
     // a test's stand-in transport is the whole network: its resolver (the second one) is the only one asked
-    let (name, fake) = (host.clone(), crate::provider::in_process());
+    let (name, fake) = (host.clone(), in_process());
     std::thread::spawn(move || {
         tx.send(!fake && std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 443)).is_ok())
     });
@@ -619,7 +616,7 @@ async fn hop_of<T>(t: Tier, price: f64, call: impl Future<Output = Called<T>>, o
 }
 
 /// A provider call's answer, and whether it may be billed (`provider::get`).
-type Called<T> = (Result<T, crate::provider::Fail>, bool);
+type Called<T> = (Result<T, Fail>, bool);
 
 /// The network transport: one provider call, then the content check. A `/pdf/` path (`hint`) asks Bright Data for
 /// raw bytes like a PDF run, but only a PDF run fails a page as `not_pdf`.
@@ -669,7 +666,7 @@ fn langs(ask: &Ask, done: &[Hop]) -> (Vec<String>, Option<Ask>) {
     let first = u.path_segments().into_iter().flatten().next();
     let words = label.into_iter().chain(first).filter(shaped).flat_map(|s| s.split(['-', '_']));
     let words = host.last().copied().into_iter().chain(words).flat_map(|w| locale(&w.to_lowercase()));
-    let own = crate::lang::uniq(words.chain(plain), String::clone);
+    let own = uniq(words.chain(plain), String::clone);
     let query = u
         .query_pairs()
         .any(|(_, v)| shaped(&&*v) && v.split(['-', '_']).any(|w| !locale(&w.to_lowercase()).is_empty()));
@@ -680,12 +677,10 @@ fn langs(ask: &Ask, done: &[Hop]) -> (Vec<String>, Option<Ask>) {
 /// The languages a locale word names through `Providers::cctld`: a ccTLD (`uk`) or a country (`gb`) → its row's
 /// (`ch` → de fr it), a row's language (`en`) → itself; any other word names none.
 fn locale(word: &str) -> Vec<String> {
-    let rows = &crate::provider::PROVIDERS.cctld;
+    let rows = &PROVIDERS.cctld;
     let langs = |r: &&str| r.split(' ').skip(1).map(String::from).collect::<Vec<_>>();
-    match rows.get(word).or_else(|| rows.values().find(|r| r.split(' ').next() == Some(word))) {
-        Some(r) => langs(r),
-        None => rows.values().flat_map(langs).filter(|l| l == word).take(1).collect(),
-    }
+    let row = rows.get(word).or_else(|| rows.values().find(|r| r.split(' ').next() == Some(word)));
+    row.map_or_else(|| rows.values().flat_map(langs).filter(|l| l == word).take(1).collect(), langs)
 }
 
 /// A provider's copy outside `langs` (none = no expectation; `en` when it names no locale and the call sent no
@@ -735,7 +730,7 @@ fn og_card(mut h: Hop, url: &str) -> Hop {
     };
     let Some(tree) = h.tree.as_ref().filter(|t| shell && own(t)) else { return h };
     let fin = if h.final_url.is_empty() { url } else { &h.final_url };
-    if let Ok(card) = crate::cache::guarded(|| Ok(clean::card(clean::build_doc(tree, url, fin, false)))) {
+    if let Ok(card) = guarded(|| Ok(clean::card(clean::build_doc(tree, url, fin, false)))) {
         (h.ok, h.code, h.kind, h.doc, h.tree) = (true, "ok".into(), "og", Some(card), None);
     }
     h
@@ -751,7 +746,7 @@ pub fn run_search(p: &Plan, q: &str, limit: usize, country: Option<&str>) -> Vec
             hop_of(t, price, crate::provider::search(t, &q, limit, country.as_deref(), wait), ok).await
         })
     };
-    let cc = crate::provider::search_country(country);
+    let cc = search_country(country);
     drive(p, &call, Vec::new(), &drop).into_iter().map(|h| Hop { country: cc.clone(), ..h }).collect()
 }
 
@@ -790,9 +785,9 @@ pub fn route(p: &Plan) -> (Vec<(Tier, Option<Duration>)>, f64) {
 /// page's language: a page flag, `outline::page_flags`).
 pub fn ignored(ask: &Ask, hops: &[Hop], id: &str) -> Vec<String> {
     let bd = hops.iter().any(|h| h.ok && h.tier == Tier::Bd);
-    let at = crate::lang::At { id, url: &ask.url, arg: "device:mobile", ..Default::default() };
+    let at = At { id, url: &ask.url, arg: "device:mobile", ..Default::default() };
     let what = "device bd · Bright Data has no device setting: desktop page";
-    (ask.mobile && bd).then(|| crate::lang::bang(id, "ignored", what, &at)).into_iter().collect()
+    (ask.mobile && bd).then(|| bang(id, "ignored", what, &at)).into_iter().collect()
 }
 
 /// `!` rows for tiers a failed run never tried: one per missing key, one for the cap with what the rest would
@@ -831,17 +826,16 @@ pub fn keyed() -> Vec<Tier> {
 pub fn no_key(p: &Plan, left: &[Tier], subject: &str, setup: bool) -> Vec<String> {
     let row = |o: &Tier| {
         let (s, mine) = (o.owner().spec(), left.iter().filter(|t| t.owner() == o.owner()));
-        let buys =
-            if p.search { vec!["web search"] } else { crate::lang::uniq(mine.clone().map(|t| t.spec().buys), |b| *b) };
+        let buys = if p.search { vec!["web search"] } else { uniq(mine.clone().map(|t| t.spec().buys), |b| *b) };
         let need = if o.owner() == Tier::Bd { format!("{} + BRIGHTDATA_UNLOCKER_ZONE", s.env) } else { s.env.into() };
         let cost = spend(mine.map(|t| t.spec().price));
         let what = format!("{} · would try {} ≤${cost:.4} · set {need}", s.short, buys.join(" + "));
-        let next = if setup { String::new() } else { crate::lang::fix("no_key", &crate::lang::At::default()) };
-        let row = crate::lang::Flag { code: "no_key".into(), what, next, row: true }.bang(subject);
-        row + &crate::provider::pages("no_key", [s.short])
+        let next = if setup { String::new() } else { fix("no_key", &At::default()) };
+        let row = Flag { code: "no_key".into(), what, next, row: true }.bang(subject);
+        row + &pages("no_key", [s.short])
     };
     // the tiers without a key, one per key (both Oxylabs tiers share one)
-    crate::lang::uniq(left.iter().filter(|t| !p.keys.contains(t)), |t| t.owner()).into_iter().map(row).collect()
+    uniq(left.iter().filter(|t| !p.keys.contains(t)), |t| t.owner()).into_iter().map(row).collect()
 }
 
 /// THE re-render rule: `js:true` on a page whose copy a render sent never asks that render again while another
@@ -925,7 +919,7 @@ pub fn fix_arg(m: &Meta, cuts: &[HopRow]) -> Option<&'static str> {
     let long = |t: Tier, h: &HopRow| h.timeout_s >= limit("render_fix_s") || !t.can("js");
     let ran = |t: Tier| m.hops.iter().chain(cuts).any(|h| h.provider == t.spec().name && long(t, h));
     // two keys name the provider, unless the tier answered itself (a 408: `lang::fix` bars a named spent tier)
-    let two = crate::lang::uniq(keys.iter().filter(|t| t.spec().price > 0.0), |t| t.owner()).len() > 1;
+    let two = uniq(keys.iter().filter(|t| t.spec().price > 0.0), |t| t.owner()).len() > 1;
     let named = |t: Tier| usize::from(two && !done.contains(&t.spec().short));
     // The tier whose own failure ended the run, still unspent (`spent`: its error, the one tier left), by name
     let err = |h: &HopRow| Tier::parse(&h.provider).filter(|t| h.code == m.code && !done.contains(&t.spec().short));
@@ -951,7 +945,7 @@ pub fn route_of(c: &Cache, url: &str, p: &mut Plan) {
 /// `dry:true`'s `up to` for that command, the same plan (`Plan::of`, `route_of`) through the same `route`.
 pub fn worst(arrow: &str, url: &str) -> f64 {
     // The words after the binary that heads the arrow, never after its name inside them
-    let cmd = crate::lang::parse(&[arrow.strip_prefix(&format!("{} ", crate::lang::bin())).unwrap_or("").to_string()]);
+    let cmd = crate::lang::parse(&[arrow.strip_prefix(&format!("{} ", bin())).unwrap_or("").to_string()]);
     // a command that can spend: a fetch or search past the cache (`account`, `setup`: free reads)
     // GitHub's search is free (a re-read once quoted ≤$0.0025, a web search's)
     let spends = ["fresh", "js", "provider", "timeout"].iter().any(|k| cmd.get(k).is_some());
@@ -1009,12 +1003,12 @@ pub fn fail_row(m: &Meta, others: &[Meta], page: &str, id: &str, served: bool) -
     let cuts: Vec<HopRow> = others.iter().flat_map(|o| o.hops.clone()).collect();
     let (done, arg) = (spent(m, &cuts, &keyed()), fix_arg(m, &cuts));
     let again = fail_count(m, others.iter(), arg).filter(|_| !served);
-    let at = crate::lang::At { id, url: &m.url, arg: arg.unwrap_or_default(), done: &done };
-    let fix = arg.filter(|_| again.is_none()).map(|_| crate::lang::fix(move_code(m), &at));
+    let at = At { id, url: &m.url, arg: arg.unwrap_or_default(), done: &done };
+    let arrow = arg.filter(|_| again.is_none()).map(|_| fix(move_code(m), &at));
     let (why, owners) = fail_detail(m, page, &cuts);
     // The longer call offered says so before its arrow (`bd cut at 60 s (3m ago) · one more try → …`)
     let more = (!served && arg.is_some_and(|a| a.contains("timeout:"))).then(|| " · one more try".into());
-    (why, again.or(more).unwrap_or_default(), fix, owners)
+    (why, again.or(more).unwrap_or_default(), arrow, owners)
 }
 
 /// `fail_row`: (why, ` · failed k/n here` or the fix's ` · one more try`, the fix, the accounts named).
@@ -1046,7 +1040,7 @@ pub fn fail_detail(m: &Meta, page: &str, cuts: &[HopRow]) -> (String, Vec<&'stat
         // Our cut, stored as `took > 60 s here` (0.1.6 rows too), reads its time and age: `cut at 60 s (3m ago)`;
         // No age under a minute (the answer that made the cut said `(0s ago)`)
         let age = crate::cache::now() - m.t;
-        let age = if age < 60.0 { String::new() } else { format!(" ({} ago)", crate::outline::fmt_age(age)) };
+        let age = if age < 60.0 { String::new() } else { format!(" ({} ago)", fmt_age(age)) };
         let ours = |h: &HopRow| h.why.strip_prefix("took > ").map(|_| format!("cut at {} s{age}", h.timeout_s));
         let why = Some(timed_out(m, cuts)).filter(|t| !t.is_empty()).or(last.map(|h| ours(h).unwrap_or(h.why.clone())));
         // a call we cut names its tier (`oxyjs cut at 60 s`), a provider's reason its account (`oxy retry in 5s`)
@@ -1057,18 +1051,15 @@ pub fn fail_detail(m: &Meta, page: &str, cuts: &[HopRow]) -> (String, Vec<&'stat
         };
     }
     // the accounts whose hop ended with the run's code, in call order
-    let keys = crate::lang::uniq(m.hops.iter().filter(|h| h.code == m.code).filter_map(owner), |k| *k);
+    let keys = uniq(m.hops.iter().filter(|h| h.code == m.code).filter_map(owner), |k| *k);
     (keys.join(" "), keys)
 }
 
 /// Every provider error answer of a run, one block each (`# oxylabs 500 provider_error`), for `error.txt`.
 pub fn error_text(hops: &[Hop]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    for h in hops.iter().filter(|h| !h.err.is_empty()) {
-        out.extend(format!("# {} {} {}\n", h.tier.spec().name, h.status, h.code).into_bytes());
-        out.extend(&h.err);
-        out.push(b'\n');
-    }
+    let block =
+        |h: &Hop| [format!("# {} {} {}\n", h.tier.spec().name, h.status, h.code).as_bytes(), &h.err, b"\n"].concat();
+    let out: Vec<u8> = hops.iter().filter(|h| !h.err.is_empty()).flat_map(block).collect();
     (!out.is_empty()).then_some(out)
 }
 
@@ -1126,8 +1117,7 @@ pub fn outcome(url: &str, hops: &mut [Hop], ms: u64) -> Outcome {
     let render = tier == Tier::OxyJs;
     let fin = if final_url.is_empty() { url } else { &final_url };
     // `judge` parsed every body once (a PDF into its doc); a failed HTML answer is cleaned here from that parse
-    let doc =
-        doc.or_else(|| tree.and_then(|t| crate::cache::guarded(|| Ok(clean::build_doc(&t, url, fin, render))).ok()));
+    let doc = doc.or_else(|| tree.and_then(|t| guarded(|| Ok(clean::build_doc(&t, url, fin, render))).ok()));
     let meta = Meta {
         url: url.into(),
         final_url: (!final_url.is_empty() && final_url != url).then_some(final_url),
@@ -1145,7 +1135,7 @@ pub fn outcome(url: &str, hops: &mut [Hop], ms: u64) -> Outcome {
         charset: charset.into(),
         ..Meta::default()
     };
-    let file = (!body.is_empty()).then(|| (crate::cache::raw_name(kind), body));
+    let file = (!body.is_empty()).then(|| (raw_name(kind), body));
     Outcome { meta, file, doc, error }
 }
 
@@ -1198,7 +1188,7 @@ enum On {
 
 /// A page's language: its `<html lang>` primary tag when that is 2–3 ASCII letters, lower case (a 10 kB
 /// `lang` reached every printed read); "" when it names none.
-fn page_lang(tree: &crate::html::Tree) -> String {
+fn page_lang(tree: &Tree) -> String {
     let tag = tree.nodes.iter().find(|n| n.tag == "html").and_then(|n| n.attr("lang")?.split(['-', '_']).next());
     let tag = tag.map(str::trim).filter(|l| (2..=3).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphabetic()));
     tag.unwrap_or_default().to_lowercase()
@@ -1223,7 +1213,7 @@ pub fn judge(tier: Tier, raw: Raw, url: &str, js: bool, pdf: bool) -> Hop {
     } else if kind == "pdf" && magic.is_none() {
         h.code = "not_pdf".into(); // a content type that named a PDF over a body that is not one
     } else if kind == "pdf" {
-        match crate::cache::guarded(|| crate::pdf::build_pdf(&raw.body, url, fin, limit("pdf_budget_s"))) {
+        match guarded(|| crate::pdf::build_pdf(&raw.body, url, fin, limit("pdf_budget_s"))) {
             Ok(d) => {
                 // only Oxylabs' copy is rebuilt from text (`provider::file_bytes`), so only its offsets can shift
                 let oxy = matches!(tier, Tier::Oxy | Tier::OxyJs);
@@ -1266,7 +1256,7 @@ pub fn judge(tier: Tier, raw: Raw, url: &str, js: bool, pdf: bool) -> Hop {
             h.landed = canonical(&tree, url);
         }
         if ok {
-            match crate::cache::guarded(|| Ok(clean::build_doc(&tree, url, &h.final_url, js))) {
+            match guarded(|| Ok(clean::build_doc(&tree, url, &h.final_url, js))) {
                 // a page that cleans to almost nothing is a shell unless its title is visibly there (example.com)
                 Ok(d) if d.loss.pruned_chars < THIN_CHARS && !shown => {
                     (h.ok, h.code, h.doc) = (false, "thin_content".into(), Some(d))
@@ -1294,7 +1284,7 @@ fn status_code(s: u16) -> String {
 
 /// A page's `<link rel=canonical>`, absolute, when it is on the same site as `url`.
 fn canonical(t: &Tree, url: &str) -> Option<String> {
-    let rel = |n: &&crate::html::Node| n.attr("rel").is_some_and(|r| r.eq_ignore_ascii_case("canonical"));
+    let rel = |n: &&Node| n.attr("rel").is_some_and(|r| r.eq_ignore_ascii_case("canonical"));
     let href = t.nodes.iter().filter(|n| n.tag == "link").find(rel)?.attr("href")?;
     let c = url::Url::parse(url).ok()?.join(href).ok()?.to_string();
     (site(&c) == site(url)).then_some(c)
@@ -1337,18 +1327,13 @@ fn serp_results(t: &Tree) -> usize {
 pub fn words_of(s: &str) -> Vec<String> {
     let f = clean::fold(s);
     let long = f.split(|c: char| !(clean::is_word(c) && !clean::is_digit(c) && c != '_'));
-    crate::lang::uniq(
-        long.filter(|w| w.chars().count() >= 4 && !CHECK.stop.contains(w)).map(String::from),
-        String::clone,
-    )
+    uniq(long.filter(|w| w.chars().count() >= 4 && !CHECK.stop.contains(w)).map(String::from), String::clone)
 }
 
 /// The page title up to its site suffix (`Title | Site`, `Title – Site`).
 pub fn title_head(s: &str) -> &str {
     let cs: Vec<(usize, char)> = s.char_indices().collect();
-    cs.windows(3)
-        .find(|w| crate::html::py_space(w[0].1) && "|·–—-".contains(w[1].1) && crate::html::py_space(w[2].1))
-        .map_or(s, |w| &s[..w[0].0])
+    cs.windows(3).find(|w| py_space(w[0].1) && "|·–—-".contains(w[1].1) && py_space(w[2].1)).map_or(s, |w| &s[..w[0].0])
 }
 
 /// The asked URL's last non-empty path segment (`/comments/x1/job_interview_tips` → `job_interview_tips`).
@@ -1420,7 +1405,7 @@ pub fn check(tree: &Tree, html: &str, raw: &Raw, url: &str) -> (bool, String, us
     // no wall path named: the copy landed where the asked id (its last path segment, 8+ letters or
     // digits) is gone, and shows none of its own words: a front page, a search; never the page
     let id = slug_id(url).is_some_and(|s| s.bytes().filter(u8::is_ascii_alphanumeric).count() >= 8);
-    if id && !page && crate::outline::lost_page(url, &raw.final_url).is_some() {
+    if id && !page && lost_page(url, &raw.final_url).is_some() {
         return (false, "redirected".into(), chars, false);
     }
     if is_serp(url) {
@@ -1430,7 +1415,7 @@ pub fn check(tree: &Tree, html: &str, raw: &Raw, url: &str) -> (bool, String, us
     // a shell loads JavaScript: a short one with none (no `<script>`, no refresh) and none of its own words is the
     // site's own answer, an error page (Akamai's 534 B "Site Maintenance"; no phrase list)
     if !shown && (words.len() >= 2 || chars < 800) {
-        let refresh = |n: &crate::html::Node| n.attr("http-equiv").is_some_and(|v| v.eq_ignore_ascii_case("refresh"));
+        let refresh = |n: &Node| n.attr("http-equiv").is_some_and(|v| v.eq_ignore_ascii_case("refresh"));
         let bare = chars < limit("page_chars") && !tree.nodes.iter().any(|n| n.tag == "script" || refresh(n));
         return (false, if bare { "error_page" } else { "js_shell" }.into(), chars, false);
     }

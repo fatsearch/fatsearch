@@ -70,13 +70,13 @@ The installer always installs the version of the release it came from.
 
 Other ways, same release archives:
 
-- npm ❓ (the package is not published yet): `npm i -g fatsearch` installs `fats`; `npx fatsearch --version`
+- npm: `npm i -g fatsearch` installs `fats`; `npx fatsearch --version`
   runs it without a global install. The npm package holds no binary: its install script downloads this
   release's archive for the machine from GitHub into the package folder, so it needs network at install and
   does not work with `--ignore-scripts`. Node 14.14+. Uninstall: `npm uninstall -g fatsearch`.
-- Homebrew ❓ (the tap is not published yet): `brew install fatsearch/tap/fatsearch` (installs `fats`)
-- cargo-binstall ❓: `cargo binstall fatsearch` takes the release archive; for a version without one (0.1.0) it
-  falls back to building from source
+- Homebrew: `brew install fatsearch/tap/fatsearch` (installs `fats`; ~10 s)
+- cargo-binstall: `cargo binstall fatsearch` takes the release archive (0.1.2: 10 s, no compile); for a version
+  without one it falls back to building from source
 - By hand: download the archive for your platform from the
   [releases page](https://github.com/fatsearch/fatsearch/releases), then check it before unpacking:
   `shasum -a 256 -c fatsearch-<target>.tar.xz.sha256` and
@@ -97,7 +97,7 @@ cargo install --locked --path .
 Or straight from crates.io, no clone: `cargo install --locked fatsearch`.
 Either compiles BoringSSL once (a few minutes) and installs `fats` (the package is named `fatsearch`).
 If `fats` is not found afterwards, add `~/.cargo/bin` to `PATH` (`. "$HOME/.cargo/env"`).
-Check: `fats --version` prints `= fats 0.1.2 · status: fats · guide: fats guide`; `fats guide` = the cheat sheet.
+Check: `fats --version` prints `= fats <version> · status: fats · guide: fats guide`; `fats guide` = the cheat sheet.
 
 ## 4. Keys (optional)
 
@@ -158,9 +158,9 @@ All hosts below start `fats mcp` as a local process. Notes that apply to every o
   instead, use its `env` field (shown below where the host has one); prefer a `${VAR}` reference to a value.
 - **Local files:** over MCP, `fats` reads files only under the server's working directory and its cache.
 - A slow page answers `pending` after 5 s (`wait:`), so tool calls stay short; the reply names the next command.
-- **Without installing** ❓ (the npm package is not published yet): a host with Node can run
+- **Without installing**: a host with Node can run
   `npx -y fatsearch mcp` as the command (`"command": "npx", "args": ["-y", "fatsearch", "mcp"]`); the first
-  start downloads the binary. The server is listed in the MCP Registry as `io.github.fatsearch/fats` ❓.
+  start downloads the binary. The server is listed in the MCP Registry as `io.github.fatsearch/fats`.
 
 ### Claude Code
 

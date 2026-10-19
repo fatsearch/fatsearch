@@ -1,9 +1,9 @@
 //! Self-observability: `fats` status, `fats stats`, `fats config`, `fats account`.
 
 use crate::cache::{Cache, Entry, MINE, Meta, jload, jsave, usage};
-use crate::cli::{MAX_BYTES, MAX_BYTES_CEIL};
+use crate::cli::{ASSET_MAX, ASSET_WAIT, FENCE, MAX_BYTES, MAX_BYTES_CEIL, no_doc, path_of};
 use crate::lang::{At, Out, bin, ksize, mib, short};
-use crate::outline::{GREP_CAP, LIST_CAP, Page, READ_CAP};
+use crate::outline::{GREP_CAP, LIST_CAP, Page, READ_CAP, fmt_age, photos};
 use crate::provider::{ACCOUNTS, Account, Api, Tier, account_calls, bill, late, links, spend};
 use crate::{fetch, settings};
 use std::time::Duration;
@@ -77,7 +77,7 @@ pub fn status(c: &Cache) -> Out {
     }
     lines.extend(health(&metas));
     lines.push(account_line(c, crate::cache::now()));
-    lines.push(match crate::cli::FENCE.get() {
+    lines.push(match FENCE.get() {
         Some(_) => "mcp: serving (this process) · local files from the working directory + the cache".into(),
         None => format!("mcp: ready · {b} mcp = stdio server, one tool fats(cmd)"),
     });
@@ -222,17 +222,16 @@ fn page_row(c: &Cache, u: usize, e: &Entry) -> (String, [f64; 2], u64) {
             let charset = if meta.charset.is_empty() { String::new() } else { format!(" {}", meta.charset) };
             let page = Page { id: pid.clone(), eq: pid, doc: &doc, meta: &meta, age: None, at: Default::default() };
             let outline: usize = crate::outline::outline(&page, None).0.iter().map(|l| crate::clean::tok(l)).sum();
-            let (raw, clean, photos) =
-                (ksize(meta.bytes as usize), ksize(doc.tokens.clean), crate::outline::photos(&doc, &meta));
+            let (raw, clean, shots) = (ksize(meta.bytes as usize), ksize(doc.tokens.clean), photos(&doc, &meta));
             let (mode, l) = (&doc.mode, &doc.loss);
             let sizes = format!("{head} raw {raw}B{charset} → clean {clean}~tok ({mode}) → outline {outline}~tok");
             let pruned = format!("{} of {} numbers pruned", l.vs_light_lost, l.light_facts);
             let signal = doc.info.get("signal").map(|v| format!(" · signal {v}")).unwrap_or_default();
-            format!("{sizes}{photos} · {pruned} · price_nums_pruned {}{signal} · {tail}", l.price_pruned)
+            format!("{sizes}{shots} · {pruned} · price_nums_pruned {}{signal} · {tail}", l.price_pruned)
         }
         // a failed copy = the `!` row its read prints (`cli::no_doc`), what it ran before the move
         Err(why) if !meta.ok => {
-            let row = crate::cli::no_doc(&pid, "", &meta, &[], &why, None).lines.split_off(1).join("\n");
+            let row = no_doc(&pid, "", &meta, &[], &why, None).lines.split_off(1).join("\n");
             let mid = format!("{} · {tail}", &head[id.len() + 1..]);
             row.split_once(" → ").map_or(format!("{row} · {mid}"), |(b, n)| format!("{b} · {mid} → {n}"))
         }
@@ -341,12 +340,11 @@ fn fetch_rows(s: &settings::Settings) -> Vec<Row> {
         if s.accept_md.value { "on" } else { "off" },
         crate::provider::MD_ACCEPT
     );
-    let (max, wait) = (ksize(crate::cli::ASSET_MAX as usize), crate::cli::ASSET_WAIT.as_secs());
+    let (max, wait) = (ksize(ASSET_MAX as usize), ASSET_WAIT.as_secs());
     let pictures =
         format!("{b} uN mK: plain only, image/* at most {max}B, {wait}s, $0 · <page>/assets/ · mcp attaches it");
     let ttl = format!("{}m · {b} account re-reads after it; status reads {ACCOUNT_FILE} only", s.account_ttl.value);
-    let ladder =
-        crate::cli::path_of(&fetch::route(&fetch::Plan::new("", fetch::Mode::Auto, false, fetch::COST_CAP, None)).0);
+    let ladder = path_of(&fetch::route(&fetch::Plan::new("", fetch::Mode::Auto, false, fetch::COST_CAP, None)).0);
     vec![
         // the page ladder the keys present run, a one-key retry included (`fetch::route`, as `dry:true` prints it)
         ("provider", format!("auto: {} · oxy no-JS also: files", ladder), "default · provider:plain|bd|oxy".into()),
@@ -515,7 +513,7 @@ pub fn account(c: &Cache, fresh: bool, wait: Duration) -> Out {
     let calls: usize = read.rows.iter().map(|a| a.calls).sum();
     let ms: u64 = read.rows.iter().map(|a| a.ms).max().unwrap_or(0); // read side by side
     let when = match cached {
-        true => format!("{} ago (cached, ttl {ttl}m)", crate::outline::fmt_age(age)),
+        true => format!("{} ago (cached, ttl {ttl}m)", fmt_age(age)),
         false => format!("read now · {calls} calls {ms}ms"),
     };
     // no provider read: the command failed (rc 1), named by the first row's code
@@ -680,7 +678,7 @@ pub fn account_dry(c: &Cache, fresh: bool) -> Out {
     let mut lines =
         vec![format!("= dry account · {} calls · read-only, no listed price · $0 · spends nothing now", calls.len())];
     if let Some(r) = hit {
-        let age = crate::outline::fmt_age((now - r.t).max(0.0));
+        let age = fmt_age((now - r.t).max(0.0));
         lines.push(format!("cache account.json {age} old (ttl {ttl}m) → no calls · fresh:true reads again"));
     }
     for (t, api, req) in &calls {
@@ -709,7 +707,7 @@ fn account_line(c: &Cache, now: f64) -> String {
     let bang: Vec<String> = r.rows.iter().filter_map(flag).collect();
     let bang = if bang.is_empty() { String::new() } else { format!(" · {}", bang.join(" · ")) };
     let n = r.rows.len();
-    let age = crate::outline::fmt_age((now - r.t).max(0.0));
+    let age = fmt_age((now - r.t).max(0.0));
     format!("account: {n} provider{}{bang} · {age} ago · {b} account", if n == 1 { "" } else { "s" })
 }
 

@@ -34,6 +34,12 @@ pub struct Words {
     led: Vec<&'static str>,
     /// Extensions that make a token a path (`page.html`, `a.pdf`), whether or not the file exists.
     doc_ext: Vec<&'static str>,
+    /// The IANA root zone (`tlds-alpha-by-domain.txt`, version 2026101900): a bare name is a host only when its
+    /// last label is one (`bare_tld`): `opencode.json`, `main.go` are words.
+    tlds: Vec<&'static str>,
+    /// The TLDs that are also file extensions (`main.rs`, `notes.md`): a bare one is a host only leading the
+    /// command (`fats docs.rs tokio`), else a word (`bare_tld`). Pinned by `tests::file_tlds_are_derived`.
+    file_tlds: Vec<&'static str>,
     /// A filter for only these words that finds nothing points to the page's media list (`search::grep`).
     pub media: Vec<&'static str>,
     /// Words a filter never looks for (`search::terms_of`, the title query).
@@ -401,6 +407,14 @@ fn is_url(t: &str) -> bool {
         && labels.last().is_some_and(|x| x.len() >= 2 && x.bytes().all(|b| b.is_ascii_alphabetic()))
 }
 
+/// The last label of a bare name (no scheme, no `/`): it names a host only when it is a real TLD (`Words::tlds`:
+/// `opencode.json`, `main.go` are words), and one that is also a file extension (`Words::file_tlds`: `main.rs`)
+/// only leading the command (`fats docs.rs tokio spawn`; `cargo build main.rs` = words). A scheme, a `/` or
+/// `site:` makes a host by its shape alone (`is_url`).
+fn bare_tld(low: &str) -> Option<&str> {
+    low.rsplit_once('.').filter(|_| !low.contains('/')).map(|(_, tld)| tld)
+}
+
 /// A path is a path only when it says so: `-`, `./ ../ / ~/`, a document extension (`page.html`, `a.pdf`), or a
 /// dotted name that exists here (`notes.md`). A bare word is text even if a file has that name (`price`,
 /// `README`), and with an id in the command only explicit paths count (free text wins).
@@ -606,9 +620,15 @@ pub fn parse(argv: &[String]) -> Cmd {
         toks = vec!["guide".into()];
     }
     let has_id = toks.iter().any(|t| Id::parse(t).is_some());
-    let (mut cls, mut any_id) = (Vec::new(), false);
-    for t in &toks {
+    let (mut cls, mut any_id, first) = (Vec::new(), false, lead.filter(|_| cmd.verb.is_none()));
+    for (i, t) in toks.iter().enumerate() {
         match class_of(t, has_id, any_id, cmd.verb.is_some()) {
+            // a TLD that is a file extension too names a host only leading the command (`cargo build main.rs`)
+            Ok(Class::Url(_))
+                if Some(i) != first && bare_tld(&t.to_lowercase()).is_some_and(|x| WORDS.file_tlds.contains(&x)) =>
+            {
+                cls.push((t.clone(), Class::Word));
+            }
             Ok(c) => {
                 any_id |= matches!(c, Class::Id(_));
                 cls.push((t.clone(), c));
@@ -641,6 +661,11 @@ pub fn parse(argv: &[String]) -> Cmd {
     cmd.idle = none && cmd.get("site").is_none() || cmd.ask.is_some();
     if cmd.verb.is_none() && (led || lone) {
         ask_typo(&mut cmd, led);
+    }
+    // a `?`/`!` row is no search: a closing `json` stays its output mod (`whoami json`)
+    if cmd.ask.is_some() && cmd.words.last().is_some_and(|w| w.eq_ignore_ascii_case("json")) {
+        cmd.words.pop();
+        cmd.reserved.push("json");
     }
     cmd
 }
@@ -694,7 +719,7 @@ fn class_of(t: &str, has_id: bool, any_id: bool, verb: bool) -> Result<Class, St
     if is_file(t, has_id) {
         return Ok(Class::File(t.to_string()));
     }
-    if !any_id && is_url(t) {
+    if !any_id && is_url(t) && bare_tld(&low).is_none_or(|tld| WORDS.tlds.contains(&tld)) {
         return Ok(Class::Url(if low.starts_with("http") { t.to_string() } else { format!("https://{t}") }));
     }
     if num(t).is_some() {
@@ -721,13 +746,15 @@ fn sort_into(cmd: &mut Cmd, alone: bool, cls: Vec<(String, Class)>, any_id: bool
     let pinned = cls.iter().any(|(_, c)| matches!(c, Class::Mod(k, _) if k == "match"));
     let free = words > 0 || nums > 1 || (nums > 0 && (!any_id || pinned));
     let page = cls.iter().any(|(_, c)| matches!(c, Class::Id(_) | Class::Url(_) | Class::File(_)));
-    // `json` closing the words is the output mod, never a word (`rust news json`)
+    // `json` closing the words beside a page id or file is the output mod (`u1 price json`); on a search it is a
+    // word like every reserved word there (`vite config json`, `example.com rust json`): JSON is `json:true`
+    let read = cls.iter().any(|(_, c)| matches!(c, Class::Id(_) | Class::File(_)));
     let last = cls.iter().rposition(|(_, c)| !matches!(c, Class::Mod(..)));
     let lead = cls.iter().position(|(_, c)| matches!(c, Class::Res(_) | Class::Word | Class::Num(_)));
     let list = |i, r: &str| any_id && Some(i) == lead && WORDS.lists.contains(&r);
     for (i, (t, c)) in cls.into_iter().enumerate() {
         match c {
-            Class::Res(r) if r == "json" && Some(i) == last => cmd.reserved.push(r),
+            Class::Res(r) if r == "json" && Some(i) == last && read => cmd.reserved.push(r),
             Class::Id(i) => cmd.ids.push(i),
             Class::Job(j) => cmd.jobs.push(j),
             Class::Link(l) => cmd.links.push(l),
@@ -966,6 +993,26 @@ mod tests {
         ("u1 -n", "u1 -n"),
         ("u1 -x -y", "u1 -x -y"),
         ("example.com", "https://example.com"),
+        // a host needs a real TLD; one that is also a file extension (`.rs`) is a host only leading the command;
+        // a scheme or a `/` makes a host anywhere
+        ("opencode mcp config opencode.json", "opencode mcp config opencode.json"),
+        ("pyproject.toml build backend options", "pyproject.toml build backend options"),
+        ("nextjs next.config.mjs", "nextjs next.config.mjs"),
+        ("main.go error", "main.go error"),
+        ("logo.png size", "logo.png size"),
+        ("cargo build main.rs", "cargo build main.rs"),
+        ("build lib.so", "build lib.so"),
+        ("rust x.ai", "https://x.ai rust"),
+        ("docs.rs tokio spawn", "https://docs.rs tokio spawn"),
+        ("limit:5 docs.rs tokio", "https://docs.rs tokio limit:5"),
+        ("docs.rs", "https://docs.rs"),
+        ("main.rs error handling", "https://main.rs error handling"),
+        ("rust example.com", "https://example.com rust"),
+        ("x.co", "https://x.co"),
+        ("a.io", "https://a.io"),
+        ("blog.rust-lang.org", "https://blog.rust-lang.org"),
+        ("tokio docs.rs/tokio", "https://docs.rs/tokio tokio"),
+        ("https://main.rs", "https://main.rs"),
         ("https://ex.com/a?b=1", "https://ex.com/a?b=1"),
         ("u1 v2.0", "u1 v2.0"),
         ("dry:yes u1#2", "u1#2 dry:true"),
@@ -1082,6 +1129,24 @@ mod tests {
         ("stts json", "? stts: a command? "),
     ];
 
+    /// `file_tlds` = the TLDs that are also extensions of files people name in a search (`lib.so`, `main.cc`); the
+    /// two other collisions, `.ai` and `.app`, are common product domains (`x.ai`), so they stay hosts anywhere.
+    #[test]
+    fn file_tlds_are_derived() {
+        let files = "md rs py sh zip mov java tf pl ml json toml yaml yml txt lock js ts jsx tsx mjs go c h cpp rb php \
+            css html xml csv sql ini cfg conf log env png jpg gif svg mp4 pdf docx tar gz exe dmg deb wasm dll so cc pm cr mk ps";
+        let derived: Vec<&str> = files.split_whitespace().filter(|e| WORDS.tlds.contains(e)).collect();
+        assert_eq!(derived, WORDS.file_tlds);
+        // the two collisions kept hosts anywhere (`x.ai`, `foo.app`)
+        assert!(["ai", "app"].iter().all(|t| WORDS.tlds.contains(t) && !WORDS.file_tlds.contains(t)));
+        assert_eq!((WORDS.tlds.len(), WORDS.tlds[0], WORDS.tlds.last().copied()), (1437, "aaa", Some("zw")));
+        // `site:` and a `/` name a host by shape alone, a TLD or not
+        assert_eq!(
+            (c("rust site:wiki.corp").get("site"), c("wiki.corp/a b").urls[0].as_str()),
+            (Some("wiki.corp"), "https://wiki.corp/a")
+        );
+    }
+
     #[test]
     fn repair_table() {
         for (i, want) in REPAIRS {
@@ -1110,10 +1175,23 @@ mod tests {
             let got = c(i).ask.unwrap_or_default().replace(bin(), "fats");
             assert!(got.starts_with(want), "{i} → {got}");
         }
-        // `json` closing the words is the output mod; anywhere else it is a word
-        for (i, json, words) in [("rust news json", true, "rust news"), ("json parser", false, "json parser")] {
+        // `json` closing the words beside a page id or file is the output mod; on a search (a host's too) it is a
+        // word, `json:true` the mod
+        let searches = [
+            ("rust news json", "rust news json"),
+            ("json parser", "json parser"),
+            ("example.com rust json", "rust json"),
+        ];
+        for (i, json, words) in searches.map(|(i, w)| (i, false, w)) {
             let got = c(i);
             assert_eq!((got.has("json"), got.words.join(" ").as_str()), (json, words), "{i}");
+        }
+        let mod_on = c("rust news json:true");
+        assert!(mod_on.flag("json"));
+        assert_eq!(mod_on.words, ["rust", "news"]);
+        // a `?`/`!` row is no search: its closing `json` stays the switch
+        for asked in ["whoami json", "stts json"] {
+            assert!(c(asked).has("json") && !c(asked).words.contains(&"json".to_string()), "{asked}");
         }
         assert!(c("u1 price json").has("json") && c("u1 price json").words == ["price"]);
         // two command words and no page are the command (`guide all` = the card), never a search for one of them;

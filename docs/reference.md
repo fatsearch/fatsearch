@@ -86,7 +86,8 @@ Several inputs in one command (`fats a.html b.pdf https://…`) are one job: a `
 
 Modifiers are `key:value`: `match:exact|words|near|topic`, `dry:true` (show the plan and its price, spend
 nothing), `json:true` (one JSON record per input, so `fats a.html b.pdf json:true` prints two lines carrying
-`i`; `FATS_JSON=1` does the same; a trailing bare `json` after other words is the same mod), `limit:20` (at most
+`i`; `FATS_JSON=1` does the same; beside a page id or file a trailing bare `json` is the same mod, after search
+words it is a word: use `json:true`), `limit:20` (at most
 this many links or filter hits; lists stop at ~300 tokens anyway), `max:1k` (cap the output at about that many
 tokens; the last row says what was cut), `fresh:true` (fetch again instead of reading the cache; a new id,
 except a search result, which is refilled), `wait:30` (seconds before a running fetch answers `pending`, 0–300).
@@ -108,6 +109,10 @@ Search modifiers: `limit:5` (results, 1–20, default 10), `country:de` (results
 it `FATS_COUNTRY`, else US), `site:docs.rs` (prepended to the query as `site:`), `since:7d` / `since:2026-01` (appended as
 `after:YYYY-MM-DD`, a hint to the search engine, not a filter: the APIs have no date parameter),
 `provider:oxy|bd`, `timeout:` (seconds per provider, default 15), `hedge:` (default 2.5 s for a search), `cost:`.
+A bare name is a site only when it ends in a real top-level domain (`docs.rs`, `example.com`; `opencode.json`,
+`main.go` are words). One whose ending is also a file extension (`.rs`, `.md`, `.py`, `.sh`, `.zip`, …) is a site
+only as the first word (`fats docs.rs tokio spawn`); later it is a word (`fats cargo build main.rs`). A `/`, a
+scheme or `site:` always names a site.
 The Oxylabs Web API is asked first; when it fails or has not answered within the hedge delay, Bright Data runs
 the same query on Google through the Web Unlocker zone, billed as one unlocker request ($0.0015; the zone
 counter shows it). A search waits up to `wait:` (30 s); when its first keyed provider usually takes

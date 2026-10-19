@@ -1872,7 +1872,7 @@ fn gh_lists_repositories() {
     assert_eq!(CALLS.load(Ordering::SeqCst), calls + 2, "the search and the account, at once");
     run("gh two words fetch:0");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls + 3, "a phrase is no login");
-    let out = run("gh ghnobody fetch:0 json");
+    let out = run("gh ghnobody fetch:0 json:true");
     assert!(out.contains(r#""provider":"github""#), "the HOW note never leaks into the record: {out}");
     for (q, note) in
         [("ghnobody", " · no user ghnobody · "), ("ghcore", " · user lookup: rate_limited retry in 720s · ")]
@@ -1938,7 +1938,7 @@ fn gh_without_a_token_says_its_limit() {
     }
     let out = run("gh ghok fetch:0");
     assert!(out.contains(" · 2 results · github · no token: 10 searches/min · "), "{out}");
-    assert!(run("gh ghok fetch:0 json").contains(r#""provider":"github""#));
+    assert!(run("gh ghok fetch:0 json:true").contains(r#""provider":"github""#));
 }
 
 /// A sign-in gate (plain redirected to an onboarding shell that carries the asked path back) gets ONE paid render,

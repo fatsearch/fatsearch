@@ -5,6 +5,27 @@ versions: [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Numbers co
 Silicon Mac, one run each unless a range is given; provider results move run to run.
 Method: [docs/benchmarks.md](docs/benchmarks.md).
 
+## 0.1.3 - 2026-10-19
+
+### Added
+- `skills/fatsearch/SKILL.md`: the usage skill for agents (Agent Skills standard; `npx skills add fatsearch/fatsearch`,
+  `gh skill install fatsearch/fatsearch`): the rules learned from agents misreading pages, the loop, the `=` line.
+- `AGENTS.md` for coding agents changing this repository: build, gates, the rules that reject a change, the file map.
+
+### Fixed
+- A file name among the search words (`opencode.json`, `next.config.mjs`, `cargo build main.rs`) stays a search
+  word; it no longer turns the search into a paid `site:` search on a host that does not exist. A bare name is a
+  site only when it ends in a real top-level domain; `fats docs.rs tokio spawn` still searches docs.rs.
+
+### Changed
+- A search ending in the word `json` (`fats vite config json`, `fats example.com rust json`) now searches for it
+  instead of printing JSON; beside a page id or file (`fats u1 price json`) it is still the JSON switch. Scripts
+  that wrote `fats <words> json` write `fats <words> json:true`.
+- README rewritten: the banner, the race picture (one page, six readers, real token counts), the cost table, the
+  three-step start, "For agents". The measurement is recorded in `docs/benchmarks.md` ("One page, six readers").
+- README and installation: every channel is live (Homebrew, npm/npx, crates.io, cargo-binstall, MCP Registry);
+  the "not published yet" marks are gone; version badges read from the registries.
+
 ## 0.1.2 - 2026-10-17
 
 ### Added

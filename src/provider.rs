@@ -310,10 +310,7 @@ async fn plain(ask: &Ask, wait: Duration) -> Result<Raw, Fail> {
 /// sniffed); a file (PDF, zip) stays bytes. The one rule for every carrier of a page's bytes (plain, Bright Data
 /// raw, a local file).
 pub fn decode_body(body: Vec<u8>, declared: Option<&str>) -> (Vec<u8>, &'static str) {
-    match crate::clean::sniff(&body) {
-        None => crate::clean::decode(body, declared),
-        Some(_) => (body, ""),
-    }
+    if crate::clean::sniff(&body).is_some() { (body, "") } else { crate::clean::decode(body, declared) }
 }
 
 // ---------------------------------------------------------------- private-address fence

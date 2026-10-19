@@ -145,3 +145,27 @@ score.
 - `timeout:8` with both keys ends at 8.09 s (0.1.0): one wall for every render in the run.
 - A 53 MB HTML page is refused at the default 16 MiB cap in 10 ms (27 MB RSS); with `max_bytes:64m` it is cleaned
   in 2.95 s at 743 MB RSS. A 16 MB page: 0.88 s, 239 MB RSS.
+
+## One page, six readers
+
+2026-10-17 17:43 EEST, one run each, default settings. Page: `https://en.wikipedia.org/wiki/Rust_(programming_language)`.
+Tokens = Anthropic `POST /v1/messages/count_tokens` (a real tokenizer, not an estimate) over the kept captures;
+bytes = the capture file's size. The README's race picture and its cost table come from this run: the picture's
+1,384 is outline + filter + section, the table's 918 is outline + section.
+
+| reader (default settings) | bytes returned | tokens |
+|---|--:|--:|
+| Firecrawl v2 `/scrape`, markdown | 239,357 | 112,517 |
+| Bright Data Web Unlocker, markdown | 218,850 | 103,625 |
+| Oxylabs Web API `/v1/scrape`, markdown, no JS | 216,346 | 102,609 |
+| Tavily `/extract`, basic | 206,278 | 97,504 |
+| Jina Reader `r.jina.ai` (no key) | 201,602 | 94,415 |
+| `fats <url>` (outline) | 1,263 | 618 |
+| `fats u1 "Graydon Hoare"` (one filter) | 1,104 | 466 |
+| `fats u1#37` (one section) | 768 | 300 |
+
+The raw HTML (`curl`, ~1 MB, ~530k tokens) was not kept, so it is not in the table.
+
+The fetch was plain HTTP for `fats` ($0). The "model bill" column in the README assumes $2 per million input
+tokens (Claude Sonnet 5.5 input, checked 2026-10-19); put your model's price in. The raw captures are kept with the website's source
+([`measure/`](https://github.com/fatsearch/FATSEARCH.COM-WEBSITE/tree/main/measure)).

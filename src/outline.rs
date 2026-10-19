@@ -2,11 +2,13 @@
 
 use crate::cache::{Cursor, Meta};
 use crate::clean::{
-    CARD, COMMENT, Doc, Info, LREF, Line, PIECE, Section, collapse, fold, host_of, is_word, paragraph, tok, tok_cut,
+    CARD, COMMENT, Doc, Info, LISTS, LREF, Line, PIECE, Section, collapse, fold, host_of, is_word, paragraph, tok,
+    tok_cut,
 };
+use crate::fetch::{JS_QUOTE, fail_row, move_code, spent, title_head};
 use crate::html::py_strip;
-use crate::lang::{Flag, Id, bin, cut, ksize, letters, short};
-use crate::provider::Tier;
+use crate::lang::{Flag, Id, WORDS, bin, cut, ksize, letters, priced, restamp, short, uniq};
+use crate::provider::{Tier, domain_country};
 use crate::settings::limit;
 use std::cmp::Reverse;
 
@@ -147,10 +149,7 @@ pub fn preview(text: &str, n: usize) -> String {
 /// Distinct words of ≥ 3 word chars, folded, in order of appearance.
 fn words3(s: &str) -> Vec<String> {
     let f = fold(s);
-    crate::lang::uniq(
-        f.split(|c: char| !is_word(c)).filter(|w| w.chars().count() >= 3).map(String::from),
-        String::clone,
-    )
+    uniq(f.split(|c: char| !is_word(c)).filter(|w| w.chars().count() >= 3).map(String::from), String::clone)
 }
 
 /// A section's outline preview. Clean and hard renders pruned the chrome, so their first n chars are content.
@@ -210,7 +209,7 @@ fn title_query(doc: &Doc) -> Vec<String> {
     if doc.mode != "light" {
         return Vec::new();
     }
-    words3(&doc.title).into_iter().filter(|w| !crate::lang::WORDS.stop.contains(&w.as_str())).take(64).collect()
+    words3(&doc.title).into_iter().filter(|w| !WORDS.stop.contains(&w.as_str())).take(64).collect()
 }
 
 pub fn info_line(info: &Info) -> String {
@@ -330,7 +329,7 @@ pub fn outline(p: &Page, prov: Option<&str>) -> Shown {
     let skipped = p.meta.extra.get("skipped").and_then(|v| v.as_array()).into_iter().flatten();
     let set = |r: &&str| crate::fetch::keyed().iter().any(|t| r.starts_with(&format!("! no_key {} ", t.spec().short)));
     let rows = skipped.filter_map(|r| r.as_str()).filter(|r| !set(r));
-    lines.extend(rows.map(|r| format!("{id} {}", crate::lang::restamp(r, id, &p.meta.url))));
+    lines.extend(rows.map(|r| format!("{id} {}", restamp(r, id, &p.meta.url))));
     let il = Some(info_line(&doc.info)).filter(|il| !il.is_empty());
     lines.extend(il.map(|il| format!("{id}#0 info | {}", preview(&il, 150))));
     // content media only (`Media::demoted` rows come last), unless the page has nothing else
@@ -342,7 +341,7 @@ pub fn outline(p: &Page, prov: Option<&str>) -> Shown {
     let head = lines[0].replace(&photos(doc, p.meta), "") + &flags(p);
     let used = tok(&head) + lines[1..].iter().map(|x| tok(x)).sum::<usize>();
     lines.extend(media);
-    if crate::clean::LISTS.text.contains(&doc.mode.as_str()) {
+    if LISTS.text.contains(&doc.mode.as_str()) {
         return text_outline(p, lines);
     }
     let cursor = Some(Cursor { u: 0, ..Cursor::default() });
@@ -411,7 +410,7 @@ fn head_line(p: &Page, prov: Option<&str>, size: usize) -> String {
             let pages = if n == 1 { "page" } else { "pages" };
             format!("pdf · {n} {pages}{}", ms.map(|m| format!(" · read {}ms/page", m / n.max(1))).unwrap_or_default())
         }
-        kind if crate::clean::LISTS.text.contains(&kind) => {
+        kind if LISTS.text.contains(&kind) => {
             let lines = crate::text::lines(doc);
             format!("{kind} {} KB {lines} {}", meta.bytes.div_ceil(1024), if lines == 1 { "line" } else { "lines" })
         }
@@ -551,7 +550,7 @@ const ANCHOR: usize = 25;
 fn anchor(doc: &Doc, from: usize, any: bool) -> Option<Id> {
     let info = |k: &str| doc.info.get(k).map(|v| fold(v));
     let own = |t: &str| crate::fetch::words_of(t).len() >= 2;
-    let head = own(crate::fetch::title_head(&doc.title));
+    let head = own(title_head(&doc.title));
     let title = Some(fold(&doc.title)).filter(|t| head && info("site").as_ref() != Some(t));
     let alt = doc.media.iter().find(|m| !m.demoted).map(|m| fold(&m.alt));
     // a description too short to anchor falls back to the title (review 2026-10-14 #19)
@@ -625,12 +624,12 @@ pub fn record_in(doc: &Doc, meta: &Meta, log: &[String]) -> Option<String> {
 /// that copy's row, `fetch::fix_arg`), or a paid ask brought this copy back. An app page (`no_copy`) gets it
 /// too: every `!` has a next step, the agent decides on the price.
 fn js_next(p: &Page) -> Option<String> {
-    let done = crate::fetch::spent(p.meta, &[], &crate::fetch::keyed());
+    let done = spent(p.meta, &[], &crate::fetch::keyed());
     let tried = |t: Tier| p.at.4.iter().flat_map(|o| &o.hops).any(|h| h.provider == t.spec().name);
     let left = Tier::ALL.into_iter().any(|t| t.can("js") && !done.contains(&t.spec().short) && !tried(t));
     let m = Some(p.meta).filter(|m| m.url.starts_with("http") && left && !p.at.2)?;
-    let js = crate::lang::priced(&format!("{} {} js:true", bin(), p.id), &m.url);
-    Some(format!("{js} {}", crate::fetch::JS_QUOTE))
+    let js = priced(&format!("{} {} js:true", bin(), p.id), &m.url);
+    Some(format!("{js} {}", JS_QUOTE))
 }
 
 /// ` · 56 of 224 numbers pruned` (a COUNT group of the `=` line): numbers the light render holds that the served one
@@ -669,15 +668,14 @@ fn page_flags(p: &Page) -> Vec<Flag> {
         let read =
             (doc.mode == "pdf").then(|| format!("{} of {n} pages read · ", n - crate::pdf::empty_pages(doc).len()));
         let (url, tried) = (short(&doc.final_url, 50), meta.tried());
-        let (why, again, fix, _) = crate::fetch::fail_row(meta, &p.at.4, "", id, p.at.1.is_some());
+        let (why, again, fix, _) = fail_row(meta, &p.at.4, "", id, p.at.1.is_some());
         // a copy holding the page's own words says so and points at them, never "nothing left"
         let (shown, copy) = if anchored { (" · page content shown", "") } else { ("", " · showing the best copy") };
         // why the run failed, as on a failed copy without a doc (`bd cut at 60 s (3m ago)`); the failure count, never
         // beside a newer copy that served (its row points there)
         let why = if why.is_empty() { why } else { format!(" · {why}") };
         // an app page's way out, or a stored copy of the page (never "nothing left" with the page in the cache)
-        let next =
-            held.clone().or(way.take().filter(|_| crate::fetch::move_code(meta) == "no_copy" || p.at.1.is_some()));
+        let next = held.clone().or(way.take().filter(|_| move_code(meta) == "no_copy" || p.at.1.is_some()));
         let again = if next.is_some() && fix.is_some() { "" } else { &again }; // the fix's `one more try` goes with it
         let what = format!("{}{url} · tried {tried}{copy}{why}{again}", read.unwrap_or_default());
         v.push(flag(&format!("{}{shown}", meta.code), what, next.or(fix).unwrap_or_default()));
@@ -725,7 +723,7 @@ fn geo_flags(p: &Page) -> Vec<Flag> {
     let flag = |(lang, tier): (&str, Tier)| {
         let asked = p.at.3.1 && !meta.country.is_empty();
         let fix = geo_fix(&meta.url, &meta.country, tier, &crate::fetch::keyed()).filter(|_| !asked);
-        let fix = fix.map(|f| crate::lang::priced(&format!("{b} {} {f}", p.id), &meta.url));
+        let fix = fix.map(|f| priced(&format!("{b} {} {f}", p.id), &meta.url));
         let next = p.at.3.0.clone().map(|n| format!("{b} {n}")).or(fix);
         let what = match (asked, next.is_some()) {
             (true, _) => format!("· served in {lang} (asked {sent})"),
@@ -741,7 +739,7 @@ fn geo_flags(p: &Page) -> Vec<Flag> {
 /// : the domain's country, else `FATS_COUNTRY` (`us`), when another (or none) was sent; else the other
 /// provider when `keys` hold it; else none (the copy is what the providers give: a COUNT, `flags`).
 fn geo_fix(url: &str, sent: &str, served: Tier, keys: &[Tier]) -> Option<String> {
-    let cc = crate::provider::domain_country(url).unwrap_or_else(crate::provider::home);
+    let cc = domain_country(url).unwrap_or_else(crate::provider::home);
     if cc != sent {
         return Some(format!("country:{} fresh:true", cc.to_lowercase()));
     }
@@ -822,9 +820,8 @@ fn text_outline(p: &Page, mut lines: Vec<String>) -> Shown {
 /// One outline row per top-level section that is not a folded link list: `u3#2 Title (1.2k, 3 sub) | preview`.
 fn top_rows(doc: &Doc, id: &str, lists: &[usize]) -> Vec<String> {
     let (secs, tq) = (&doc.sections, title_query(doc));
-    let mut rows = Vec::new();
     let tops = secs[..doc.served()].iter().enumerate().map(|(i, s)| (i + 1, s));
-    for (k, s) in tops.filter(|(k, s)| s.level <= doc.top && !lists.contains(k)) {
+    let row = |(k, s): (usize, &Section)| {
         let sp = span(doc, k);
         let sub = sp.len() - 1;
         // the page's top part (text before its first heading, level 0) whole up to `top_part_tok`: a state banner
@@ -838,9 +835,9 @@ fn top_rows(doc: &Doc, id: &str, lists: &[usize]) -> Vec<String> {
         }
         let own: Vec<usize> = sp.iter().copied().filter(|&j| j == k || secs[j - 1].level > doc.top).collect();
         let size = ksize(sec_tokens(doc, k)) + &counts(doc, &own, sub);
-        rows.push(format!("{} ({size}) | {pv}", format!("{id}#{k} {}", cut(&s.title, 60)).trim_end()));
-    }
-    rows
+        format!("{} ({size}) | {pv}", format!("{id}#{k} {}", cut(&s.title, 60)).trim_end())
+    };
+    tops.filter(|(k, s)| s.level <= doc.top && !lists.contains(k)).map(row).collect()
 }
 
 pub fn outline_all(p: &Page) -> Shown {
@@ -931,16 +928,14 @@ fn more(parts: &[Vec<String>], part: usize, next: &str) -> Option<String> {
 /// Sections `ks` as read: each one's lines under its `## Title` head, the head led by `tag` (None = no head, the
 /// section a read opens).
 fn body(doc: &Doc, ks: &[usize], tag: impl Fn(usize) -> Option<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    for &k in ks {
+    let part = |&k: &usize| {
         let s = &doc.sections[k - 1];
         // a comment's head is its size, never its first words again (they follow), indented by its depth
         let (pad, n) = ("  ".repeat(s.level.saturating_sub(COMMENT)), span(doc, k).len() - 1);
         let head = if s.level < COMMENT { "#".repeat(s.level.max(1)) + " " + &s.title } else { format!("replies {n}") };
-        out.extend(tag(k).map(|t| format!("{pad}{t}{head}")));
-        out.extend(s.lines.iter().cloned());
-    }
-    out
+        tag(k).map(|t| format!("{pad}{t}{head}")).into_iter().chain(s.lines.iter().cloned())
+    };
+    ks.iter().flat_map(part).collect()
 }
 
 /// The parts `fats uN#k<part>` reads: section k with its subsections (a comment: its own text, its replies are

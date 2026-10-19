@@ -1007,7 +1007,7 @@ fn oversized_input_is_refused() {
     // the built-in tables (src/data/*.json) are counted where every other setting is shown
     assert!(s.run("config").0.contains(
         "
-tables 7 files · 559 rows · built-in · providers 43, errors 49, check 86, sites 42, clean 167, words 134, limits 38
+tables 7 files · 2012 rows · built-in · providers 43, errors 49, check 86, sites 42, clean 167, words 1587, limits 38
 "
     ));
     // every behaviour threshold is a row of its own
@@ -1572,6 +1572,45 @@ fn search_dry_shows_the_hedge() {
     assert!(out.contains("via bd → bd retry · limit:10 · wait:30s → new u1-u10 · up to $0.0030"), "{out}");
     let out = bd("rust news dry:true wait:5");
     assert!(out.contains("via bd · limit:10 · wait:5s → new u1-u10 · up to $0.0015"), "{out}");
+}
+
+/// A bare name is a host only with a real TLD; a TLD that is also a file extension (`.rs`) only leading the command;
+/// a closing bare `json` on a search is a word. Each case's dry plan: the query searched, or the page fetched.
+#[test]
+fn a_host_needs_a_real_tld_and_json_ends_a_search_as_a_word() {
+    let s = Sandbox::new("search-words");
+    let keyed = |cmd: &str| {
+        let mut run = s.cmd(&format!("{cmd} dry:true"));
+        let o = run.env_remove("FATS_OFFLINE").env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    for (cmd, query) in [
+        ("opencode mcp config opencode.json", "opencode mcp config opencode.json"),
+        ("pyproject.toml build backend options", "pyproject.toml build backend options"),
+        ("nextjs next.config.mjs", "nextjs next.config.mjs"),
+        ("main.go error", "main.go error"),
+        ("logo.png size", "logo.png size"),
+        ("cargo build main.rs", "cargo build main.rs"),
+        ("build lib.so", "build lib.so"),
+        ("rust x.ai", "site:x.ai rust"),
+        ("vite config json", "vite config json"),
+        ("docs.rs tokio spawn", "site:docs.rs tokio spawn"),
+        ("main.rs error handling", "site:main.rs error handling"),
+        ("example.com rust json", "site:example.com rust json"),
+        ("rust blog.rust-lang.org", "site:blog.rust-lang.org rust"),
+        ("serde site:docs.rs/serde", "site:docs.rs/serde serde"),
+    ] {
+        let out = keyed(cmd);
+        assert!(out.contains(&format!("\nsearch \"{query}\" via oxy")), "{cmd}: {out}");
+    }
+    for (cmd, host) in [("docs.rs", "docs.rs"), ("example.com", "example.com"), ("x.co", "x.co"), ("a.io", "a.io")] {
+        let out = keyed(cmd);
+        assert!(
+            out.starts_with(&format!("= dry https://{host} ")) && out.contains(&format!("\n{host} fetch ")),
+            "{out}"
+        );
+    }
+    assert!(keyed("vite config json:true").starts_with('{'), "json:true is the output mod");
 }
 
 /// One real fetch, run by hand: `FATS_LIVE=1 cargo test --locked -- --ignored live_plain`.

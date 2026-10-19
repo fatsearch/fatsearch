@@ -217,10 +217,8 @@ pub fn fold(s: &str) -> String {
             let len = if syl.is_multiple_of(28) { 2 } else { 3 };
             out.extend(jamo[..len].iter().filter_map(|&j| char::from_u32(j)));
         } else if !combining(cp) {
-            match FOLD.binary_search_by_key(&cp, |&(k, _)| k) {
-                Ok(at) => out.push_str(FOLD[at].1),
-                Err(_) => out.push(c),
-            }
+            let at = FOLD.binary_search_by_key(&cp, |&(k, _)| k);
+            if let Ok(at) = at { out.push_str(FOLD[at].1) } else { out.push(c) }
         }
     }
     out.to_lowercase()

@@ -74,10 +74,8 @@ fn xml_outline(t: &str) -> String {
     while let Some(o) = t[i..].find('<') {
         let (s, tail) = (i + o, &t[i + o..]);
         let skip = [("<!--", "-->"), ("<![CDATA[", "]]>")].iter().find(|(a, _)| tail.starts_with(a));
-        let end = match skip {
-            Some((_, b)) => tail.find(b).map_or(tail.len(), |e| e + b.len()),
-            None => tail.find('>').map_or(tail.len(), |e| e + 1),
-        };
+        let close = skip.map_or(">", |(_, b)| b);
+        let end = tail.find(close).map_or(tail.len(), |e| e + close.len());
         i = s + end;
         let tag = &tail[..end];
         if skip.is_some() || tag.starts_with("<?") || tag.starts_with("<!") {

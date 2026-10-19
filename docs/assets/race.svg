@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="528" viewBox="0 0 960 528" role="img" aria-label="Same question, same answer in two AI chats. With fats the agent reads an outline, a filter and one section: 1,384 tokens in context. With Firecrawl the whole page lands in context: 112,517 tokens, 81 times more.">
+<style>
+.s{font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;fill:#f0f2f4} .t{font:500 13.5px -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;fill:#f0f2f4} .c{font:500 12px -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
+.h{font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;fill:#a6abb2;white-space:pre} .hb{font-weight:600;fill:#f0f2f4} .ha{font:11px ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;fill:#7b8187}
+.m{font:10.6px ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;white-space:pre} .m2{font:11.5px ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace} .f{fill:#7b8187}
+.mf{fill:#94ccf3} .mo{fill:#a6abb2} .more{fill:#7b8187} .bad{fill:#fd736d;font-weight:700}
+.cap{font:600 11.5px -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;letter-spacing:.08em}
+.f0{opacity:0;animation:f0 10s infinite}@keyframes f0{0%,4.00%{opacity:0}5.20%,95.00%{opacity:1}100%{opacity:0}}
+.f1{opacity:0;animation:f1 10s infinite}@keyframes f1{0%,11.00%{opacity:0}12.20%,95.00%{opacity:1}100%{opacity:0}}
+.f2{opacity:0;animation:f2 10s infinite}@keyframes f2{0%,17.00%{opacity:0}18.20%,95.00%{opacity:1}100%{opacity:0}}
+.f3{opacity:0;animation:f3 10s infinite}@keyframes f3{0%,17.60%{opacity:0}18.80%,95.00%{opacity:1}100%{opacity:0}}
+.f4{opacity:0;animation:f4 10s infinite}@keyframes f4{0%,18.20%{opacity:0}19.40%,95.00%{opacity:1}100%{opacity:0}}
+.f5{opacity:0;animation:f5 10s infinite}@keyframes f5{0%,18.80%{opacity:0}20.00%,95.00%{opacity:1}100%{opacity:0}}
+.f6{opacity:0;animation:f6 10s infinite}@keyframes f6{0%,21.80%{opacity:0}23.00%,95.00%{opacity:1}100%{opacity:0}}
+.f7{opacity:0;animation:f7 10s infinite}@keyframes f7{0%,27.80%{opacity:0}29.00%,95.00%{opacity:1}100%{opacity:0}}
+.f8{opacity:0;animation:f8 10s infinite}@keyframes f8{0%,28.40%{opacity:0}29.60%,95.00%{opacity:1}100%{opacity:0}}
+.f9{opacity:0;animation:f9 10s infinite}@keyframes f9{0%,29.00%{opacity:0}30.20%,95.00%{opacity:1}100%{opacity:0}}
+.f10{opacity:0;animation:f10 10s infinite}@keyframes f10{0%,32.00%{opacity:0}33.20%,95.00%{opacity:1}100%{opacity:0}}
+.f11{opacity:0;animation:f11 10s infinite}@keyframes f11{0%,38.00%{opacity:0}39.20%,95.00%{opacity:1}100%{opacity:0}}
+.f12{opacity:0;animation:f12 10s infinite}@keyframes f12{0%,38.60%{opacity:0}39.80%,95.00%{opacity:1}100%{opacity:0}}
+.f13{opacity:0;animation:f13 10s infinite}@keyframes f13{0%,39.20%{opacity:0}40.40%,95.00%{opacity:1}100%{opacity:0}}
+.f14{opacity:0;animation:f14 10s infinite}@keyframes f14{0%,42.20%{opacity:0}43.40%,95.00%{opacity:1}100%{opacity:0}}
+.f15{opacity:0;animation:f15 10s infinite}@keyframes f15{0%,48.20%{opacity:0}49.40%,95.00%{opacity:1}100%{opacity:0}}
+.fs{transform:translateY(-182px);animation:fs 10s infinite}@keyframes fs{0%{transform:translateY(0)}32.00%{transform:translateY(0px)}33.50%{transform:translateY(-1px)}38.00%{transform:translateY(-1px)}39.50%{transform:translateY(-35px)}38.60%{transform:translateY(-35px)}40.10%{transform:translateY(-61px)}39.20%{transform:translateY(-61px)}40.70%{transform:translateY(-77px)}42.20%{transform:translateY(-77px)}43.70%{transform:translateY(-113px)}48.20%{transform:translateY(-113px)}49.70%{transform:translateY(-182px)}95.00%{transform:translateY(-182px)}100%{transform:translateY(0)}}
+.fn0{opacity:0;animation:fn0 10s infinite}@keyframes fn0{0%,0.00%{opacity:0}0.10%,21.80%{opacity:1}21.90%,100%{opacity:0}}
+.fn1{opacity:0;animation:fn1 10s infinite}@keyframes fn1{0%,21.80%{opacity:0}21.90%,32.00%{opacity:1}32.10%,100%{opacity:0}}
+.fn2{opacity:0;animation:fn2 10s infinite}@keyframes fn2{0%,32.00%{opacity:0}32.10%,42.20%{opacity:1}42.30%,100%{opacity:0}}
+.fn3{opacity:0;animation:fn3 10s infinite}@keyframes fn3{0%,42.20%{opacity:0}42.30%,95.00%{opacity:1}95.10%,100%{opacity:0}}
+.fb{transform-box:fill-box;transform-origin:0 0;transform:scaleX(0.0123);animation:fb 10s infinite}@keyframes fb{0.00%{transform:scaleX(0.0060)}21.80%{transform:scaleX(0.0060)}32.00%{transform:scaleX(0.0096)}42.20%{transform:scaleX(0.0123)}95.00%{transform:scaleX(0.0123)}100%{transform:scaleX(.006)}}
+.o0{opacity:0;animation:o0 10s infinite}@keyframes o0{0%,4.00%{opacity:0}5.20%,95.00%{opacity:1}100%{opacity:0}}
+.o1{opacity:0;animation:o1 10s infinite}@keyframes o1{0%,11.00%{opacity:0}12.20%,95.00%{opacity:1}100%{opacity:0}}
+.o2{opacity:0;animation:o2 10s infinite}@keyframes o2{0%,17.00%{opacity:0}18.20%,95.00%{opacity:1}100%{opacity:0}}
+.o3{opacity:0;animation:o3 10s infinite}@keyframes o3{0%,17.60%{opacity:0}18.80%,95.00%{opacity:1}100%{opacity:0}}
+.o4{opacity:0;animation:o4 10s infinite}@keyframes o4{0%,18.20%{opacity:0}19.40%,95.00%{opacity:1}100%{opacity:0}}
+.o5{opacity:0;animation:o5 10s infinite}@keyframes o5{0%,18.80%{opacity:0}20.00%,95.00%{opacity:1}100%{opacity:0}}
+.o6{opacity:0;animation:o6 10s infinite}@keyframes o6{0%,19.40%{opacity:0}20.60%,95.00%{opacity:1}100%{opacity:0}}
+.o7{opacity:0;animation:o7 10s infinite}@keyframes o7{0%,20.00%{opacity:0}21.20%,95.00%{opacity:1}100%{opacity:0}}
+.o8{opacity:0;animation:o8 10s infinite}@keyframes o8{0%,20.60%{opacity:0}21.80%,95.00%{opacity:1}100%{opacity:0}}
+.o9{opacity:0;animation:o9 10s infinite}@keyframes o9{0%,21.20%{opacity:0}22.40%,95.00%{opacity:1}100%{opacity:0}}
+.o10{opacity:0;animation:o10 10s infinite}@keyframes o10{0%,21.80%{opacity:0}23.00%,95.00%{opacity:1}100%{opacity:0}}
+.o11{opacity:0;animation:o11 10s infinite}@keyframes o11{0%,22.40%{opacity:0}23.60%,95.00%{opacity:1}100%{opacity:0}}
+.o12{opacity:0;animation:o12 10s infinite}@keyframes o12{0%,23.00%{opacity:0}24.20%,95.00%{opacity:1}100%{opacity:0}}
+.o13{opacity:0;animation:o13 10s infinite}@keyframes o13{0%,23.60%{opacity:0}24.80%,95.00%{opacity:1}100%{opacity:0}}
+.o14{opacity:0;animation:o14 10s infinite}@keyframes o14{0%,24.20%{opacity:0}25.40%,95.00%{opacity:1}100%{opacity:0}}
+.o15{opacity:0;animation:o15 10s infinite}@keyframes o15{0%,24.80%{opacity:0}26.00%,95.00%{opacity:1}100%{opacity:0}}
+.o16{opacity:0;animation:o16 10s infinite}@keyframes o16{0%,25.40%{opacity:0}26.60%,95.00%{opacity:1}100%{opacity:0}}
+.o17{opacity:0;animation:o17 10s infinite}@keyframes o17{0%,28.40%{opacity:0}29.60%,95.00%{opacity:1}100%{opacity:0}}
+.o18{opacity:0;animation:o18 10s infinite}@keyframes o18{0%,34.40%{opacity:0}35.60%,95.00%{opacity:1}100%{opacity:0}}
+.os{transform:translateY(-134px);animation:os 10s infinite}@keyframes os{0%{transform:translateY(0)}24.80%{transform:translateY(0px)}26.30%{transform:translateY(-13px)}25.40%{transform:translateY(-13px)}26.90%{transform:translateY(-29px)}28.40%{transform:translateY(-29px)}29.90%{transform:translateY(-65px)}34.40%{transform:translateY(-65px)}35.90%{transform:translateY(-134px)}95.00%{transform:translateY(-134px)}100%{transform:translateY(0)}}
+.on0{opacity:0;animation:on0 10s infinite}@keyframes on0{0%,0.00%{opacity:0}0.10%,19.40%{opacity:1}19.50%,100%{opacity:0}}
+.on1{opacity:0;animation:on1 10s infinite}@keyframes on1{0%,19.40%{opacity:0}19.50%,21.80%{opacity:1}21.90%,100%{opacity:0}}
+.on2{opacity:0;animation:on2 10s infinite}@keyframes on2{0%,21.80%{opacity:0}21.90%,24.20%{opacity:1}24.30%,100%{opacity:0}}
+.on3{opacity:0;animation:on3 10s infinite}@keyframes on3{0%,24.20%{opacity:0}24.30%,28.40%{opacity:1}28.50%,100%{opacity:0}}
+.on4{opacity:0;animation:on4 10s infinite}@keyframes on4{0%,28.40%{opacity:0}28.50%,95.00%{opacity:1}95.10%,100%{opacity:0}}
+.ob{transform-box:fill-box;transform-origin:0 0;transform:scaleX(1.0000);animation:ob 10s infinite}@keyframes ob{0.00%{transform:scaleX(0.0060)}19.40%{transform:scaleX(0.1084)}21.80%{transform:scaleX(0.2160)}24.20%{transform:scaleX(0.3244)}28.40%{transform:scaleX(1.0000)}95.00%{transform:scaleX(1.0000)}100%{transform:scaleX(.006)}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}g[class]{opacity:1!important}.num{opacity:0!important}.num.fin{opacity:1!important}}
+</style>
+<text x="235" y="15" text-anchor="middle" class="cap" fill="#f9d460">WITH FATS · 1,384 TOKENS</text>
+<text x="725" y="15" text-anchor="middle" class="cap" fill="#fd736d">WITH FIRECRAWL · 112,517 TOKENS</text>
+<g transform="translate(0 26)">
+<rect x=".5" y=".5" width="469" height="501" rx="18" fill="#090c11" stroke="#f9d460" stroke-opacity="0.55"/>
+<text x="18" y="29" class="t">Who made Rust?</text>
+<rect x="357.4" y="13" width="94.6" height="24" rx="12" fill="#f9d460" fill-opacity=".12" stroke="#f9d460" stroke-opacity=".5"/>
+<text x="404.7" y="29" text-anchor="middle" class="c" fill="#f9d460">tool · fats</text>
+<line x1="0" y1="46.5" x2="470" y2="46.5" stroke="#292e35"/>
+<clipPath id="fc"><rect x="0" y="47" width="470" height="371"/></clipPath>
+<g clip-path="url(#fc)"><g transform="translate(0 46)"><g class="fs"><g class="f0" transform="translate(0 18)"><rect x="150.89999999999998" y="0" width="301.1" height="56" rx="16" fill="#12161c"/><text x="166.89999999999998" y="22" class="s">yo can u grab me who made Rust and what</text><text x="166.89999999999998" y="41" class="s">safety stuff it actually guarantees?</text></g>
+<g class="f1" transform="translate(0 92)"><circle cx="30" cy="10" r="12" fill="#f9d460" fill-opacity=".18"/><path transform="translate(23 3) scale(.58)" d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z" fill="#f9d460"/><text x="52" y="14" class="s">On it, reading the Wikipedia page.</text></g>
+<g class="f2" transform="translate(0 123)"><rect x="52" y="0" width="400" height="116" rx="10" fill="#0e1217" stroke="#292e35"/><path transform="translate(63 10) scale(.58)" d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z" fill="none" stroke="#f9d460" stroke-width="2.4" stroke-linejoin="round"/><text x="82" y="22" class="h"><tspan class="hb">fats</tspan>  <tspan class="ha">en.wikipedia.org/wiki/Rust_(programming_languag…</tspan></text><line x1="52" y1="34.5" x2="452" y2="34.5" stroke="#292e35"/></g>
+<g class="f3" transform="translate(0 167)"><text x="64" y="11" class="m mf">= j11.u46 Rust (programming language) - Wikipedia · en.wi…</text></g>
+<g class="f4" transform="translate(0 183)"><text x="64" y="11" class="m mf">u46#9 Syntax and features (9.2k, 27 sub) | [edit [l175] ]…</text></g>
+<g class="f5" transform="translate(0 199)"><text x="64" y="11" class="m mf">u46#37 Safety (305) | [edit [l278] ] Safety properties [l…</text></g>
+<g class="f6" transform="translate(0 215)"><text x="64" y="11" class="m more">… +9 lines</text></g>
+<g class="f7" transform="translate(0 251)"><rect x="52" y="0" width="400" height="100" rx="10" fill="#0e1217" stroke="#292e35"/><path transform="translate(63 10) scale(.58)" d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z" fill="none" stroke="#f9d460" stroke-width="2.4" stroke-linejoin="round"/><text x="82" y="22" class="h"><tspan class="hb">fats</tspan>  <tspan class="ha">u46 Graydon Hoare</tspan></text><line x1="52" y1="34.5" x2="452" y2="34.5" stroke="#292e35"/></g>
+<g class="f8" transform="translate(0 295)"><text x="64" y="11" class="m mf">= j11.u46 filter "Graydon Hoare" · 5 hit · match:exact+al…</text></g>
+<g class="f9" transform="translate(0 311)"><text x="64" y="11" class="m mf">u46#2 Software developer Graydon Hoare created Rust in 20…</text></g>
+<g class="f10" transform="translate(0 327)"><text x="64" y="11" class="m more">… +5 lines</text></g>
+<g class="f11" transform="translate(0 363)"><rect x="52" y="0" width="400" height="100" rx="10" fill="#0e1217" stroke="#292e35"/><path transform="translate(63 10) scale(.58)" d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z" fill="none" stroke="#f9d460" stroke-width="2.4" stroke-linejoin="round"/><text x="82" y="22" class="h"><tspan class="hb">fats</tspan>  <tspan class="ha">u46#37</tspan></text><line x1="52" y1="34.5" x2="452" y2="34.5" stroke="#292e35"/></g>
+<g class="f12" transform="translate(0 407)"><text x="64" y="11" class="m mf">= j11.u46#37 Safety · part 1/1 · up fats u46 · next fats …</text></g>
+<g class="f13" transform="translate(0 423)"><text x="64" y="11" class="m mf">Safety properties [l279] guaranteed by Rust include memor…</text></g>
+<g class="f14" transform="translate(0 439)"><text x="64" y="11" class="m more">… +3 lines</text></g>
+<g class="f15" transform="translate(0 475)"><text x="52" y="14" class="s">Graydon Hoare created Rust in 2006 at Mozilla. Safe Rust</text><text x="52" y="33" class="s">guarantees memory safety, type safety and data-race</text><text x="52" y="52" class="s">freedom; an unsafe block opts out.</text></g></g></g></g>
+<rect x="18" y="422" width="434" height="64" rx="18" fill="#0e1217" stroke="#3d434a"/>
+<text x="34" y="444" class="s f">Reply…</text>
+<circle cx="44" cy="470" r="12" fill="none" stroke="#3d434a"/><text x="44" y="475" text-anchor="middle" class="s f">+</text>
+<text x="70" y="474" class="m2 f">context</text>
+<rect x="128" y="467.5" width="184" height="5" rx="2.5" fill="#12161c"/>
+<rect class="fb" x="128" y="467.5" width="184" height="5" rx="2.5" fill="#f9d460"/>
+<text x="404" y="474" text-anchor="end" class="m2 num fn0"><tspan fill="#f9d460" font-weight="700">0</tspan><tspan class="f"> tok</tspan></text>
+<text x="404" y="474" text-anchor="end" class="m2 num fn1"><tspan fill="#f9d460" font-weight="700">618</tspan><tspan class="f"> tok</tspan></text>
+<text x="404" y="474" text-anchor="end" class="m2 num fn2"><tspan fill="#f9d460" font-weight="700">1,084</tspan><tspan class="f"> tok</tspan></text>
+<text x="404" y="474" text-anchor="end" class="m2 num fin fn3"><tspan fill="#f9d460" font-weight="700">1,384</tspan><tspan class="f"> tok</tspan></text>
+<circle cx="428" cy="470" r="14" fill="#12161c"/><path d="M428 476V464M423 469l5-5 5 5" fill="none" stroke="#7b8187" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<g transform="translate(490 26)">
+<rect x=".5" y=".5" width="469" height="501" rx="18" fill="#090c11" stroke="#3d434a" stroke-opacity="1"/>
+<text x="18" y="29" class="t">Who made Rust?</text>
+<rect x="324.4" y="13" width="127.6" height="24" rx="12" fill="#fd736d" fill-opacity=".12" stroke="#fd736d" stroke-opacity=".5"/>
+<text x="388.2" y="29" text-anchor="middle" class="c" fill="#fd736d">tool · Firecrawl</text>
+<line x1="0" y1="46.5" x2="470" y2="46.5" stroke="#292e35"/>
+<clipPath id="oc"><rect x="0" y="47" width="470" height="371"/></clipPath>
+<g clip-path="url(#oc)"><g transform="translate(0 46)"><g class="os"><g class="o0" transform="translate(0 18)"><rect x="150.89999999999998" y="0" width="301.1" height="56" rx="16" fill="#12161c"/><text x="166.89999999999998" y="22" class="s">yo can u grab me who made Rust and what</text><text x="166.89999999999998" y="41" class="s">safety stuff it actually guarantees?</text></g>
+<g class="o1" transform="translate(0 92)"><circle cx="30" cy="10" r="12" fill="#fd736d" fill-opacity=".18"/><path transform="translate(23 3) scale(.58)" d="M12 2l2.4 7.6L22 12l-7.6 2.4L12 22l-2.4-7.6L2 12l7.6-2.4z" fill="#fd736d"/><text x="52" y="14" class="s">On it, reading the Wikipedia page.</text></g>
+<g class="o2" transform="translate(0 123)"><rect x="52" y="0" width="400" height="292" rx="10" fill="#0e1217" stroke="#292e35"/><path transform="translate(63 10) scale(.58)" d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z" fill="none" stroke="#fd736d" stroke-width="2.4" stroke-linejoin="round"/><text x="82" y="22" class="h"><tspan class="hb">Firecrawl scrape</tspan>  <tspan class="ha">en.wikipedia.org/wiki/Rust_(progra…</tspan></text><line x1="52" y1="34.5" x2="452" y2="34.5" stroke="#292e35"/></g>
+<g class="o3" transform="translate(0 167)"><text x="64" y="11" class="m mo">[Jump to content](https://en.wikipedia.org/wiki/Rust_(pro…</text></g>
+<g class="o4" transform="translate(0 183)"><text x="64" y="11" class="m mo">[![This is a good article. Click here for more informatio…</text></g>
+<g class="o5" transform="translate(0 199)"><text x="64" y="11" class="m mo">From Wikipedia, the free encyclopedia</text></g>
+<g class="o6" transform="translate(0 215)"><text x="64" y="11" class="m mo">General-purpose programming language</text></g>
+<g class="o7" transform="translate(0 231)"><text x="64" y="11" class="m mo">| Rust |</text></g>
+<g class="o8" transform="translate(0 247)"><text x="64" y="11" class="m mo">| --- |</text></g>
+<g class="o9" transform="translate(0 263)"><text x="64" y="11" class="m mo">| [![Rust logo: a capital letter R attached inside a spro…</text></g>
+<g class="o10" transform="translate(0 279)"><text x="64" y="11" class="m mo">| [Paradigms](https://en.wikipedia.org/wiki/Programming_p…</text></g>
+<g class="o11" transform="translate(0 295)"><text x="64" y="11" class="m mo">| [Developer](https://en.wikipedia.org/wiki/Software_deve…</text></g>
+<g class="o12" transform="translate(0 311)"><text x="64" y="11" class="m mo">| Firstappeared | January20, 2012;14 years ago(2012-01-20…</text></g>
+<g class="o13" transform="translate(0 327)"><text x="64" y="11" class="m mo">|  |</text></g>
+<g class="o14" transform="translate(0 343)"><text x="64" y="11" class="m mo">| [Stable release](https://en.wikipedia.org/wiki/Software…</text></g>
+<g class="o15" transform="translate(0 359)"><text x="64" y="11" class="m mo">|  |</text></g>
+<g class="o16" transform="translate(0 375)"><text x="64" y="11" class="m mo">| [Typing discipline](https://en.wikipedia.org/wiki/Type_…</text></g>
+<g class="o17" transform="translate(0 391)"><text x="64" y="11" class="m bad">… +779 lines</text></g>
+<g class="o18" transform="translate(0 427)"><text x="52" y="14" class="s">Graydon Hoare created Rust in 2006 at Mozilla. Safe Rust</text><text x="52" y="33" class="s">guarantees memory safety, type safety and data-race</text><text x="52" y="52" class="s">freedom; an unsafe block opts out.</text></g></g></g></g>
+<rect x="18" y="422" width="434" height="64" rx="18" fill="#0e1217" stroke="#3d434a"/>
+<text x="34" y="444" class="s f">Reply…</text>
+<circle cx="44" cy="470" r="12" fill="none" stroke="#3d434a"/><text x="44" y="475" text-anchor="middle" class="s f">+</text>
+<text x="70" y="474" class="m2 f">context</text>
+<rect x="128" y="467.5" width="184" height="5" rx="2.5" fill="#12161c"/>
+<rect class="ob" x="128" y="467.5" width="184" height="5" rx="2.5" fill="#fd736d"/>
+<text x="404" y="474" text-anchor="end" class="m2 num on0"><tspan fill="#fd736d" font-weight="700">0</tspan><tspan class="f"> tok</tspan></text>
+<text x="404" y="474" text-anchor="end" class="m2 num on1"><tspan fill="#fd736d" font-weight="700">12,200</tspan><tspan class="f"> tok</tspan></text>
+<text x="404" y="474" text-anchor="end" class="m2 num on2"><tspan fill="#fd736d" font-weight="700">24,300</tspan><tspan class="f"> tok</tspan></text>
+<text x="404" y="474" text-anchor="end" class="m2 num on3"><tspan fill="#fd736d" font-weight="700">36,500</tspan><tspan class="f"> tok</tspan></text>
+<text x="404" y="474" text-anchor="end" class="m2 num fin on4"><tspan fill="#fd736d" font-weight="700">112,517</tspan><tspan class="f"> tok</tspan></text>
+<circle cx="428" cy="470" r="14" fill="#12161c"/><path d="M428 476V464M423 469l5-5 5 5" fill="none" stroke="#7b8187" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>
