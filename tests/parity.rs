@@ -1,14 +1,18 @@
-//! Parity gate: the Rust binary vs the Python prototype (the oracle) on every cached fixture page.
-//! Oracle = the prototype's parity script, JSONL (outline, u1#1, u1#2, u1 <words>, u1 links per page).
-//! Needs `FATS_PARITY=<oracle.jsonl>` (the cached pages are not in this repository); without it the test skips
-//! and says so.
+//! Parity gate: the binary vs a reference output (JSONL: outline, u1#1, …), not in this repository.
+//! Needs `FATS_PARITY=<reference.jsonl>` (the cached pages are not in this repository either); without it the
+//! test skips and says so.
 //!
 //! Two runs per page, each in a throwaway cache seeded with raw.html only (the doc is rebuilt by Rust):
-//!   port      FATS_CHUNK=400 + `match:words`: the prototype's own rules → must be 0 diffs
+//!   port      FATS_CHUNK=400 + `match:words`: the reference's own rules → must be 0 diffs
 //!   doctrine  defaults (300-token blocks, exact rung first): counted and reported
 //! Normalised before diffing: whitespace, `jN.` id prefixes, ms/cost/age, a trailing `· cache` on the `=` line,
-//! `tok` counts within ±10%, the media count and rows (newer than the prototype; their tokens come off a whole
+//! `tok` counts within ±10%, the media count and rows (the reference has none; their tokens come off a whole
 //! read's `=` figure too, `no_media_tok`).
+//! Unix only: the throwaway cache links each page's raw.html (a symlink).
+#![cfg(unix)]
+
+#[path = "../src/scratch.rs"]
+mod scratch;
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -17,6 +21,11 @@ use std::process::Command;
 
 fn norm(text: &str) -> Vec<String> {
     text.lines()
+        // the tiers a render arrow names (`outline::js_next`: `js:true · bd, then oxyjs`) are the route of the keys
+        // present, like `≤$`
+        .map(|l| l.split_once(" js:true · ").and_then(|(a, b)| Some(format!("{a} js:true{}", &b[b.find(" ≤$")?..]))))
+        .zip(text.lines())
+        .map(|(cut, l)| cut.unwrap_or_else(|| l.to_string()))
         .map(|l| {
             let mut out: Vec<String> = Vec::new();
             for w in l.split_whitespace() {
@@ -36,11 +45,11 @@ fn norm(text: &str) -> Vec<String> {
             out.join(" ")
         })
         .enumerate()
-        // every snapshot read ends its `=` line with `· cache 2h` ; the prototype did it on the outline only
+        // every snapshot read ends its `=` line with `· cache 2h`; the reference does it on the outline only
         .map(|(i, l)| if i == 0 { media_count(l.trim_end_matches(" · cache")) } else { l })
         // the whole-page claim is held back on a page with text elsewhere (one honesty line)
         .map(|l| l.strip_prefix("(whole page shown) · ").map_or(l.clone(), String::from))
-        // the media rows came after the prototype (media rows are new)
+        // the reference prints no media rows
         .filter(|l| !is_media(l))
         .collect()
 }
@@ -49,8 +58,8 @@ fn is_media(l: &str) -> bool {
     l.starts_with('m') && l[1..].starts_with(|c: char| c.is_ascii_digit()) || l.contains(" media → ")
 }
 
-/// A whole read's `=` figure is what it printed, media rows and count included: the prototype
-/// had neither, so their tokens come off before the ±10% compare.
+/// A whole read's `=` figure is what it printed, media rows and count included: the reference has neither, so
+/// their tokens come off before the ±10% compare.
 fn no_media_tok(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let (Some(head), Some(last)) = (lines.first(), lines.last()) else { return text.to_string() };
@@ -67,8 +76,8 @@ fn no_media_tok(text: &str) -> String {
     std::iter::once(head.join(" ")).chain(lines[1..].iter().map(|l| l.to_string())).collect::<Vec<_>>().join("\n")
 }
 
-/// The `=` line without its media count (`· 3 photos`, `· 1 video`) and its pruned-numbers count (`· 95 of 424
-/// numbers pruned`), which the prototype never printed.
+/// The `=` line without its media count (`· 3 photos`, `· 1 video`) and its pruned-numbers count
+/// (`· 95 of 424 numbers pruned`), which the reference never prints.
 fn media_count(l: &str) -> String {
     let groups = l.split(" · ").filter(|g| {
         let w: Vec<&str> = g.split(' ').collect();
@@ -117,7 +126,7 @@ fn seed(root: &Path, row: &Value) {
     std::os::unix::fs::symlink(src.join("raw.html"), d.join("raw.html")).expect("seed raw.html");
     let mut meta = row["meta"].clone();
     meta["final_url"] = row["final_url"].clone();
-    // the prototype's rule: every Oxylabs call rendered (`run_js`), nothing else did
+    // the reference's rule: every Oxylabs call rendered (`run_js`), nothing else did
     meta["render"] = (meta["provider"] == "oxylabs").into();
     std::fs::write(d.join("meta.json"), meta.to_string()).expect("seed meta.json");
     let st = serde_json::json!({"u": [{"url": row["url"], "dir": "p/u1"}], "cursor": null});
@@ -141,7 +150,7 @@ fn parity_with_prototype() {
         return;
     };
     let text = std::fs::read_to_string(&oracle).expect("oracle file");
-    let tmp = std::env::temp_dir().join(format!("fats-parity-{}", std::process::id()));
+    let tmp = scratch::Scratch::new("parity");
     let mut count: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // kind → (runs, diffs)
     let mut report = String::new();
     for (i, line) in text.lines().enumerate() {
@@ -173,7 +182,7 @@ fn parity_with_prototype() {
             }
         }
     }
-    std::fs::remove_dir_all(&tmp).ok();
+    drop(tmp);
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-diffs.md");
     std::fs::write(&out, &report).unwrap();
     eprintln!("parity: {} pages · diffs per command (runs/diffs) · details {}", text.lines().count(), out.display());

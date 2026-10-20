@@ -1,0 +1,21 @@
+{bold}fats{/} (FATSEARCH) · read any web page, PDF or search result as small clean text for your AI agent.
+
+{bold}FOR YOUR AGENT{/}
+  fats guide       {dim}the skill: how an agent uses fats well (~2.0k tokens, built in){/}
+  fats mcp         {dim}the agent connection (how: fats help mcp){/}
+
+{bold}READY?{/}
+{ready}
+  {green}✓{/} Agent connection     built in · add it to Claude Code / Codex / Cursor: fats help mcp
+
+{bold}TRY{/}
+  fats example.com                     {dim}read a page: a short outline with numbered parts{/}
+  fats u1#2                            {dim}read part 2 of that page{/}
+  fats u1 price                        {dim}find lines with “price” on it{/}
+  fats best rust http client           {dim}search the web (needs a provider key){/}
+  fats ./report.pdf                    {dim}read a local file{/}
+{yours}
+{bold}MORE{/}
+  fats setup       {dim}start here: keys, agent connection, on/off{/}
+  fats help        {dim}every command, explained{/}
+  fats status      {dim}the technical status (what your agent sees){/}

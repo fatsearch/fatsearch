@@ -1,18 +1,18 @@
 [package]
 name = "fatsearch"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 # pinned to rust-toolchain.toml; the oldest toolchain that builds this tree has not been measured yet
 rust-version = "1.99"
 description = "Web pages and documents turned into small, clean, cached Markdown for AI agents"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fatsearch/fatsearch"
-homepage = "https://github.com/fatsearch/fatsearch"
+homepage = "https://fatsearch.com"
 readme = "README.md"
 keywords = ["markdown", "scraping", "llm", "mcp", "cli"]
 categories = ["command-line-utilities", "text-processing", "web-programming::http-client"]
 # Dev-only files: the gate, CI and maintainer scripts. Tests and their fixtures ship.
-exclude = ["/.github/", "/scripts/", "/check.sh", "/dist-workspace.toml"]
+exclude = ["/.config/", "/.github/", "/scripts/", "/check.sh", "/dist-workspace.toml"]
 
 # The library keeps the short name the binary has (`use fats::…`); the package is `fatsearch`.
 [lib]
@@ -33,6 +33,9 @@ chrono = { version = "=0.4.45", default-features = false, features = ["alloc"] }
 dirs = "=7.0.0"
 # Charset decoding (WHATWG labels, BOM, windows-1250 & co.); already in the tree via wreq and pdf_oxide.
 encoding_rs = "=0.8.42"
+# `fats setup <provider>`: the local key form's one-time 128-bit path token from the OS. Already in the tree via
+# pdf_oxide and uuid.
+getrandom = "=0.4.3"
 html5ever = "=0.39.0"
 # `fats u3 m1`: a picture's real size from its header; `fats mcp` downscales it to what Claude views. Already in
 # the tree via pdf_oxide (png, jpeg); webp and gif (pure Rust, image-rs) are what this adds.
@@ -65,6 +68,11 @@ url = "=2.5.8"
 wreq-util = { version = "=0.2.0", default-features = false, features = ["emulation", "emulation-compression"] }
 wreq = { version = "=0.16.1", default-features = false, features = ["webpki-roots", "tokio-rt", "gzip", "brotli", "deflate", "zstd"] }
 
+[dev-dependencies]
+# tests/redact.rs: a loopback TLS listener with a self-signed certificate (a real verify failure). Already in the tree
+# under wreq (same version, no default features): no new crate in Cargo.lock.
+btls = { version = "=0.5.6", default-features = false }
+
 [features]
 # `provider::fake`: an in-process stand-in for the provider APIs, for tests/redact.rs only. Off in every shipped build.
 fake = []
@@ -75,6 +83,10 @@ required-features = ["fake"]
 
 [[test]]
 name = "wait"
+required-features = ["fake"]
+
+[[test]]
+name = "telemetry"
 required-features = ["fake"]
 
 [profile.dev]

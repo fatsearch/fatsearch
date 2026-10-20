@@ -1,6 +1,5 @@
 //! PDF bytes → Doc: one section per page, so `u3#4` is page 4. Text comes from pdf_oxide's per-page extractor;
 //! no OCR, so a page without a text layer stays an empty section and the outline counts it.
-//! Replaces the `pdftotext … | fats -` hint that earlier builds printed for a PDF.
 
 use crate::clean::{Doc, Section, collapse, fold, is_word};
 use pdf_oxide::PdfDocument;
@@ -8,19 +7,19 @@ use std::time::{Duration, Instant};
 
 /// Bytes → Doc with `mode = "pdf"`. `info` keeps the PDF's own title (when it is one) and `read_ms`, the time the
 /// text extraction took, so the outline can show the per-page cost. A page whose extraction fails reads as empty.
-/// Pages that would start after `budget_s` seconds (`fats config` `pdf_budget_s`) are not read (page 1 always is); `cut` = how many.
+/// Pages that would start after `budget_s` seconds (`fats config` `pdf_budget_s`) are not read (page 1 always is);
+/// `cut` = how many.
 pub fn build_pdf(raw: &[u8], url: &str, fin: &str, budget_s: u64) -> Result<Doc, String> {
     let t0 = Instant::now();
     let pdf = PdfDocument::from_bytes(raw.to_vec()).map_err(|e| format!("pdf: {e}"))?;
     let n = pdf.page_count().map_err(|e| format!("pdf: {e}"))?;
-    let sections: Vec<Section> = (0..n)
-        .take_while(|&i| i == 0 || t0.elapsed() < Duration::from_secs(budget_s))
-        .map(|i| Section {
-            level: 1,
-            title: format!("page {}", i + 1),
-            lines: pdf.extract_text(i).map(|t| t.lines().filter_map(line).collect()).unwrap_or_default(),
-        })
-        .collect();
+    let page = |i| Section {
+        level: 1,
+        title: format!("page {}", i + 1),
+        lines: pdf.extract_text(i).map(|t| t.lines().filter_map(line).collect()).unwrap_or_default(),
+    };
+    let read = (0..n).take_while(|&i| i == 0 || t0.elapsed() < Duration::from_secs(budget_s));
+    let sections: Vec<Section> = read.map(page).collect();
     let cut = n - sections.len();
     let first = sections.first().map(|s| fold(&s.lines.join(" "))).unwrap_or_default();
     let title = info_title(&pdf).filter(|t| on_page(t, &first));
@@ -105,10 +104,10 @@ fn on_page(title: &str, page1: &str) -> bool {
     title.contains(' ') && !words.is_empty() && hits * 2 >= words.len()
 }
 
-/// Last path segment of the URL (`file:///tmp/menu.pdf` → `menu.pdf`), without a query.
+/// Last path segment of the URL (`file:///tmp/menu.pdf` → `menu.pdf`; a Windows file's `\` too), without a query.
 pub fn file_name(u: &str) -> String {
     let p = u.split(['?', '#']).next().unwrap_or(u);
-    let name = p.trim_end_matches('/').rsplit('/').next().unwrap_or(p);
+    let name = p.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(p);
     if name.is_empty() { u.to_string() } else { name.to_string() }
 }
 
@@ -151,6 +150,7 @@ mod tests {
     #[test]
     fn file_name_of_url() {
         assert_eq!(file_name("file:///tmp/a/menu.pdf"), "menu.pdf");
+        assert_eq!(file_name(r"file://C:\tmp\menu.pdf"), "menu.pdf");
         assert_eq!(file_name("https://x.example/doc.pdf?x=1"), "doc.pdf");
     }
 

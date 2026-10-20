@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # THE gate: every check runs, each prints ok/FAIL, exit 1 if any failed. Logs: target/check/<name>.log.
-#   ./check.sh         quick, per commit: fmt · clippy (fake) · tests (fake, nextest) · line budget; one debug
-#                      compile, no release
+#   ./check.sh         quick, per commit: fmt · clippy (fake) · tests (fake, nextest) · line budget · server.json;
+#                      one debug compile, no release
 #   ./check.sh full    at task end and in CI: quick + clippy (shipped features) · deny · cooldown (skipped
 #                      offline: CI runs it in its own job, with the network) · the release build · no fake hook in
 #                      it · its size
@@ -17,11 +17,8 @@ if ! cargo nextest --version > /dev/null 2>&1; then
 fi
 # every warning (rustc, clippy, cached replays too) fails the build here, not in Cargo.toml [lints]
 export CARGO_BUILD_WARNINGS=deny
-# A new worktree's first gate builds every dependency (≈ 90 s quick, ≈ 6 min full). Instead: clone the main
-# worktree's target/ (APFS clonefile / reflink: no copy, no extra disk), then touch every source file. Without the
-# touch, the clone's newer `fats` artifacts count as fresh for this checkout's older files: stale binaries pass.
-# Never one target/ shared by worktrees: cargo names a path crate's artifacts relative to its workspace, so every
-# worktree maps to the same `fats` files and runs another worktree's build.
+# a new worktree starts from the main worktree's target/ (CONTRIBUTING.md, "Faster first build"); the touch keeps
+# the clone's newer artifacts from counting as fresh for this checkout's older files
 seed() {
     local from
     from="$(git worktree list --porcelain | awk 'NR == 1 { print $2 }')/$(git rev-parse --show-prefix)target"
@@ -94,20 +91,28 @@ server_json() {
     local v
     v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
     echo "Cargo.toml $v · server.json: $(grep -o '"version": "[^"]*"' server.json | tr '\n' ' ')"
-    [ -n "$v" ] && ! grep -o '"version": "[^"]*"' server.json | grep -vqx "\"version\": \"$v\""
+    [ -n "$v" ] && ! grep -o '"version": "[^"]*"' server.json | grep -vqx "\"version\": \"$v\"" || return 1
+    # the registry proves crate ownership by this exact line in the crates.io README (0.1.3 lost it in a rewrite)
+    grep -Eq "mcp-name: $(sed -n 's/^ *"name": "\(io\.github[^"]*\)".*/\1/p' server.json | head -n 1)([^A-Za-z0-9_./-]|$)" README.md
 }
 
 gate fmt cargo fmt --check
 gate clippy-fake cargo clippy --locked --all-targets --features fake
-gate test cargo nextest run --locked --features fake --no-fail-fast
+# the tests run as GitHub Actions runs them (it sets exactly these two): a test that forgets to clear a CI
+# marker the code reads fails here, not first in CI
+gate test env GITHUB_ACTIONS=true CI=true cargo nextest run --locked --features fake --no-fail-fast
 gate linebudget python3 scripts/linebudget.py
 gate server-json server_json
+# the publish scrub's word rows over src/, tests/, scripts/ and check.sh; skipped where the scrub script is absent
+scrub=../tools/publish/cli.sh
+[ -f "$scrub" ] && gate process-words "$scrub" scrub --only process,finding-ids src tests scripts check.sh
 if [ "$mode" = full ]; then
     gate clippy cargo clippy --locked --all-targets
     # CARGO_NET_OFFLINE set (CI, after `cargo deny fetch`): the advisory database already on disk
     gate deny cargo deny ${CARGO_NET_OFFLINE:+"--offline"} check
     if online; then
-        gate cooldown python3 scripts/cooldown.py
+        # cooldown.py needs tomllib (python >= 3.11); macOS ships 3.9 as python3
+        gate cooldown "$(command -v python3.13 || command -v python3.12 || command -v python3.11 || echo python3)" scripts/cooldown.py
     else
         echo "cooldown: skipped (offline; CI runs it in its own job)" > target/check/cooldown.log
         echo "skip cooldown (offline)"

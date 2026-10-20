@@ -1,0 +1,3 @@
+{dim}○{/} Web search needs a provider key (Oxylabs or Bright Data).
+  {cyan}→{/} tip: add a provider (2 min): {bold}fats setup{/}
+  {dim}Reading a page you already know works without one: fats example.com{/}

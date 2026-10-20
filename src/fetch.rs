@@ -1,12 +1,13 @@
-//! FETCH: the router. `auto` = plain first; a page that fails the content check goes to Bright Data, and to
-//! Oxylabs with JavaScript rendering when Bright Data has not answered within the hedge delay (`hedge:`, 5 s).
-//! Oxylabs without JavaScript is no page tier (it served 3 of 20 pages plain failed on, 2026-10-14 spike); it
-//! stays for a search, a PDF's bytes and `provider:oxy`.
-//! The first good body wins and the other call is cancelled, its bill unverified (`billed`). Government hosts skip Bright Data
-//! (it refuses them). A PDF (`pdf_run`) goes plain → Oxylabs without JS → Bright Data for its bytes, never
+//! FETCH: the router. `auto` = the ladder (`Plan::ladder`): plain first, then the keyed tiers cheapest first,
+//! Oxylabs and Decodo without JavaScript, then the renders (Bright Data, Oxylabs, Decodo) racing one hedge apart
+//! (`hedge:`, 5 s) while the content check fails. Oxylabs without JS is a page rung: after plain's captcha with both
+//! keys, on every page with its key alone, never after a shell (`Plan::ladder`; Decodo's the same); it also serves a
+//! search, a PDF's bytes and `provider:oxy`.
+//! The first good body wins and the other call is cancelled, its bill unverified (`billed`). Government hosts skip
+//! Bright Data (it refuses them). A PDF (`pdf_run`) goes plain → Oxylabs without JS → Bright Data for its bytes, never
 //! JavaScript; a `/pdf/` path (`Plan::hint`) only gets the file timeout and raw bytes, page rules otherwise; a zip
-//! document (docx, xlsx) never goes to a provider, and a text document plain served (`clean::Lists::text`) stops it. `next` is the whole decision table, pure, so
-//! it is tested without a network.
+//! document (docx, xlsx) never goes to a provider, and a text document plain served (`clean::Lists::text`) stops it.
+//! `next` is the whole decision table, pure, so it is tested without a network.
 //! Every page fetch walks the same ladder; `js:true` walks the table's render order (`JS_QUOTE`).
 
 use crate::cache::{Cache, HopRow, Meta, guarded, raw_name};
@@ -15,16 +16,15 @@ use crate::html::{Node, Tree, py_space};
 use crate::lang::{At, Cmd, Flag, bang, bin, fix, uniq};
 use crate::outline::{fmt_age, is_thin, lost_page};
 use crate::provider::{
-    Ask, Fail, Hit, Limit, PROVIDERS, REFUSED, Raw, SEARCH_TIMEOUT, Tier, in_process, pages, search_country, spend,
+    Ask, Fail, Hit, Limit, PROVIDERS, REFUSED, Raw, SEARCH_TIMEOUT, Tier, pages, search_country, sent, spend,
 };
 use crate::settings::limit;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-/// A page that passes the check but cleans to fewer body characters is a JS shell.
-pub const THIN_CHARS: usize = 300;
 /// Default `cost:` cap per command, USD.
 pub const COST_CAP: f64 = 0.05;
 /// The URL tables (`src/data/sites.json`).
@@ -34,8 +34,10 @@ pub struct Sites {
     /// Government labels (`gov()`), a TLD convention, no site: Bright Data refuses those hosts, so `auto` sends
     /// them straight to Oxylabs. The first two are TLDs; the rest are public suffixes under a country code.
     pub gov: Vec<&'static str>,
-    /// URL suffixes that name a document, and its kind (what `clean::kind_of` finds in the answer). A text
-    /// document's suffix only keeps a `/pdf/` path from being a PDF hint (`Plan::hint`): the answer says what it is.
+    /// URL suffixes that name a document, and its kind (what `clean::kind_of` finds in the answer; `html` = a
+    /// page). A text document's suffix only keeps a `/pdf/` path from being a PDF hint (`Plan::hint`): the answer
+    /// says what it is; `secret` = a key or credential (`cli::secret`: never read from disk). THE list: a token
+    /// with one of them is a path too (`lang::is_file`, `doc_kind`).
     doc_ext: Vec<(&'static str, &'static str)>,
     /// Path segments that may name a PDF without the suffix (`arxiv.org/pdf/2405.15793`, `…/doi/pdf/10.1145/…`);
     /// a hint only, since `…/docs/pdf/merge.html` is a page (`Plan::hint`).
@@ -46,6 +48,10 @@ pub struct Sites {
     /// Hosts where every subdomain is someone else's site (`alice.github.io`): each is its own route. The few the
     /// Public Suffix List's private section has that agents meet most (a registry row like `sld`, no site).
     shared: Vec<&'static str>,
+    /// The fence's blocks (`provider::private_ip`, CIDR): this host (0/8), private, CGNAT, loopback, link-local
+    /// (169.254.169.254 = cloud metadata), IETF, documentation, benchmarking, multicast, reserved and broadcast;
+    /// IPv6 ULA, link-local, site-local, multicast, documentation (`::` and `::1` carry IPv4 0.0.0.0 and 0.0.0.1).
+    pub fence: Vec<&'static str>,
 }
 
 pub static SITES: LazyLock<Sites> = LazyLock::new(|| crate::settings::table("sites"));
@@ -74,7 +80,7 @@ pub enum Mode {
     Only(Tier),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Plan {
     pub mode: Mode,
     /// `js:true`: skip plain (and Oxylabs without JS, where it runs); Bright Data, then Oxylabs rendering JavaScript.
@@ -83,8 +89,8 @@ pub struct Plan {
     pub gov: bool,
     /// The URL names a document by its suffix: `pdf`, `zip`, a text document (`Sites::doc_ext`).
     pub doc: Option<&'static str>,
-    /// The path may name a file (`Sites::pdf_path`, no `.htm(l)` suffix): Oxylabs gets `PDF_OXY` and Bright Data sends raw
-    /// bytes, but a page that passes the content check is served as a page; only an answer that says PDF makes it
+    /// The path may name a file (`Sites::pdf_path`, no `.htm(l)` suffix): Oxylabs gets `PDF_OXY` and Bright Data sends
+    /// raw bytes, but a page that passes the content check is served as a page; only an answer that says PDF makes it
     /// a PDF run.
     pub hint: bool,
     /// Tiers with a key configured.
@@ -105,6 +111,8 @@ pub struct Plan {
     pub wait: Option<Duration>,
     /// The folder of the copy stored before, the Markdown guard's yardstick (`md_weak`); None = none.
     pub prior: Option<std::path::PathBuf>,
+    /// A batch's `cost:` pool (`pooled`) and this run's id in it; None = the run has `cap` to itself.
+    pub pool: Option<(std::path::PathBuf, usize)>,
 }
 
 impl Plan {
@@ -112,24 +120,25 @@ impl Plan {
         let gov = gov(url);
         let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
         let keys = keyed();
-        let doc = SITES.doc_ext.iter().find(|e| path.ends_with(e.0)).map(|e| e.1);
-        let page = path.ends_with(".html") || path.ends_with(".htm");
+        let kind = doc_kind(&path);
+        let (page, doc) = (kind == Some("html"), kind.filter(|k| *k != "html"));
         let hint = doc.is_none() && !page && SITES.pdf_path.iter().any(|p| path.contains(p));
         Plan { mode, js, cap, gov, doc, hint, keys, timeout, hedge: HEDGE, ..Plan::default() }
     }
 
-    /// A web search: the search rows (Oxylabs, then Bright Data beside it after the hedge); `provider:` = that one only.
+    /// A web search: the search rows (Oxylabs, then Bright Data beside it after the hedge); `provider:` = that one
+    /// only.
     pub fn search(mode: Mode, cap: f64, timeout: Option<Duration>) -> Plan {
         let mut p = Plan { search: true, hedge: SEARCH_HEDGE, ..Plan::new("", mode, false, cap, timeout) };
         p.keys.retain(|t| t.can("search"));
         p
     }
 
-    /// THE plan of a command's mods (`provider:`, `js:`, `cost:` less what this run `spent`, `timeout:`, `hedge:`),
-    /// a page's for `url`, else a search's: what a fetch runs, `dry:true` routes and an arrow quotes (`worst`).
-    pub fn of(cmd: &Cmd, url: Option<&str>, spent: f64) -> Plan {
+    /// THE plan of a command's mods (`provider:`, `js:`, `cost:`, `timeout:`, `hedge:`), a page's for `url`, else a
+    /// search's: what a fetch runs, `dry:true` routes and an arrow quotes (`worst`).
+    pub fn of(cmd: &Cmd, url: Option<&str>) -> Plan {
         let mode = cmd.get("provider").and_then(Tier::parse).map_or(Mode::Auto, Mode::Only);
-        let cap = (cmd.get("cost").and_then(|v| v.parse::<f64>().ok()).unwrap_or(COST_CAP) - spent).max(0.0);
+        let cap = cmd.get("cost").and_then(|v| v.parse::<f64>().ok()).unwrap_or(COST_CAP).max(0.0);
         let timeout = cmd.get("timeout").and_then(|v| v.parse().ok()).map(Duration::from_secs);
         let mut p =
             url.map_or_else(|| Plan::search(mode, cap, timeout), |u| Plan::new(u, mode, cmd.flag("js"), cap, timeout));
@@ -144,21 +153,17 @@ impl Plan {
         !self.search && (self.doc == Some("pdf") || done.iter().any(|h| h.kind == "pdf"))
     }
 
-    /// Tiers in the order they may run, before any answer.
-    pub fn tiers(&self) -> Vec<Tier> {
-        self.ladder(&[])
-    }
-
-    /// THE ladder rule: the tiers in the order they may run, given the finished hops (`pdf_run`). `auto` = the
-    /// capability rows (`provider::Spec::can`) that do this job, cheapest first (table order on a tie: bd before
-    /// oxyjs); a paid no-JS tier leaves a page's ladder when another provider's render has a key (it served 3 of 20
-    /// pages plain failed on), so with one provider's key every rung of that provider runs, unless
-    /// plain's wall needs a render (`Check::render_first`: after a JS challenge or shell oxy no-JS served 0/33, after
-    /// a 403 or captcha 11/26). With both keys it stays, before the renders,
-    /// after plain's captcha only (`Check::no_js_first`: Reddit 25/34 in ~4.4 s for $0.0010, a render $0.0015); one
-    /// try, no site log. Never after a shell, the page needs JS (0/3 served, each +$0.0010, +4–10 s).
-    /// `provider:oxy` = both Oxylabs tiers, without JS first.
-    fn ladder(&self, done: &[Hop]) -> Vec<Tier> {
+    /// THE ladder rule: the tiers in the order they may run, given the finished hops (`pdf_run`; none = before any
+    /// answer). `auto` = the capability rows (`provider::Spec::can`) that do this job, cheapest first (table order on a
+    /// tie: bd before oxyjs); a paid no-JS tier leaves a page's ladder when another provider's render has a key (it
+    /// served 3 of 20 pages plain failed on), so with one provider's key every rung of that provider runs, unless
+    /// plain's wall needs a render (`Check::render_first`: after a JS challenge or shell oxy no-JS served 0/33, after a
+    /// 403 or captcha 11/26). With both keys it stays, before the renders, after plain's captcha only
+    /// (`Check::no_js_first`: Reddit 25/34 in ~4.4 s for $0.0010, a render $0.0015); one try, no site log. Never after
+    /// a shell, the page needs JS (0/3 served, each +$0.0010, +4–10 s), nor after a paid no-JS tier OUR cut stopped:
+    /// the next is the same slow page without JS (oxy 10 s, then decodo 15 s).
+    /// `provider:oxy` = every tier of that key, without JS first (oxy, oxyjs).
+    pub fn ladder(&self, done: &[Hop]) -> Vec<Tier> {
         let pdf = self.pdf_run(done);
         let job = match () {
             _ if self.search => "search",
@@ -173,14 +178,13 @@ impl Plan {
         let plain = |codes: &[&str]| done.iter().any(|h| h.tier == Tier::Plain && codes.contains(&h.code.as_str()));
         // a paid no-JS tier yields to another provider's render but after plain's `no_js_first` wall, to its own
         // render after a `render_first` one
-        let yields = |t: Tier| if render(t) { !plain(&CHECK.no_js_first) } else { plain(&CHECK.render_first) };
+        let cut = done.iter().any(|h| !h.tier.can("js") && h.tier.spec().price > 0.0 && h.code == "provider_timeout");
+        let yields = |t: Tier| cut || if render(t) { !plain(&CHECK.no_js_first) } else { plain(&CHECK.render_first) };
+        let drops = |t: &Tier| page && !t.can("js") && t.spec().price > 0.0 && yields(*t);
         let all = match self.mode {
             _ if self.prefetch => vec![Tier::Plain],
-            Mode::Only(Tier::Oxy) if !self.search => vec![Tier::Oxy, Tier::OxyJs],
-            Mode::Only(t) => vec![t],
-            Mode::Auto => {
-                rows.iter().copied().filter(|&t| !(page && !t.can("js") && t.spec().price > 0.0 && yields(t))).collect()
-            }
+            Mode::Only(o) => Tier::ALL.into_iter().filter(|&t| t == o || t.owner() == o).collect(),
+            Mode::Auto => rows.iter().copied().filter(|t| !drops(t)).collect(),
         };
         // behind a `one_render` gate, plain's or a render's, ONE render: it answers every render alike (bd and oxyjs
         // both billed for one shell); a render the provider refused or erred on rendered nothing, so the next may try
@@ -192,31 +196,31 @@ impl Plan {
     }
 
     /// A tier's timeout, given the finished hops. `timeout:` stretches only the slow tiers: the 10 s plain and oxy
-    /// no-JS gates exist to hand a hard page on quickly, so they keep their time, but never past what the agent's
-    /// wall left (`agent_left`; plain runs first, so its cap is `timeout:` itself: `timeout:2` on a 12 s page ran
-    /// 12 s; `provider:oxy timeout:1` ran its no-JS call 20 s, 21 s in all). In a PDF run, or on a `/pdf/` path (`hint`), Oxylabs gets
-    /// `PDF_OXY`. The one-key retry of a timed-out call (`retries`) gets twice OUR time ("bd, then bd
-    /// with a longer timeout"), never twice the agent's `timeout:` (a cap it asked for), and never past the
-    /// one-key wall (`wall_left`). A named no-JS tier (`provider:oxy`, the cut tier's offer) gates nothing to hand
-    /// on quickly: twice its time, as a cut one's retry.
+    /// no-JS gates exist to hand a hard page on quickly, so they keep their time, but never past what the agent's wall
+    /// left (`agent_left`; plain runs first, so its cap is `timeout:` itself: `timeout:2` on a 12 s page ran 12 s;
+    /// `provider:oxy timeout:1` ran its no-JS call 20 s, 21 s in all). In a PDF run, or on a `/pdf/` path (`hint`),
+    /// Oxylabs gets `PDF_OXY`. The one-key retry of a timed-out call (`retries`) gets twice OUR time, never twice the
+    /// agent's `timeout:` (a cap it asked for), and never past the one-key wall (`wall_left`). A named no-JS tier
+    /// (`provider:oxy`, the cut tier's offer) gates nothing to hand on quickly: twice its time, as a cut one's retry.
     fn timeout_of(&self, t: Tier, done: &[Hop]) -> Duration {
         let cut = done.iter().find(|h| h.tier == t && h.code == "provider_timeout");
         let k = 1 + u32::from(one_call(self) || cut.is_some() || (self.mode == Mode::Only(t) && !t.can("js")));
         let wall = cut.and_then(|h| wall_left(done, h)).unwrap_or(Duration::MAX);
         let left = self.agent_left(done);
         let ours = |d: Duration| left.unwrap_or((d * k).min(wall));
-        match t {
+        let paid_file = t.spec().price > 0.0 && t.can("pdf") && (self.pdf_run(done) || self.hint);
+        match () {
             _ if self.search => ours(SEARCH_TIMEOUT),
-            Tier::Bd | Tier::OxyJs => ours(t.spec().timeout),
-            Tier::Oxy if self.pdf_run(done) || self.hint => ours(PDF_OXY),
-            Tier::Plain | Tier::Oxy => (t.spec().timeout * k).min(wall).min(left.unwrap_or(Duration::MAX)),
+            _ if t.can("js") => ours(t.spec().timeout),
+            _ if paid_file => ours(PDF_OXY),
+            _ => (t.spec().timeout * k).min(wall).min(left.unwrap_or(Duration::MAX)),
         }
     }
 
     /// Plain and oxy without JS (the no-JS rows, `!t.can("js")`) are gates of a fetch: what follows waits for their
-    /// verdict, and only some failures are worth it. In a paid ask (`js:true`, `provider:`) every tier is a gate: ONE provider runs, the next
-    /// only on its failure (`hedge:off`; a hedge bills both). Bd leads a render: it won 14/14 of the
-    /// races it answered, and fails fast (js_shell ~2.3 s) where oxyjs fails slow (68-71 s timeouts over
+    /// verdict, and only some failures are worth it. In a paid ask (`js:true`, `provider:`) every tier is a gate: ONE
+    /// provider runs, the next only on its failure (`hedge:off`; a hedge bills both). Bd leads a render: it won 14/14
+    /// of the races it answered, and fails fast (js_shell ~2.3 s) where oxyjs fails slow (68-71 s timeouts over
     /// 192 runs).
     fn gate(&self, t: Tier) -> bool {
         !self.search && (!t.can("js") || !self.hedged() || self.timeout.is_some())
@@ -224,8 +228,8 @@ impl Plan {
 
     /// With `timeout:8` and both keys, bd was cut at 8 s and oxyjs, hedged at 5 s, cut 8 s later: 13.3 s. So
     /// the agent's `timeout:` is ONE wall for the provider calls of a page run, one at a time (`gate`): what the
-    /// finished ones left of it (plain, free, capped by it but not counted, and the host check before it); the run stops
-    /// with < 1 s left (`next`). None = no `timeout:`.
+    /// finished ones left of it (plain, free, capped by it but not counted, and the host check before it); the run
+    /// stops with < 1 s left (`next`). None = no `timeout:`.
     fn agent_left(&self, done: &[Hop]) -> Option<Duration> {
         let used = done.iter().filter(|h| !self.search && h.tier != Tier::Plain).map(|h| h.ms).sum();
         self.timeout.map(|t| t.saturating_sub(Duration::from_millis(used)))
@@ -241,7 +245,7 @@ impl Plan {
     /// answer time (`Spec::search_s`: bd answers in 4.5-25 s, bd-only got 0/3 searches at 5 s).
     /// Longer than `wait:` = the search runs detached (`cli::searching`): the caller still answers at `wait:`.
     pub fn search_wait(&self, wait: Duration) -> Duration {
-        let lead = self.tiers().into_iter().find(|t| self.keys.contains(t)).map_or(0, |t| t.spec().search_s);
+        let lead = self.ladder(&[]).into_iter().find(|t| self.keys.contains(t)).map_or(0, |t| t.spec().search_s);
         wait.max(Duration::from_secs(lead))
     }
 }
@@ -270,7 +274,8 @@ pub fn site(url: &str) -> String {
 }
 
 /// What `js:true` takes: a render's time (oxyjs renders measured 14-32 s, 2026-10); its price = `worst`.
-pub const JS_QUOTE: &str = "~25s";
+/// `≈`, never `~`: an arrow pasted into zsh unquoted stops at `~25s` (a user's home dir it looks up).
+pub const JS_QUOTE: &str = "≈25s";
 
 /// One call's outcome: the hop row in meta.json, plus the body and doc for the store.
 #[derive(Default)]
@@ -293,6 +298,8 @@ pub struct Hop {
     pub final_url: String,
     /// Where a bd ask landed by its same-site canonical link (`canonical`): `Meta::landed`, never a base.
     pub landed: Option<String>,
+    /// The page whose meta refresh plain followed to this one (`provider::refresh`): `Meta::refreshed_from`.
+    pub refreshed_from: Option<String>,
     /// Visible characters (picks the best copy when every hop fails).
     pub vis: usize,
     pub doc: Option<Doc>,
@@ -311,6 +318,8 @@ pub struct Hop {
     pub end: Option<Instant>,
     /// The HTML answer's `<html lang>` primary subtag, lower case (`it`); empty = none declared (`langs`).
     pub lang: String,
+    /// Ms plain waited for its turn before it started (`provider::pace`), not in `ms`.
+    pub waited: u64,
 }
 
 impl Hop {
@@ -331,6 +340,7 @@ impl Hop {
             timeout_s: self.timeout_s,
             limit: self.limit.map(|l| l.limit),
             remaining: self.limit.map(|l| l.remaining),
+            waited_ms: Some(self.waited).filter(|&w| w > 0),
         }
     }
 }
@@ -344,19 +354,18 @@ pub enum Step {
 
 /// THE final answers: about the target itself, so every tier gets the same one. The first ends the job and cancels
 /// every call in flight: a missing page, an oversized body, a private address (a provider must not be sent one
-/// either), a host that does not exist (`host_hop`). Not final: a provider's refusal or unlock failure, such as
-/// Bright Data's 502 / `x-brd-error-code` (`reject_block`, `resolve_failed_*`: "each attempt uses a different
-/// peer, and the same request has been observed to succeed on a later attempt", docs.brightdata.com
-/// products/web-unlocker/error-codes) or its policy refusals (another provider may serve that host).
-const FINAL: &[&str] = &["not_found", "too_big", "private_address", "no_host"];
+/// either), a host that does not exist or got no verdict on its address (`host_hop`). Not final: a provider's
+/// refusal or unlock failure, such as Bright Data's 502 / `x-brd-error-code` (`reject_block`, `resolve_failed_*`:
+/// "each attempt uses a different peer, and the same request has been observed to succeed on a later attempt",
+/// docs.brightdata.com products/web-unlocker/error-codes) or its policy refusals (another provider may serve that
+/// host).
+const FINAL: &[&str] =
+    &["not_found", "too_big", "private_address", "no_host", "dns_timeout", "dns_failed", "tls_failed"];
 
-fn is_final(h: &Hop) -> bool {
-    FINAL.contains(&h.code.as_str())
-}
-
-/// A failed gate hop (plain, or oxy without JS) worth the next tier: not a zip document, not a final answer.
+/// A failed gate hop (plain, or oxy without JS) worth the next tier: not a zip document, not a final answer
+/// (`FINAL`).
 fn escalates(h: &Hop) -> bool {
-    !h.ok && h.kind != "zip" && !is_final(h)
+    !h.ok && h.kind != "zip" && !FINAL.contains(&h.code.as_str())
 }
 
 /// Codes that are about the key, not the page: a refused key or zone, or its request budget spent. The same key on
@@ -384,11 +393,13 @@ pub fn next(p: &Plan, done: &[Hop], running: &[(Tier, Duration)]) -> Step {
         return Step::Wait(left(p, running, done).min(w));
     }
     let spent_wall = p.agent_left(done).is_some_and(|l| l < Duration::from_secs(1));
-    if over || spent_wall || done.iter().any(|h| h.ok || is_final(h)) {
+    if over || spent_wall || done.iter().any(|h| h.ok || FINAL.contains(&h.code.as_str())) {
         return Step::Stop;
     }
     let started = |t: Tier| done.iter().any(|h| h.tier == t) || running.iter().any(|r| r.0 == t);
-    let spent = spend(done.iter().map(|h| h.cost).chain(running.iter().map(|r| r.0.spec().price)));
+    // a gate's verdict worth the next tier (a zip document goes on whatever plain said)
+    let settled = |q: Tier| p.doc == Some("zip") || !done.iter().any(|h| h.tier == q && escalates(h));
+    let spent = held(done, running);
     let can = |t: Tier| p.keys.contains(&t) && !refused(done, t) && spent + t.spec().price <= p.cap + 1e-9;
     // `prev` = the last tier that ran: one that could not start (no key, no budget) does not gate the next
     let mut prev: Option<Tier> = None;
@@ -401,11 +412,7 @@ pub fn next(p: &Plan, done: &[Hop], running: &[(Tier, Duration)]) -> Step {
             // plain and oxy without JS are gates: what follows waits for their verdict, and only some failures
             // are worth the next tier
             Some((q, Some(_))) if p.gate(q) => break,
-            Some((q, None))
-                if p.gate(q) && (p.doc == Some("zip") || !done.iter().any(|h| h.tier == q && escalates(h))) =>
-            {
-                break;
-            }
+            Some((q, None)) if p.gate(q) && settled(q) => break,
             // a provider still inside its hedge delay runs alone
             Some((_, Some(e))) if e < p.hedge && can(t) => {
                 return Step::Wait((p.hedge - e).min(left(p, running, done)));
@@ -424,17 +431,17 @@ pub fn next(p: &Plan, done: &[Hop], running: &[(Tier, Duration)]) -> Step {
 }
 
 /// THE retry rule: with ONE paid provider on the keyed ladder (one key, or a gov
-/// host or `provider:bd` with both, or the other one refused this run) there is no other provider to cover a transient failure, so its
-/// failed call gets ONE retry after OUR cut (`provider_timeout`) or a network error, never after the provider's own
-/// refusal (`provider_error`, a non-200 API answer, `provider::read`: a final refusal; retries served 0/7 vs 3/9
-/// after our cut), never on the site's own status (`Hop::status`: a 5xx page, a wall served as
+/// host or `provider:bd` with both, or the other one refused this run) there is no other provider to cover a transient
+/// failure, so its failed call gets ONE retry after OUR cut (`provider_timeout`) or a network error, never after the
+/// provider's own refusal (`provider_error`, a non-200 API answer, `provider::read`: a final refusal; retries served
+/// 0/7 vs 3/9 after our cut), never on the site's own status (`Hop::status`: a 5xx page, a wall served as
 /// 503), a wall or a shell (the same answer again), nor in a prefetch (its page fetch covers it), nor a detached
 /// search (`one_call`: it got the retry's time at once, `timeout_of`), nor under the agent's `timeout:` (a hard budget;
 /// a search cut there is not asked again either); inside `cost:` (`next`'s `can`); never with less
 /// time than the call it repeats had (bd-only retries after a 60 s cut got 23.9-30 s under the wall, served 0/5):
 /// the run ends at the first timeout, its row buys more time (`fix_arg`).
 fn retries(p: &Plan, done: &[Hop], h: &Hop) -> bool {
-    let keyed = p.tiers().into_iter().filter(|t| p.keys.contains(t) && t.spec().price > 0.0 && !refused(done, *t));
+    let keyed = p.ladder(&[]).into_iter().filter(|t| p.keys.contains(t) && t.spec().price > 0.0 && !refused(done, *t));
     let paid = uniq(keyed, |t| t.owner());
     let transient = matches!(h.code.as_str(), "provider_timeout" | "net_error") && !one_call(p) && p.timeout.is_none();
     let first = done.iter().filter(|d| d.tier == h.tier).count() == 1;
@@ -470,7 +477,7 @@ fn thin(h: &Hop) -> bool {
 /// provider's answer). The ladder runs on
 /// until then, so this only names the outcome.
 fn app_page(done: &[Hop]) -> bool {
-    let ran = |h: &&Hop| h.tier.spec().price > 0.0 && !ours(&h.code, h.upto, h.timeout_s);
+    let ran = |h: &&Hop| h.tier.spec().price > 0.0 && !ours(&h.code, h.upto);
     let paid = |h: &&Hop| ran(h) && matches!(h.code.as_str(), "js_shell" | "provider_timeout");
     done.iter().any(|h| h.code == "js_shell") && uniq(done.iter().filter(paid), |h| h.tier.owner()).len() > 1
 }
@@ -487,7 +494,8 @@ pub type Call = Pin<Box<dyn Future<Output = Hop> + Send>>;
 /// Run the table: start what `next` says, wait for the first answer, cancel what is left. `call` gets the tier
 /// and the hops so far (a PDF run by then: `pdf_run`; its timeout: `timeout_of`).
 /// A cancelled call is a hop too (`abandoned`, or cut at the plan's `wait`; its bill unverified, `billed`).
-/// `done` = hops settled before the first call (`host_hop`); `seen` gets the tiers so far each time one starts or lands.
+/// `done` = hops settled before the first call (`host_hop`); `seen` gets the tiers so far each time one starts or
+/// lands.
 pub fn drive(p: &Plan, call: &dyn Fn(Tier, &[Hop]) -> Call, mut done: Vec<Hop>, seen: Seen) -> Vec<Hop> {
     crate::provider::block(async {
         let mut set = tokio::task::JoinSet::new();
@@ -495,7 +503,7 @@ pub fn drive(p: &Plan, call: &dyn Fn(Tier, &[Hop]) -> Call, mut done: Vec<Hop>, 
         let (end, mut cut) = (p.wait.map(|w| Instant::now() + w), None);
         loop {
             let now: Vec<(Tier, Duration)> = running.iter().map(|r| (r.0, r.1.elapsed())).collect();
-            let step = next(p, &done, &now);
+            let step = pooled(p, &done, &now);
             let left = end.map(|e| e.saturating_duration_since(Instant::now()));
             if left == Some(Duration::ZERO) && !matches!(step, Step::Stop) {
                 cut = p.wait;
@@ -508,7 +516,10 @@ pub fn drive(p: &Plan, call: &dyn Fn(Tier, &[Hop]) -> Call, mut done: Vec<Hop>, 
                 }
                 Step::Wait(d) => {
                     let d = left.map_or(d, |l| d.min(l));
-                    if let Ok(Some(r)) = tokio::time::timeout(d, set.join_next_with_id()).await
+                    // a pool's turn has no call to land (`pooled`): a sleep, never a join on an empty set (a spin)
+                    if set.is_empty() {
+                        tokio::time::sleep(d).await;
+                    } else if let Ok(Some(r)) = tokio::time::timeout(d, set.join_next_with_id()).await
                         && let Some(h) = landed(r, &mut running)
                     {
                         done.push(cut_why(p, h));
@@ -516,9 +527,8 @@ pub fn drive(p: &Plan, call: &dyn Fn(Tier, &[Hop]) -> Call, mut done: Vec<Hop>, 
                 }
                 Step::Stop => break,
             }
-            let tried = done
-                .iter()
-                .map(|h| format!("{}{}", h.tier.spec().short, if h.ok { "✓".into() } else { format!(":{}✗", h.code) }));
+            let mark = |h: &Hop| if h.ok { "✓".to_string() } else { format!(":{}✗", h.code) };
+            let tried = done.iter().map(|h| format!("{}{}", h.tier.spec().short, mark(h)));
             let busy = running.iter().map(|r| format!("{} running", r.0.spec().short));
             // the newest running call's start, and the last running call's deadline (its timeout as it started)
             let at = |i: Instant| crate::cache::now() - i.elapsed().as_secs_f64();
@@ -537,47 +547,83 @@ pub fn drive(p: &Plan, call: &dyn Fn(Tier, &[Hop]) -> Call, mut done: Vec<Hop>, 
     .unwrap_or_else(|| vec![Hop { code: "net_error".into(), ..Hop::default() }])
 }
 
+/// A batch's `cost:` pool file: each run's `[floor, hold]` (`seed`, `pooled`).
+type Pool = BTreeMap<usize, [f64; 2]>;
+
+/// THE batch's `cost:` pool (`Plan::pool`, one file a batch): under its lock this run's cap is what the other runs
+/// leave (`claims`), a paid call holds its price before it starts, and every turn sets the run's hold to what it
+/// `held`; its floor goes when it stops (plain served it: within its plain call): Σ billed ≤ `cost:`. The trade-offs
+/// of a floor set at launch (`seed`): a queued page keeps its share until its turn; a page short of its rung stops
+/// and gives its share back, so of two pages on even shares the one that meets the cap second gets both (which one
+/// is a race, never input order; one of them always runs on). A run short only of the floors of runs already
+/// started waits a turn (`POOL_TURN`, within its `timeout:`) with its own floor given back, never `budget_hit`
+/// while those come back (2 pages at `cost:0.002`, $0.001 each: the one plain could not serve needs a $0.0015 render
+/// as the other's plain serves); two such runs never wait on each other.
+fn pooled(p: &Plan, done: &[Hop], running: &[(Tier, Duration)]) -> Step {
+    let Some((at, me)) = &p.pool else { return next(p, done, running) };
+    crate::cache::edit(at, |pool: &mut Pool| {
+        let left = |soon| (p.cap - spend(claims(at, pool, *me, soon).into_iter().map(|o| o.1))).max(0.0);
+        let step = next(&Plan { cap: left(false), ..p.clone() }, done, running);
+        let hope = || matches!(next(&Plan { cap: left(true), ..p.clone() }, done, running), Step::Start(_));
+        let turn = matches!(step, Step::Stop) && hope();
+        let start = if let Step::Start(t) = step { t.spec().price } else { 0.0 };
+        let floor = if matches!(step, Step::Stop) { 0.0 } else { pool.get(me).map_or(0.0, |h| h[0]) };
+        pool.insert(*me, [floor, held(done, running) + start]);
+        if turn { Step::Wait(p.agent_left(done).map_or(POOL_TURN, |l| l.min(POOL_TURN))) } else { step }
+    })
+    .unwrap_or(Step::Stop)
+}
+
+/// How often a run short of the pool looks again (`pooled`): a plain call it waits for takes ~0.1-10 s.
+const POOL_TURN: Duration = Duration::from_millis(250);
+
+/// The other runs' claims on the pool `at`, each the larger of its hold and the floor it still holds (` held`: not
+/// spent yet); none = no row. A run that died (`cache::run_at`: its lock let go, killed before it gave its floor
+/// back) holds no floor; its hold stays, a call it started may be billed. `soon` = only a queued run's floor
+/// (`Detached::by`, not started: no pid) counts: a started one gives its floor back when it stops.
+fn claims(at: &std::path::Path, pool: &Pool, me: usize, soon: bool) -> Vec<(usize, f64, &'static str)> {
+    let run = |n: usize| crate::cache::run_at(&at.with_file_name(format!("u{n}.json")));
+    let alive = |n| run(n).is_none_or(|(r, alive)| alive && !(soon && (r.by == 0 || r.pid != 0)));
+    let claim = |(&n, &[f, h]): (&usize, &[f64; 2])| if f > h && alive(n) { (n, f, " held") } else { (n, h, "") };
+    pool.iter().filter(|o| *o.0 != me).map(claim).filter(|o| o.1 > 0.0).collect()
+}
+
+/// What a run spent or holds, THE one rule of the cap: billed, maybe billed (a cut call's `upto`) and running.
+fn held(done: &[Hop], running: &[(Tier, Duration)]) -> f64 {
+    spend(done.iter().map(|h| h.cost + h.upto).chain(running.iter().map(|r| r.0.spec().price)))
+}
+
+/// A batch's pool at its launch: each run's floor = one paid try whatever plain says (its uncapped route's dearest
+/// rung: the cheapest, oxy's $0.001, left a page plain sent to a render short), held until the run stops, so one
+/// page's hedge never buys a queued page's first paid try. Floors over `cap` are cut to an even share each
+/// (`cap` / pages; a first page's whole floor left the next none, which a $0.001 rung would have served): no page
+/// is starved before it runs; one whose share is short stops and gives it back (`pooled`).
+pub fn seed(at: &std::path::Path, runs: impl Iterator<Item = (usize, Plan)>, cap: f64) -> Result<(), String> {
+    let dearest = |p: Plan| route(&Plan { cap: f64::INFINITY, ..p }).0.into_iter().map(|t| t.0.spec().price);
+    let floors: Vec<(usize, f64)> = runs.map(|(n, p)| (n, dearest(p).fold(0.0, f64::max))).collect();
+    let share = if spend(floors.iter().map(|f| f.1)) > cap + 1e-9 { cap / floors.len() as f64 } else { cap };
+    let pool: Pool = floors.into_iter().map(|(n, f)| (n, [f.min(share), 0.0])).collect();
+    crate::cache::edit(at, |old: &mut Pool| *old = pool)
+}
+
 /// Why WE cut a call (`Hop::why`, named by `fail_detail`): `timeout:8s` = the agent's `timeout:` (its fix is
 /// the default time), else `took > 60 s here` (`fail_detail` reads it as `cut at 60 s (3m ago)`).
 fn cut_why(p: &Plan, mut h: Hop) -> Hop {
     let s = h.timeout_s;
     if h.code == "provider_timeout" && h.status == 0 && h.why.is_empty() {
-        // under `timeout:` a render gets what the agent's wall left (`agent_left`): its cut is named as the agent typed it
+        // under `timeout:` a render gets what the agent's wall left (`agent_left`): its cut is named as the agent typed
+        // it
         let user = p.timeout.map(|w| w.as_secs()).filter(|&w| (h.tier.can("js") && s <= w) || s == w);
         h.why = user.map_or_else(|| format!("took > {s} s here"), |w| format!("timeout:{w}s"));
     }
     h
 }
 
-/// How long the system resolver gets before the run goes on without its verdict (`dns_timeout`).
-pub const DNS_WAIT: Duration = Duration::from_millis(1500);
-
-/// THE host check, before any tier runs (`js:true` skips plain too): the system resolver, and on no
-/// address the second resolver (`provider::exists`, asked on that failure only). A host both call missing is a
-/// plain hop `no_host`: final, $0, no provider call. A resolver that gives no verdict in time is a plain hop
-/// `dns_timeout` (not a missing host): plain is skipped (it would wait on the same lookup), the providers run.
-/// None = the host resolves, or the URL names an IP address.
-pub fn host_hop(url: &str) -> Option<Hop> {
-    let Some(url::Host::Domain(host)) = url::Url::parse(url).ok()?.host().map(|h| h.to_owned()) else {
-        return None;
-    };
-    let (t0, (tx, rx)) = (Instant::now(), std::sync::mpsc::channel());
-    // a test's stand-in transport is the whole network: its resolver (the second one) is the only one asked
-    let (name, fake) = (host.clone(), in_process());
-    std::thread::spawn(move || {
-        tx.send(!fake && std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), 443)).is_ok())
-    });
-    let code = match rx.recv_timeout(DNS_WAIT) {
-        Ok(true) => return None,
-        Ok(false) => match crate::provider::block(crate::provider::exists(&host)).flatten() {
-            Some(true) => return None,
-            Some(false) => "no_host",
-            None => "dns_timeout",
-        },
-        Err(_) => "dns_timeout",
-    };
-    let ms = t0.elapsed().as_millis() as u64;
-    Some(Hop { tier: Tier::Plain, code: code.into(), ms, ..Hop::default() })
+/// THE host check's hop (`provider::host_check`), before any tier runs: a plain hop, final, $0.
+fn host_hop(url: &str, wall: Option<Duration>) -> Option<Hop> {
+    let t0 = Instant::now();
+    let (code, why) = crate::provider::host_check(url, wall)?;
+    Some(Hop { tier: Tier::Plain, code: code.into(), ms: t0.elapsed().as_millis() as u64, why, ..Hop::default() })
 }
 
 /// A running call, and its timeout (`Plan::timeout_of` when it started).
@@ -623,10 +669,10 @@ type Called<T> = (Result<T, Fail>, bool);
 pub fn run(p: &Plan, ask: &Ask, seen: Seen) -> Vec<Hop> {
     let call = |t: Tier, done: &[Hop]| -> Call {
         let (mut ask, pdf) = (ask.clone(), p.pdf_run(done));
-        (ask.js, ask.doc) = (t == Tier::OxyJs, pdf || p.hint);
+        (ask.js, ask.doc) = (t.renders(), pdf || p.hint);
         ask.timeout = Some(p.timeout_of(t, done));
         let (key, price, prior, card) = (t.key().unwrap_or_default(), t.spec().price, p.prior.clone(), !p.js && !pdf);
-        let langs = langs(&ask, done);
+        let (langs, turn) = (langs(&ask, done), (t == Tier::Plain).then(|| crate::provider::pace(&ask.url)));
         Box::pin(async move {
             let ok = |raw: Raw| Hop { limit: raw.limit, ..judge(t, raw, &ask.url, ask.js, pdf) };
             let (key, ok) = (&key, &ok);
@@ -638,11 +684,12 @@ pub fn run(p: &Plan, ask: &Ask, seen: Seen) -> Vec<Hop> {
                 let (ms, failed) = (first.ms + h.ms, format!("{why}+html:{}", h.code));
                 first = if h.ok { Hop { ms, why: why.into(), ..h } } else { Hop { ms, why: failed, ..first } };
             }
+            first.waited = turn.map_or(0, |t| t.1);
             geo(if card && !ask.js { og_card(first, &ask.url) } else { first }, &langs)
         })
     };
-    let hops = drive(p, &call, host_hop(&ask.url).into_iter().collect(), seen).into_iter();
-    hops.map(|h| Hop { country: crate::provider::sent(ask, h.tier).unwrap_or_default(), ..h }).collect()
+    let hops = drive(p, &call, host_hop(&ask.url, p.agent_left(&[])).into_iter().collect(), seen).into_iter();
+    hops.map(|h| Hop { country: sent(ask, h.tier).unwrap_or_default(), ..h }).collect()
 }
 
 /// THE language rule: the languages a provider's copy should be in: the `country:` mod's (`locale`),
@@ -667,9 +714,8 @@ fn langs(ask: &Ask, done: &[Hop]) -> (Vec<String>, Option<Ask>) {
     let words = label.into_iter().chain(first).filter(shaped).flat_map(|s| s.split(['-', '_']));
     let words = host.last().copied().into_iter().chain(words).flat_map(|w| locale(&w.to_lowercase()));
     let own = uniq(words.chain(plain), String::clone);
-    let query = u
-        .query_pairs()
-        .any(|(_, v)| shaped(&&*v) && v.split(['-', '_']).any(|w| !locale(&w.to_lowercase()).is_empty()));
+    let tagged = |v: &str| shaped(&v) && v.split(['-', '_']).any(|w| !locale(&w.to_lowercase()).is_empty());
+    let query = u.query_pairs().any(|(_, v)| tagged(&v));
     let bare = (named.is_empty() && own.is_empty() && !query).then(|| ask.clone());
     (if named.is_empty() { own } else { named }, bare)
 }
@@ -690,7 +736,7 @@ fn locale(word: &str) -> Vec<String> {
 /// a flag: `own:es` in its `why` (`bd✓own:es` in the tried path: `stats`, meta.json's hops).
 fn geo(mut h: Hop, (langs, bare): &(Vec<String>, Option<Ask>)) -> Hop {
     let own = |a: &Ask| url::Url::parse(&a.url).is_ok_and(|u| h.landed.as_deref() == Some(u.as_str()));
-    let unsent = bare.as_ref().filter(|a| crate::provider::sent(a, h.tier).is_none());
+    let unsent = bare.as_ref().filter(|a| sent(a, h.tier).is_none());
     let langs = if unsent.is_some() { &vec!["en".into()] } else { langs };
     if h.ok && h.tier != Tier::Plain && !h.lang.is_empty() && !langs.is_empty() && !langs.contains(&h.lang) {
         let tag = if unsent.is_some_and(own) { "own" } else { "lang" };
@@ -700,7 +746,7 @@ fn geo(mut h: Hop, (langs, bare): &(Vec<String>, Option<Ask>)) -> Hop {
 }
 
 /// THE Markdown guard: a server's own `text/markdown` answer (`clean::kind_of` `md`) is not served when it is thin
-/// (`THIN_CHARS` of prose) or under a fifth of the prose of the copy stored before, or flat (no heading) where
+/// (`thin_chars` of prose) or under a fifth of the prose of the copy stored before, or flat (no heading) where
 /// that copy had ≥ 3 sections; plain then asks again for HTML only (`Ask::html`), and the Markdown is served when
 /// that ask fails. `prior` = the stored copy's folder: its doc.json is read only for a Markdown answer, never
 /// rebuilt. The reason is the served hop's `why` (`plain✓md:thin` in `tried`).
@@ -711,7 +757,7 @@ fn md_weak(d: &Doc, prior: Option<&std::path::Path>) -> Option<&'static str> {
     let flat = d.sections.iter().enumerate().all(|(i, s)| s.title == format!("part {}", i + 1));
     let stored = prior.and_then(|p| crate::cache::jload::<Doc>(&p.join("doc.json")));
     let (n, tok) = stored.map_or((0, 0), |p| (p.sections.len(), p.tokens.clean));
-    let thin = d.loss.pruned_chars < THIN_CHARS || d.tokens.clean * 5 < tok;
+    let thin = d.loss.pruned_chars < limit("thin_chars") || d.tokens.clean * 5 < tok;
     thin.then_some("md:thin").or((flat && n >= 3).then_some("md:flat"))
 }
 
@@ -722,7 +768,7 @@ fn md_weak(d: &Doc, prior: Option<&std::path::Path>) -> Option<&'static str> {
 /// a wall or an app shell carrying the site-wide card (a maps shell, a login wall) is not the page. Stored as kind
 /// `og` (`clean::card`), so a rebuild of the body makes the card again.
 fn og_card(mut h: Hop, url: &str) -> Hop {
-    let shell = !h.ok && (h.code == "js_shell" || (400..500).contains(&h.status) && !is_final(&h));
+    let shell = !h.ok && (h.code == "js_shell" || (400..500).contains(&h.status) && !FINAL.contains(&h.code.as_str()));
     let own = |t: &Tree| {
         let (title, site) = (t.meta("og:title").map(clean::fold), t.meta("og:site_name").map(clean::fold));
         let desc = t.meta("og:description").map_or(0, |d| d.trim().chars().count());
@@ -750,24 +796,29 @@ pub fn run_search(p: &Plan, q: &str, limit: usize, country: Option<&str>) -> Vec
     drive(p, &call, Vec::new(), &drop).into_iter().map(|h| Hop { country: cc.clone(), ..h }).collect()
 }
 
+/// `route`'s answer: each tier with its hedge delay (None = after the call before it), and the worst-case cost.
+pub type Route = (Vec<(Tier, Option<Duration>)>, f64);
+
 /// What `dry:true` prints: the tiers a fully failing run would try, in order, each with the delay after which it
 /// starts beside the call before it (`next` hedges it) or None (it waits for that call's verdict), and the
 /// worst-case cost.
-pub fn route(p: &Plan) -> (Vec<(Tier, Option<Duration>)>, f64) {
+pub fn route(p: &Plan) -> Route {
     // a worst case: every call runs out its time (a clock, so the one-key wall decides a retry); under the
     // agent's one wall every render fails at once, so each one left gets to start and bill; plain meets the
-    // wall that keeps every rung after it (a captcha keeps oxy no-JS with both keys)
+    // wall that keeps every rung after it (a captcha keeps oxy no-JS with both keys), and so does a page's no-JS
+    // rung (cut, it would skip the next one: `ladder`)
+    let page = !p.search && !p.hint && !p.pdf_run(&[]);
     let fail = |t: Tier, ms: Duration, end| {
         let ms = if p.timeout.is_some() { 0 } else { ms.as_millis() as u64 };
-        let code = if t == Tier::Plain { CHECK.no_js_first[0] } else { "provider_timeout" }.into();
+        let wall = t == Tier::Plain || page && !t.can("js");
+        let code = if wall { CHECK.no_js_first[0] } else { "provider_timeout" }.into();
         Hop { tier: t, code, kind: "html", cost: t.spec().price, ms, end, ..Hop::default() }
     };
     let (mut done, mut path, mut clock) = (Vec::new(), Vec::new(), Instant::now());
     while let Step::Start(t) = next(p, &done, &[]) {
         // a tier hedged at or past a search's `wait:` never starts beside: it runs only after a fast failure
-        let after = p.hedge;
-        let beside = match next(p, &done, &[(t, after)]) {
-            Step::Start(u) if p.wait.is_none_or(|w| after < w) => Some((u, Some(after))),
+        let beside = match next(p, &done, &[(t, p.hedge)]) {
+            Step::Start(u) if p.wait.is_none_or(|w| p.hedge < w) => Some((u, Some(p.hedge))),
             _ => None,
         };
         let start = clock;
@@ -794,48 +845,107 @@ pub fn ignored(ask: &Ask, hops: &[Hop], id: &str) -> Vec<String> {
 /// cost. `subject` heads the rows (a snapshot's id, empty for a search); `id` = what the hint reruns, on `url` ("" =
 /// a search; the cap's arrow priced for the URL's own plan, as its `dry:true`).
 pub fn skipped(p: &Plan, hops: &[Hop], subject: &str, id: &str, url: &str) -> Vec<String> {
-    use crate::lang::{At, bang};
-    let zip = p.doc == Some("zip") && p.tiers()[0] == Tier::Plain;
+    let zip = p.doc == Some("zip") && p.ladder(&[])[0] == Tier::Plain;
     if hops.iter().any(|h| h.ok) || zip || hops.iter().any(|h| p.gate(h.tier) && !escalates(h)) {
         return Vec::new();
     }
     let left: Vec<Tier> = p.ladder(hops).into_iter().filter(|t| !hops.iter().any(|h| h.tier == *t)).collect();
     let mut rows = no_key(p, &left, subject, false);
     let over: Vec<Tier> = left.into_iter().filter(|t| p.keys.contains(t) && !refused(hops, *t)).collect();
-    // the same rule as `next`: a tier the cap stopped (one cut at a search's `wait:` was not)
-    let spent = spend(hops.iter().map(|h| h.cost));
-    if over.iter().any(|t| spent + t.spec().price > p.cap + 1e-9) {
+    // the same rule as `next`/`pooled`: a tier the cap stopped (one cut at a search's `wait:` was not); in a batch
+    // the cap the agent typed, the other runs' claims read under the pool's lock (who spent it: `budget_row`)
+    let others =
+        |(at, me): &(std::path::PathBuf, usize)| crate::cache::edit(at, |o: &mut Pool| claims(at, o, *me, false));
+    let by = p.pool.as_ref().and_then(|pool| others(pool).ok());
+    let (spent, others) = (held(hops, &[]), spend(by.unwrap_or_default().iter().map(|o| o.1)));
+    if over.iter().any(|t| spent + others + t.spec().price > p.cap + 1e-9) {
         let want = spent + spend(over.iter().map(|t| t.spec().price));
         let names: Vec<&str> = over.iter().map(|t| t.spec().short).collect();
-        let (cap, want) = (p.cap, (want * 1e4).ceil() / 1e4);
+        // up to the next $0.0001, past a sum's float noise: 3 × $0.0015 sums to 0.0045000000000000005, never $0.0046
+        let (cap, want) = (p.cap, (want * 1e4 - 1e-6).ceil() / 1e4);
         let what = format!("{} not tried · ${want:.4} > cost:{cap}", names.join(" "));
         rows.push(bang(subject, "budget_hit", &what, &At { id, url, arg: &want.to_string(), ..At::default() }));
     }
     rows
 }
 
-/// The tiers with a key configured (`Tier::key`). Unit tests run with every key: the key dir of the machine that
-/// runs them never changes an answer (the binary's tests set their own).
-pub fn keyed() -> Vec<Tier> {
-    Tier::ALL.into_iter().filter(|t| cfg!(test) || t.key().is_some()).collect()
+/// The document kind a path's suffix names (`Sites::doc_ext`), lower case in: `html` = a page.
+pub fn doc_kind(path: &str) -> Option<&'static str> {
+    SITES.doc_ext.iter().find(|e| path.ends_with(e.0)).map(|e| e.1)
 }
 
-/// THE `no_key` row (fetch, search, dry, setup, account), one per provider of `left` without a
-/// key: what its key would add to this run and the price, `! no_key bd · would try unblock+JS ≤$0.0015 · set
-/// BRIGHTDATA_API_KEY + … → fats setup · bd <sign-up>`; `setup` = said inside `fats setup`: no `→ fats setup`.
+/// The tiers with a key configured (`Tier::key`). Unit tests run with the keys of the world they model
+/// (`tests::KEYED`): the key dir of the machine that runs them never changes an answer (the binary's tests set
+/// their own).
+pub fn keyed() -> Vec<Tier> {
+    #[cfg(test)]
+    let has = |t: &Tier| tests::KEYED.contains(t);
+    #[cfg(not(test))]
+    let has = |t: &Tier| t.key().is_some();
+    Tier::ALL.into_iter().filter(has).collect()
+}
+
+/// THE `no_key` row (fetch, search, dry, setup, account), one per provider of `left` without a key: what its key
+/// would add to this run and the price, `! no_key bd · would try unblock+JS ≤$0.0015 · set BRIGHTDATA_API_KEY + …
+/// → fats setup bd` (the provider's key form, which names its sign-up page); `setup` = said inside `fats setup`: no
+/// arrow, `· bd <sign-up>` instead.
 pub fn no_key(p: &Plan, left: &[Tier], subject: &str, setup: bool) -> Vec<String> {
     let row = |o: &Tier| {
         let (s, mine) = (o.owner().spec(), left.iter().filter(|t| t.owner() == o.owner()));
         let buys = if p.search { vec!["web search"] } else { uniq(mine.clone().map(|t| t.spec().buys), |b| *b) };
         let need = if o.owner() == Tier::Bd { format!("{} + BRIGHTDATA_UNLOCKER_ZONE", s.env) } else { s.env.into() };
-        let cost = spend(mine.map(|t| t.spec().price));
+        let (cost, sw) = (spend(mine.map(|t| t.spec().price)), o.switch());
+        let kept = crate::settings::key(sw).map_or("", |_| " (key kept)");
+        // a switch turned off, or bd's key without its zone, is no missing key: its row says which (`! off free`)
+        let (code, what, arg) = match (crate::settings::on(sw), sw) {
+            (false, "free") => ("off", "free fetch turned off".into(), sw),
+            (false, _) => ("off", format!("turned off{kept}"), sw),
+            (true, "bd") if !kept.is_empty() => ("no_zone", "key saved, no Web Unlocker zone yet".into(), "<name>"),
+            _ => ("no_key", String::new(), ""),
+        };
+        if code != "no_key" {
+            return bang(subject, code, &format!("{sw} · {what}"), &At { arg, ..At::default() });
+        }
         let what = format!("{} · would try {} ≤${cost:.4} · set {need}", s.short, buys.join(" + "));
-        let next = if setup { String::new() } else { fix("no_key", &At::default()) };
+        let next = if setup { String::new() } else { format!("{} setup {}", bin(), s.short) };
         let row = Flag { code: "no_key".into(), what, next, row: true }.bang(subject);
-        row + &pages("no_key", [s.short])
+        if setup { row + &pages("no_key", [s.short]) } else { row }
     };
-    // the tiers without a key, one per key (both Oxylabs tiers share one)
-    uniq(left.iter().filter(|t| !p.keys.contains(t)), |t| t.owner()).into_iter().map(row).collect()
+    // the tiers without a key, one row a provider (both Oxylabs tiers share one), the cheapest first
+    let mut owners = uniq(left.iter().filter(|t| !p.keys.contains(t)), |t| t.owner());
+    let cost = |o: &&Tier| spend(left.iter().filter(|t| t.owner() == o.owner()).map(|t| t.spec().price));
+    owners.sort_by(|a, b| cost(a).total_cmp(&cost(b)));
+    owners.into_iter().map(row).collect()
+}
+
+/// The heads of `no_key`'s rows: a provider's key missing, its switch off (`! off oxy · …`), bd's zone missing.
+pub const KEY_ROWS: [&str; 3] = ["! no_key ", "! off ", "! no_zone "];
+
+/// A failed run's stored rows for the tiers it never tried (`skipped`).
+pub fn skips(m: &Meta) -> impl Iterator<Item = &str> {
+    m.extra.get("skipped").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|r| r.as_str())
+}
+
+/// A failed run's stored `budget_hit` row (`skipped`: the cap stopped it) as read now: a batch page's says who spent
+/// the batch's pool (`m`'s `pool`), every page with a claim, this one too, the parts summing to it: `(spent $0.0020:
+/// u1 $0.0010, u3 $0.0010)` (the others alone read as $0.0010 left). Read at each print, never stored: a page stops
+/// while another still holds an unbilled try (`u1 $0.0015 held`), which it bills after ($0.0020). Its arrow is the
+/// reader's (`lang::restamp` for `id`), through the settle gate (`clear`, `others` = the session's other copies):
+/// one that plans a settled tier is dropped, the row stays.
+pub fn budget_row(m: &Meta, id: &str, others: &[Meta]) -> Option<String> {
+    let row = skips(m).find(|r| r.starts_with("! budget_hit "))?;
+    let at = std::path::Path::new(m.extra.get("pool").and_then(|v| v.as_str()).unwrap_or_default());
+    let all = crate::cache::jload(at).map(|pool: Pool| claims(at, &pool, 0, false)).filter(|a| !a.is_empty());
+    let ids = all.iter().flatten().map(|o| format!("u{} ${:.4}{}", o.0, o.1, o.2)).collect::<Vec<_>>().join(", ");
+    let by = all.map(|a| format!(" (spent ${:.4}: {ids}) → ", spend(a.iter().map(|o| o.1))));
+    let row = crate::lang::restamp(&row.replacen(" → ", by.as_deref().unwrap_or(" → "), 1), id, &m.url);
+    Some(row.split_once(" → ").filter(|r| !clear(r.1, m, others)).map_or(row.clone(), |r| r.0.into()))
+}
+
+/// A failed run's stored `no_key` rows (`skipped`) whose provider still has no key (`Tier::switch` names it).
+pub fn no_key_left(m: &Meta) -> Vec<&str> {
+    let left = |n: &str| !keyed().iter().any(|t| t.switch() == n);
+    skips(m).filter(|&r| KEY_ROWS.iter().find_map(|k| r.strip_prefix(k)?.split(' ').next()).is_some_and(left)).collect()
 }
 
 /// THE re-render rule: `js:true` on a page whose copy a render sent never asks that render again while another
@@ -857,7 +967,9 @@ fn gov(url: &str) -> bool {
 /// The tiers a fix must not send again (`lang::At::done`): every tier this run called, every tier without a key
 /// (`keys`: a hint never names a provider the user has no key for), bd on a gov host, and a no-JS
 /// tier after a JS shell or challenge (`Check::render_first`: oxy no-JS served 0/33 there). Once no other paid
-/// tier is left, a tier whose only signal was OUR cut (`ours`: it never said no) is not spent: it is the move.
+/// tier is left, a no-JS tier whose only signal was OUR cut (`ours`: it never said no) is not spent: it is the
+/// move, at twice its time (`timeout_of`; oxy cut at 10 s served a thread 6 of 6 later). A render we cut is
+/// spent: no longer call follows it (`fix_arg`).
 /// `cuts` = the hops of the URL's other copies this session (cli `seen`): a tier another copy of the URL tried is no
 /// fix either (a `provider:oxy` offer never shows again after the `provider:oxy` copy).
 pub fn spent(m: &Meta, cuts: &[HopRow], keys: &[Tier]) -> Vec<&'static str> {
@@ -866,10 +978,14 @@ pub fn spent(m: &Meta, cuts: &[HopRow], keys: &[Tier]) -> Vec<&'static str> {
     let site_no =
         |t: &Tier| all_hops.iter().any(|h| h.code == "error_page" && Tier::parse(&h.provider) == Some(t.owner()));
     let barred = |t: &Tier| !keys.contains(t) || gov(&m.url) && !t.can("gov") || js_wall && !t.can("js") || site_no(t);
-    // Nor, then, one whose only word was its own error (`provider_error`) unless another copy's too
+    // Nor, then, one whose only word was its own error (`provider_error`) unless another copy's too or it settled
     let error = |h: &HopRow| h.code == "provider_error" && !cuts.iter().any(|c| c.provider == h.provider);
+    let sett = settled(m, cuts, None);
+    let error = |h: &HopRow| error(h) && !sett.contains(&h.provider.as_str());
     let done = |all: bool| {
-        let hops = all_hops.iter().filter(|h| all || !ours(&h.code, h.upto, h.timeout_s) && !error(h));
+        let gate = |h: &HopRow| ours(&h.code, h.upto) && Tier::parse(&h.provider).is_some_and(|t| !t.can("js"));
+        // a rate limit is a wait, never the tier's answer (bd's `rate_limited` → `provider:bd`)
+        let hops = all_hops.iter().filter(|h| h.code != "rate_limited" && (all || !gate(h) && !error(h)));
         let tiers = hops.filter_map(|h| Tier::parse(&h.provider)).chain(Tier::ALL.into_iter().filter(barred));
         tiers.map(|t| t.spec().short).collect::<Vec<_>>()
     };
@@ -878,21 +994,36 @@ pub fn spent(m: &Meta, cuts: &[HopRow], keys: &[Tier]) -> Vec<&'static str> {
     if rest { all } else { done(false) }
 }
 
-/// A call WE cut (`upto`: no answer; bd cut at our 60 s served the page in 36.7 s 3 min later) under
-/// `render_fix_s` is no "tried": no `app_page` vote, not `spent` when it is the last tier left.
-fn ours(code: &str, upto: f64, timeout_s: u64) -> bool {
-    code == "provider_timeout" && upto > 0.0 && timeout_s < limit("render_fix_s")
+/// THE settle rule: the tiers (names) a provider's error settled for `m`'s URL: its own 4xx (the same request is
+/// refused again: Oxylabs' 400-404 are not retryable) or its own retries given up (`faulted`). The hop keeps no
+/// status, so it is read from `why`, which `provider::reason` starts with it (`400 url: value not supported`).
+/// `m`'s own hops settle; another copy's (`cuts`) settles every copy when it gave up, is a 404 or names the `url`,
+/// else only when the arrow's own request (`country` its `country:` mod) sends that tier the country the refused
+/// call sent (`provider::sent`: `400 geo_location: …` refuses that country again, never another).
+pub fn settled<'a>(m: &'a Meta, cuts: &'a [HopRow], country: Option<&str>) -> Vec<&'a str> {
+    let is = |h: &HopRow| h.code == "provider_error" && (h.why.starts_with('4') || h.why.contains("faulted"));
+    let all = |h: &HopRow| h.why.contains("faulted") || h.why.starts_with("404") || h.why.contains(" url: ");
+    let ask = Ask { url: m.url.clone(), country: country.map(String::from), ..Ask::default() };
+    let same = |h: &HopRow| Tier::parse(&h.provider).is_some_and(|t| sent(&ask, t).unwrap_or_default() == h.country);
+    let hops = m.hops.iter().chain(cuts).filter(|h| is(h) && (all(h) || same(h)));
+    hops.map(|h| h.provider.as_str()).collect()
+}
+
+/// A call WE cut (`upto`: no answer) is no provider's answer: no `app_page` vote.
+fn ours(code: &str, upto: f64) -> bool {
+    code == "provider_timeout" && upto > 0.0
 }
 
 /// The cut a failed run's move and reason follow when the run ended in OUR cut, whatever code
-/// heads the row (`outcome` puts a wall any tier met there): the tiers decide, not the head. Of two cuts, bd's
-/// (`js:true`'s order, one provider at a time), else the last.
+/// heads the row (`outcome` puts a wall any tier met there): the tiers decide, not the head. Of two cuts, the first
+/// render's of the table (`js:true`'s order, one provider at a time: bd), else the last.
 pub fn cut_of(m: &Meta) -> Option<&HopRow> {
     let last = m.hops.iter().rfind(|h| h.code != "abandoned")?;
     let ended =
         last.code == "provider_timeout" && (m.code == last.code || m.code.ends_with("_wall") || last.upto > 0.0);
     let all = m.hops.iter().enumerate().filter(|(_, h)| ended && h.code == "provider_timeout");
-    all.max_by_key(|(i, h)| (h.provider == Tier::Bd.spec().name, *i)).map(|(_, h)| h)
+    let first = Tier::ALL.into_iter().find(|t| t.can("js")).map(|t| t.spec().name);
+    all.max_by_key(|(i, h)| (Some(h.provider.as_str()) == first, *i)).map(|(_, h)| h)
 }
 
 /// The code a failed run's move follows (`lang::fix`): a timeout's when it ended in our cut (`cut_of`), else its own.
@@ -902,34 +1033,29 @@ pub fn move_code(m: &Meta) -> &str {
 
 /// `{arg}` of a failed fetch's fix (`lang::fix`), THE timeout move, judged on the session's hops of the URL (`cuts`
 /// = its other copies'): after the agent's own `timeout:` cut shorter than the tier's time, none (`fresh:true`
-/// = the default time, never `nothing left to try`); with no other keyed tier left untried, the cut render ONCE a
-/// session (until a call of `render_fix_s` ran, cut or answered) at its longer time and price (`OFFER`;
-/// bd took over 60 s on TikTok 9 of 9 times), then None = a COUNT, no arrow (`timed_out`), as after a no-JS
-/// cut or an error page with nothing left; else a render (`js:true`; shells + timeouts = `no_copy`).
+/// = the default time, never `nothing left to try`); with no other keyed tier left untried, None = a COUNT, no
+/// arrow, the run's end (no longer call after our cut: 0 of 131 saved renders answered in 60-150 s, the
+/// four `timeout:150` calls that served did so in under 60 s), as after an error page with nothing left;
+/// else a render (`js:true`, `lang::fix` names the keyed tier left; shells + timeouts = `no_copy`).
 pub fn fix_arg(m: &Meta, cuts: &[HopRow]) -> Option<&'static str> {
-    let (cut, keys) = (cut_of(m), keyed());
-    let done = spent(m, cuts, &keys);
+    let (cut, done) = (cut_of(m), spent(m, cuts, &keyed()));
     // in a timeout's move a tier WE cut is tried too, else two cut renders defer to each other (`js:true`)
     let tried = |t: &Tier| cut.is_some() && m.hops.iter().chain(cuts).any(|h| h.provider == t.spec().name);
-    let left = |js: bool, not: Tier| {
-        let untried = |t: &&Tier| t.spec().price > 0.0 && !done.contains(&t.spec().short) && **t != not && !tried(t);
-        Tier::ALL.iter().filter(untried).any(|t| t.can("js") || !js)
-    };
+    let open = |t: &Tier| t.spec().price > 0.0 && !done.contains(&t.spec().short);
+    let left = |not: Tier| Tier::ALL.iter().any(|t| open(t) && *t != not && !tried(t));
+    // the certificate's answer (`provider::plain`): the keyed no-JS tier by name (`provider:oxy`), else none
+    let no_js = Tier::ALL.iter().find(|t| open(t) && !t.can("js")).map(|t| ASK[*t as usize].as_str());
     let short = |h: &HopRow, t: Option<Tier>| t.is_none_or(|t| h.timeout_s < t.spec().timeout.as_secs());
-    let long = |t: Tier, h: &HopRow| h.timeout_s >= limit("render_fix_s") || !t.can("js");
-    let ran = |t: Tier| m.hops.iter().chain(cuts).any(|h| h.provider == t.spec().name && long(t, h));
-    // two keys name the provider, unless the tier answered itself (a 408: `lang::fix` bars a named spent tier)
-    let two = uniq(keys.iter().filter(|t| t.spec().price > 0.0), |t| t.owner()).len() > 1;
-    let named = |t: Tier| usize::from(two && !done.contains(&t.spec().short));
     // The tier whose own failure ended the run, still unspent (`spent`: its error, the one tier left), by name
     let err = |h: &HopRow| Tier::parse(&h.provider).filter(|t| h.code == m.code && !done.contains(&t.spec().short));
     match cut.map(|h| (h, Tier::parse(&h.provider))) {
+        None if m.code == "tls_failed" => no_js,
         // The site refused every keyed provider with its error page: a count; so is a site's 4xx
-        None if (m.code == "error_page" || m.code.starts_with("http_4")) && !left(false, Tier::Plain) => None,
-        None => Some(m.hops.iter().find_map(err).map_or("", |t| &OFFER[t as usize][2])),
+        None if (m.code == "error_page" || m.code.starts_with("http_4")) && !left(Tier::Plain) => None,
+        // a settled tier is never asked again: `fail_row`'s gate (`settled`) names the tier left
+        None => Some(m.hops.iter().find_map(err).map_or("", |t| &ASK[t as usize])),
         Some((h, t)) if h.why.starts_with("timeout:") && short(h, t) => Some(""),
-        Some((_, Some(t))) if !left(t.can("js"), t) && !ran(t) => Some(&OFFER[t as usize][named(t)]),
-        Some((_, Some(t))) if !left(false, t) => None,
+        Some((_, Some(t))) if !left(t) => None,
         _ => Some("js:true"),
     }
 }
@@ -941,59 +1067,52 @@ pub fn route_of(c: &Cache, url: &str, p: &mut Plan) {
 }
 
 /// The most an arrow (`fats u1 fresh:true …`, the words after the binary) can spend on `url`
-/// ("" = its id's page, or a search), 0 when it spends nothing; THE `≤$X` of every paid arrow (`lang::priced`):
-/// `dry:true`'s `up to` for that command, the same plan (`Plan::of`, `route_of`) through the same `route`.
-pub fn worst(arrow: &str, url: &str) -> f64 {
-    // The words after the binary that heads the arrow, never after its name inside them
-    let cmd = crate::lang::parse(&[arrow.strip_prefix(&format!("{} ", bin())).unwrap_or("").to_string()]);
+/// ("" = its id's page, or a search), with the tiers it would call in order (`outline::js_next` names the first,
+/// `fail_row`'s settle gate reads them all); None = it spends nothing. THE `≤$X` of every paid arrow
+/// (`lang::priced`): `dry:true`'s `up to` for that command, the same plan (`Plan::of`, `route_of`) through the same
+/// `route`.
+pub fn worst(arrow: &str, url: &str) -> Option<Route> {
+    // The words after the binary that heads the arrow or a `· ` part of it (`check the certificate · fats u1 …`),
+    // never after its name inside them, before its price
+    let at = format!(" · {arrow}").split_once(&format!(" · {} ", bin())).map(|p| p.1.to_string()).unwrap_or_default();
+    let words = at.split(" ≤$").next().unwrap_or_default();
+    let cmd = crate::lang::parse(&[words.to_string()]);
     // a command that can spend: a fetch or search past the cache (`account`, `setup`: free reads)
     // GitHub's search is free (a re-read once quoted ≤$0.0025, a web search's)
     let spends = ["fresh", "js", "provider", "timeout"].iter().any(|k| cmd.get(k).is_some());
     if !spends || !cmd.reserved.is_empty() || crate::cli::is_gh(&cmd) {
-        return 0.0;
+        return None;
     }
     let page = cmd.urls.first().map(String::as_str).or((!url.is_empty() || !cmd.ids.is_empty()).then_some(url));
-    let mut p = Plan::of(&cmd, page, 0.0);
+    let mut p = Plan::of(&cmd, page);
     let s = crate::settings::get();
     route_of(&Cache::at(s.cache.value.clone(), s.session.value.clone()), page.unwrap_or_default(), &mut p);
-    route(&p).1
+    Some(route(&p))
 }
 
-/// `60 s + 150 s here` (`fail_detail` names the tier): every time this session cut the URL's timed-out tier at (this
-/// copy's hops and `cuts`), once one reached `render_fix_s` (the longer time ran, `fix_arg` never offers it
-/// again); `cut at 60 s · 150 s answered` once a longer call served (Zara: in 16 s), else `150 s failed
-/// (502)` (its code); else "".
-pub fn timed_out(m: &Meta, cuts: &[HopRow]) -> String {
-    let (Some(last), fix) = (cut_of(m), limit::<u64>("render_fix_s")) else { return String::new() };
-    // A call of that provider at the longer time ran, cut OR answered (`true`, said apart)
-    let same = |h: &&HopRow| h.provider == last.provider && (h.code == last.code || h.timeout_s >= fix);
-    // The longer call `answered` only when it served (a serve sorts last), else it `failed (502)`
-    let key = |h: &HopRow| (h.code != last.code, h.timeout_s, h.code == "ok", h.code.replace("http_", ""));
-    let s: std::collections::BTreeSet<_> = m.hops.iter().chain(cuts).filter(same).map(key).collect();
-    let times = |r| s.iter().filter(|t| t.0 == r).map(|t| format!("{} s", t.1)).collect::<Vec<_>>().join(" + ");
-    match s.last() {
-        Some((true, _, true, _)) => format!("cut at {} · {} answered", times(false), times(true)),
-        Some((true, .., c)) => format!("cut at {} · {} failed ({c})", times(false), times(true)),
-        Some((false, t, ..)) if *t >= fix => format!("{} here", times(false)),
-        _ => String::new(),
-    }
+/// THE settle gate, every printed paid arrow (`fail_row`, `outline::js_next`, `outline::geo_flags`, `budget_row`):
+/// false when the arrow's own dry (`worst`: its tiers, by name or ladder) plans a tier settled for `m`'s URL
+/// (`settled`, for the country the arrow's request sends), the hops of the URL's `others` copies read too.
+pub fn clear(arrow: &str, m: &Meta, others: &[Meta]) -> bool {
+    let cuts: Vec<HopRow> = others.iter().flat_map(|o| o.hops.clone()).collect();
+    let sett = settled(m, &cuts, crate::lang::parse(&[arrow.into()]).get("country"));
+    worst(arrow, &m.url).is_none_or(|r| r.0.iter().all(|t| !sett.contains(&t.0.spec().name)))
 }
 
-/// A failed record's count once another record of the same URL or query in this session (`others`)
-/// failed the same way, the same code along the same tiers, codes and countries (whatever time each call was
-/// given, so the 150 s call failing as the 60 s one did counts, `http_502`): ` · failed 2/2 here` (the same
-/// failures / the records). Its arrow would send the call that failed again (a bd outage = an endless $0 loop;
-/// consent.google's 400): said only when its fix (`arg`) changes nothing (empty), the caller drops the
-/// arrow. The end state (no fix, None) counts every copy failed the same way, whatever path; a code is the
-/// move's (`move_code`: a 0.1.6 `no_copy` both-cut copy is the timeout it was), said from the first (`failed 1/1
-/// here` on a one-key error page, the row with no arrow).
+/// A failed record's count once another record of the same URL or query in this session (`others`) failed the
+/// same way: ` · failed k/n here` (the same failures / the records). With a fix (`arg`) the same way = the same
+/// move code and the same LAST tier, code and country (a lap ending where an earlier one ended, whatever
+/// tiers ran before or time each call had), and the caller drops the arrow (it would send the call that failed
+/// again: a bd outage = an endless $0 loop; consent.google's 400). With no fix (None) every copy failed with the
+/// same move code counts, whatever path, said from the first (`failed 1/1 here` on a one-key error page, the row
+/// with no arrow). A code is the move's (`move_code`: an older build's stored `no_copy` whose renders were both cut is
+/// the timeout it was).
 pub fn fail_count<'a>(m: &Meta, others: impl Iterator<Item = &'a Meta>, arg: Option<&str>) -> Option<String> {
     let same: Vec<&Meta> = others.filter(|s| s.url == m.url).collect();
-    let tiers =
-        |s: &Meta| s.hops.iter().map(|h| [&h.provider, &h.code, &h.country].map(String::clone)).collect::<Vec<_>>();
-    let way = |s: &Meta| move_code(s) == move_code(m) && (arg.is_none() || tiers(s) == tiers(m));
+    let last = |s: &Meta| s.hops.last().map(|h| [&h.provider, &h.code, &h.country].map(String::clone));
+    let way = |s: &Meta| move_code(s) == move_code(m) && (arg.is_none() || last(s) == last(m));
     let k = 1 + same.iter().filter(|s| !s.ok && way(s)).count();
-    arg.is_none_or(|a| k > 1 && a.is_empty()).then(|| format!(" · failed {k}/{} here", same.len() + 1))
+    (arg.is_none() || k > 1).then(|| format!(" · failed {k}/{} here", same.len() + 1))
 }
 
 /// D1: THE failed copy's row parts, for `cli::no_doc` and `outline::page_flags`: why it failed (`fail_detail`, `page`
@@ -1001,38 +1120,56 @@ pub fn fail_count<'a>(m: &Meta, others: impl Iterator<Item = &'a Meta>, arg: Opt
 /// No count when a newer copy `served` (its row points there, never "failed" beside the page).
 pub fn fail_row(m: &Meta, others: &[Meta], page: &str, id: &str, served: bool) -> FailRow {
     let cuts: Vec<HopRow> = others.iter().flat_map(|o| o.hops.clone()).collect();
-    let (done, arg) = (spent(m, &cuts, &keyed()), fix_arg(m, &cuts));
-    let again = fail_count(m, others.iter(), arg).filter(|_| !served);
+    let done = spent(m, &cuts, &keyed());
+    let arg = fix_arg(m, &cuts);
     let at = At { id, url: &m.url, arg: arg.unwrap_or_default(), done: &done };
-    let arrow = arg.filter(|_| again.is_none()).map(|_| fix(move_code(m), &at));
-    let (why, owners) = fail_detail(m, page, &cuts);
-    // The longer call offered says so before its arrow (`bd cut at 60 s (3m ago) · one more try → …`)
-    let more = (!served && arg.is_some_and(|a| a.contains("timeout:"))).then(|| " · one more try".into());
-    (why, again.or(more).unwrap_or_default(), arrow, owners)
+    // the settle gate (`clear`): an arrow that plans a settled tier names the keyed paid tier left whose dry plans
+    // none (`left_ask`), else none: a count from the first copy (oxy-only: `failed 1/1`)
+    let gate = |a: &str| clear(a, m, others);
+    let (arg, arrow) = match arg.map(|_| fix(move_code(m), &at)) {
+        Some(a) if !gate(&a) => left_ask(id, &m.url, &done, gate).unzip(),
+        arrow => (arg, arrow),
+    };
+    let again = fail_count(m, others.iter(), arg).filter(|_| !served);
+    // a run the cap stopped: its `budget_hit` row (`skipped`) is the one move while it has one
+    let budget = budget_row(m, id, others).is_some_and(|r| r.contains(" → "));
+    // a repeat drops the arrow only when it changes nothing: the same call again (an empty `arg`); a tier never
+    // asked (both keys: `provider:bd` after oxyjs cut twice) stays the move beside the count
+    let arrow = arrow.filter(|_| !(again.is_some() && arg == Some("")) && !budget);
+    // a key this run lacked could still serve it (its `no_key` row): that is the move, never "nothing left" or none
+    let none = arrow.as_ref().is_none_or(|a| a.starts_with("nothing left")) && !budget && !no_key_left(m).is_empty();
+    let arrow = if none { Some(fix("no_key", &At::default())) } else { arrow };
+    let (why, owners) = fail_detail(m, page);
+    (why, again.unwrap_or_default(), arrow, owners)
 }
 
-/// `fail_row`: (why, ` · failed k/n here` or the fix's ` · one more try`, the fix, the accounts named).
+/// `fail_row`: (why, ` · failed k/n here`, the fix, the accounts named).
 pub type FailRow = (String, String, Option<String>, Vec<&'static str>);
 
-/// `fix_arg`'s one more call of a cut render at `render_fix_s`, one key / two keys (two name the provider):
-/// `timeout:150` / `provider:bd timeout:150` (`lang::fix` quotes it, `worst`). A no-JS tier is offered by
-/// `lang::fix` at its own time (`timeout:` stretches renders only); third, the tier named at its own time.
-static OFFER: LazyLock<Vec<[String; 3]>> = LazyLock::new(|| {
-    let s: u64 = limit("render_fix_s");
-    Tier::ALL.map(|t| [format!("timeout:{s}"), format!("{} timeout:{s}", t.ask()), t.ask()]).to_vec()
+/// THE "keyed paid tier left" arrow (`lang::fix` after a render or a refusal, `fail_row`'s settle gate): the first
+/// paid tier not `done` whose `fats <id> fresh:true <ask>` passes `ok`, priced (`lang::priced`), and its ask.
+pub fn left_ask(id: &str, url: &str, done: &[&str], ok: impl Fn(&str) -> bool) -> Option<(&'static str, String)> {
+    let left = Tier::ALL.into_iter().filter(|t| t.spec().price > 0.0 && !done.contains(&t.spec().short));
+    let mut arrows = left.map(|t| (ASK[t as usize].as_str(), format!("{} {id} fresh:true {}", bin(), ASK[t as usize])));
+    arrows.find(|a| ok(&a.1)).map(|(a, arrow)| (a, crate::lang::priced(&arrow, url)))
+}
+
+/// A tier asked by name (`provider:oxy js:true`: its owner, and `js:true` for an owner's render rung).
+static ASK: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let ask = |t: Tier| format!("provider:{}{}", t.owner().spec().short, if t.renders() { " js:true" } else { "" });
+    Tier::ALL.map(ask).to_vec()
 });
 
-/// What a failed run's `!` row names: a refused key is named as `fats config` lists it (`oxy`, `bd`); a failure
-/// the provider gave a reason token for (`Hop::why`) names the account and the token (`bd proxy_error`,
-/// `oxy retry in 5s`, `bd cut at 60 s (3m ago)`, after the longer time ran every time tried: `timed_out`); never
-/// the provider's answer itself. Any other failure names `page`. Also the accounts the row names, for their
-/// dashboard pages (`provider::pages`). THE reason of every failed copy's row, with or without a doc.
-pub fn fail_detail(m: &Meta, page: &str, cuts: &[HopRow]) -> (String, Vec<&'static str>) {
+/// What a failed run's `!` row names: a refused key is named as `fats config` lists it (`oxy`, `bd`); a failure the
+/// provider gave a reason token for (`Hop::why`) names the account and the token (`bd proxy_error`, `oxy retry in 5s`,
+/// `bd cut at 60 s (3m ago)`); never the provider's answer itself. Any other failure names `page`. Also the accounts
+/// the row names, for their dashboard pages (`provider::pages`). THE reason of every failed copy's row, with or without
+/// a doc.
+pub fn fail_detail(m: &Meta, page: &str) -> (String, Vec<&'static str>) {
     // the account a hop bills (`oxy` for oxyjs), a tier's or one of its own (`gh`: GitHub)
     let owner = |h: &HopRow| {
-        Tier::parse(&h.provider)
-            .map(|t| t.owner().spec().short)
-            .or(crate::provider::links(&h.provider).map(|l| l.short))
+        let tier = Tier::parse(&h.provider).map(|t| t.owner().spec().short);
+        tier.or(crate::provider::links(&h.provider).map(|l| l.short))
     };
     if m.code != "bad_key" {
         let code = move_code(m);
@@ -1042,10 +1179,15 @@ pub fn fail_detail(m: &Meta, page: &str, cuts: &[HopRow]) -> (String, Vec<&'stat
         let age = crate::cache::now() - m.t;
         let age = if age < 60.0 { String::new() } else { format!(" ({} ago)", fmt_age(age)) };
         let ours = |h: &HopRow| h.why.strip_prefix("took > ").map(|_| format!("cut at {} s{age}", h.timeout_s));
-        let why = Some(timed_out(m, cuts)).filter(|t| !t.is_empty()).or(last.map(|h| ours(h).unwrap_or(h.why.clone())));
-        // a call we cut names its tier (`oxyjs cut at 60 s`), a provider's reason its account (`oxy retry in 5s`)
-        let cut = last.and_then(|h| Tier::parse(&h.provider)).filter(|_| code == "provider_timeout");
+        let why = last.map(|h| ours(h).unwrap_or(h.why.clone()));
+        // a certificate's refusal names its reason, never the http copy's: `certificate-verify-failed · $0`
+        let tls = why.clone().filter(|_| code == "tls_failed").and_then(|w| Some(w.strip_prefix("tls:")?.to_owned()));
+        // a call we cut or a provider's error names its tier (`oxyjs cut at 60 s`, `oxyjs 400 url: value not
+        // supported`), a provider's other reason its account (`oxy retry in 5s`)
+        let cut = last.and_then(|h| Tier::parse(&h.provider));
+        let cut = cut.filter(|_| matches!(code, "provider_timeout" | "provider_error"));
         return match (last.and_then(owner), why.filter(|w| !w.is_empty())) {
+            _ if let Some(t) = tls => (format!("{} · $0", t.split('+').next().unwrap_or_default()), Vec::new()),
             (Some(o), Some(w)) => (format!("{} {w}", cut.map_or(o, |t| t.spec().short)), vec![o]),
             _ => (page.into(), Vec::new()),
         };
@@ -1082,6 +1224,7 @@ pub fn outcome(url: &str, hops: &mut [Hop], ms: u64) -> Outcome {
         "html" if !h.body.is_empty() => Some((0, h.vis)),
         _ => None,
     };
+    let wall = hops.iter().rfind(|h| h.code.ends_with("_wall"));
     let best = win.or_else(|| hops.iter().enumerate().filter_map(|(i, h)| Some((score(h)?, i))).max().map(|x| x.1));
     // a failed run is named by its last answer; a cut PDF shown as the best copy by its own code (`pdf_truncated`)
     let code = match (win, best.filter(|&i| hops[i].kind == "pdf")) {
@@ -1091,22 +1234,20 @@ pub fn outcome(url: &str, hops: &mut [Hop], ms: u64) -> Outcome {
         _ if app_page(hops) => "no_copy".into(),
         // A wall any tier met says more than the last tier's timeout (oxy-only Joomla: `cloudflare_wall`, not
         // `provider_timeout`)
-        _ => {
-            match (hops.iter().rev().find(|h| h.code != "abandoned"), hops.iter().rfind(|h| h.code.ends_with("_wall")))
-            {
-                // a `one_render` gate names the run only when its render met it too (a shell, the gate), never a
-                // render cut or refused: that one keeps its own fix (the 150 s offer, the other provider)
-                (Some(l), Some(w)) if CHECK.one_render.contains(&w.code.as_str()) => {
-                    if l.code == "js_shell" { w } else { l }.code.clone()
-                }
-                (Some(l), Some(w)) if l.code == "provider_timeout" => w.code.clone(),
-                (last, _) => last.map_or("no_key".into(), |h| h.code.clone()),
+        _ => match (hops.iter().rev().find(|h| h.code != "abandoned"), wall) {
+            // a `one_render` gate names the run only when its render met it too (a shell, the gate), never a
+            // render cut or refused: that one keeps its own fix (the other keyed provider, else the run's end)
+            (Some(l), Some(w)) if CHECK.one_render.contains(&w.code.as_str()) => {
+                if l.code == "js_shell" { w } else { l }.code.clone()
             }
-        }
+            (Some(l), Some(w)) if l.code == "provider_timeout" => w.code.clone(),
+            (last, _) => last.map_or("no_key".into(), |h| h.code.clone()),
+        },
     };
     let error = if win.is_some() { None } else { error_text(hops) };
     let cost = spend(hops.iter().map(|h| h.cost));
     let landed = best.and_then(|i| hops[i].landed.clone());
+    let refreshed_from = best.and_then(|i| hops[i].refreshed_from.clone());
     let (tier, kind, final_url, body, doc, tree, charset) = match best {
         Some(i) => {
             let h = &mut hops[i];
@@ -1114,7 +1255,7 @@ pub fn outcome(url: &str, hops: &mut [Hop], ms: u64) -> Outcome {
         }
         None => (hops.last().map_or(Tier::Plain, |h| h.tier), "html", String::new(), Vec::new(), None, None, ""),
     };
-    let render = tier == Tier::OxyJs;
+    let render = tier.renders();
     let fin = if final_url.is_empty() { url } else { &final_url };
     // `judge` parsed every body once (a PDF into its doc); a failed HTML answer is cleaned here from that parse
     let doc = doc.or_else(|| tree.and_then(|t| guarded(|| Ok(clean::build_doc(&t, url, fin, render))).ok()));
@@ -1122,8 +1263,9 @@ pub fn outcome(url: &str, hops: &mut [Hop], ms: u64) -> Outcome {
         url: url.into(),
         final_url: (!final_url.is_empty() && final_url != url).then_some(final_url),
         landed,
+        refreshed_from,
         provider: tier.spec().name.into(),
-        ms,
+        ms: ms.saturating_sub(hops.iter().map(|h| h.waited).sum()),
         cost: (cost * 1e6).round() / 1e6,
         ok: win.is_some(),
         code,
@@ -1176,7 +1318,8 @@ pub struct Wall {
     pub code: &'static str,
 }
 
-/// Where a wall rule looks: response header lines, the raw HTML (unescaped, folded), the visible text, or the HTTP status (an error status, ≥ 400, is a wall of its own).
+/// Where a wall rule looks: response header lines, the raw HTML (unescaped, folded), the visible text, or the HTTP
+/// status (an error status, ≥ 400, is a wall of its own).
 #[derive(serde::Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum On {
@@ -1202,8 +1345,9 @@ fn page_lang(tree: &Tree) -> String {
 /// tier is tried.
 pub fn judge(tier: Tier, raw: Raw, url: &str, js: bool, pdf: bool) -> Hop {
     let (kind, magic) = (clean::kind_of(&raw.ctype, &raw.body), clean::sniff(&raw.body));
-    let (final_url, charset) = (raw.final_url.clone(), raw.charset);
-    let mut h = Hop { tier, status: raw.status, final_url, kind, charset, ..Hop::default() };
+    let mut h = Hop { tier, kind, status: raw.status, charset: raw.charset, why: raw.why.clone(), ..Hop::default() };
+    h.final_url.clone_from(&raw.final_url);
+    h.refreshed_from.clone_from(&raw.refreshed_from);
     let fin = if raw.final_url.is_empty() { url } else { &raw.final_url };
     if pdf && magic != Some("pdf") && (tier != Tier::Plain || clean::LISTS.text.contains(&kind)) {
         // the site's own error status (Bright Data's `x-brd-status-code`) says more than "not the file"
@@ -1242,10 +1386,11 @@ pub fn judge(tier: Tier, raw: Raw, url: &str, js: bool, pdf: bool) -> Hop {
         let (ok, code, vis, shown) = check(&tree, &text, &raw, url);
         // the site's own language only from a copy of the site (served, or a shell/thin page below 400), never a
         // wall's or a challenge's (a CF challenge says `en-US` on any site)
-        if ok || (raw.status < 400 && !code.ends_with("_wall")) {
-            h.lang = page_lang(&tree);
-        }
+        h.lang = if ok || (raw.status < 400 && !code.ends_with("_wall")) { page_lang(&tree) } else { h.lang };
         (h.ok, h.code, h.vis) = (ok, code, vis);
+        // https refused for its certificate (`provider::plain`'s `tls:` why) and an error page over http: the site
+        // is there, its certificate is the answer, no paid tier is asked (`FINAL`); http's other answers: `plain`
+        h.code = if h.code == "error_page" && raw.why.starts_with("tls:") { "tls_failed".into() } else { h.code };
         // a page served under an error status says so in its tier path (`oxyjs✓403`)
         h.why = if ok && raw.status >= 400 { raw.status.to_string() } else { h.why };
         // A provider is named, never plain (no provider: its error page is the page's own answer)
@@ -1257,8 +1402,9 @@ pub fn judge(tier: Tier, raw: Raw, url: &str, js: bool, pdf: bool) -> Hop {
         }
         if ok {
             match guarded(|| Ok(clean::build_doc(&tree, url, &h.final_url, js))) {
-                // a page that cleans to almost nothing is a shell unless its title is visibly there (example.com)
-                Ok(d) if d.loss.pruned_chars < THIN_CHARS && !shown => {
+                // a page that cleans to fewer than `thin_chars` is a shell unless its title is visibly there
+                // (example.com)
+                Ok(d) if d.loss.pruned_chars < limit("thin_chars") && !shown => {
                     (h.ok, h.code, h.doc) = (false, "thin_content".into(), Some(d))
                 }
                 // a page that passes for one in a PDF run is not the file (a bot check titled as itself)
@@ -1290,36 +1436,29 @@ fn canonical(t: &Tree, url: &str) -> Option<String> {
     (site(&c) == site(url)).then_some(c)
 }
 
-/// Text a no-JS browser shows (everything but head, script, style, template and svg), and the same without the
-/// text nodes that ask for JavaScript.
-fn visible(t: &Tree) -> (String, String) {
-    let (mut out, mut body) = (String::new(), String::new());
-    for s in t.texts(0, &["head", "script", "style", "template", "svg"]) {
-        let f = clean::fold(s);
-        if !CHECK.js_needed.iter().any(|m| f.contains(m)) {
-            body.push(' ');
-            body.push_str(&f);
-        }
-        out.push(' ');
-        out.push_str(&f);
-    }
-    (clean::collapse(&out), clean::collapse(&body))
+/// Text a no-JS browser shows (everything but head, script, style, template and svg), the same without the text
+/// nodes that ask for JavaScript, and whether one of those, outside the page's chrome (noscript, nav, header,
+/// footer, aside), is a paragraph (`clean::paragraph`): a text of the page's own.
+pub fn visible(t: &Tree) -> (String, String, bool) {
+    let skip = ["head", "script", "style", "template", "svg", "noscript", "nav", "header", "footer", "aside"];
+    let asks_js = |f: &String| CHECK.js_needed.iter().any(|m| f.contains(m));
+    let all: Vec<String> = t.texts(0, &skip[..5]).map(clean::fold).collect();
+    let body: Vec<&str> = all.iter().filter(|f| !asks_js(f)).map(String::as_str).collect();
+    let own = t.texts(0, &skip).map(clean::fold).any(|f| clean::paragraph(&f) && !asks_js(&f));
+    (clean::collapse(&all.join(" ")), clean::collapse(&body.join(" ")), own)
 }
 
-/// A search page: a URL whose query names the search (`q=`, a key ending in `query`), judged by its results.
-fn is_serp(url: &str) -> bool {
-    let u = url::Url::parse(url).ok();
-    u.is_some_and(|u| u.query_pairs().any(|(k, _)| k == "q" || k.ends_with("query")))
-}
-
-/// Results on a search page, by no engine's markup: distinct link targets whose text holds ≥ `link_words` words.
-fn serp_results(t: &Tree) -> usize {
+/// A search page (a URL whose query names the search: `q=`, a key ending in `query`) is judged by its results, by
+/// no engine's markup: distinct link targets whose text holds ≥ `link_words` words. None = no search page.
+fn serp_results(url: &str, t: &Tree) -> Option<usize> {
+    let u = url::Url::parse(url).ok()?;
+    u.query_pairs().any(|(k, _)| k == "q" || k.ends_with("query")).then_some(())?;
     let links = t.nodes.iter().enumerate().filter_map(|(i, n)| {
         let href = n.attr("href").filter(|h| n.tag == "a" && !h.starts_with('#'))?;
         let words = t.texts(i, &[]).flat_map(str::split_whitespace).count();
         (words >= limit("link_words")).then_some(href)
     });
-    links.collect::<std::collections::HashSet<_>>().len()
+    Some(links.collect::<std::collections::HashSet<_>>().len())
 }
 
 /// The page's own words in `s` (THE rule, with `outline::anchor`): its distinct folded words of ≥ 4
@@ -1367,7 +1506,7 @@ fn sign_in_gate(asked: &str, landed: &str) -> bool {
 /// from the visible text = the body is a JS shell). A short page is real when its title is visibly there.
 /// (ok, code, visible chars, title shown).
 pub fn check(tree: &Tree, html: &str, raw: &Raw, url: &str) -> (bool, String, usize, bool) {
-    let (vis, body) = visible(tree);
+    let (vis, body, own) = visible(tree);
     let chars = vis.chars().count();
     let folded = std::cell::OnceCell::new();
     let title = tree.meta("og:title").map(str::to_string).unwrap_or_else(|| tree.title.clone());
@@ -1402,19 +1541,20 @@ pub fn check(tree: &Tree, html: &str, raw: &Raw, url: &str) -> (bool, String, us
     if !page && sign_in_gate(url, &raw.final_url) {
         return (false, "login_wall".into(), chars, false);
     }
-    // no wall path named: the copy landed where the asked id (its last path segment, 8+ letters or
-    // digits) is gone, and shows none of its own words: a front page, a search; never the page
-    let id = slug_id(url).is_some_and(|s| s.bytes().filter(u8::is_ascii_alphanumeric).count() >= 8);
-    if id && !page && lost_page(url, &raw.final_url).is_some() {
+    // no wall path named: the copy landed where the asked id is gone (`lost_page`), and shows none of its own
+    // words: a front page, a search; never the page
+    if !page && lost_page(url, &raw.final_url).is_some() {
         return (false, "redirected".into(), chars, false);
     }
-    if is_serp(url) {
-        let ok = serp_results(tree) >= limit("serp_links");
+    if let Some(n) = serp_results(url, tree) {
+        let ok = n >= limit("serp_links");
         return (ok, if ok { "ok" } else { "serp_empty" }.into(), chars, false);
     }
     // a shell loads JavaScript: a short one with none (no `<script>`, no refresh) and none of its own words is the
-    // site's own answer, an error page (Akamai's 534 B "Site Maintenance"; no phrase list)
-    if !shown && (words.len() >= 2 || chars < 800) {
+    // site's own answer, an error page (Akamai's 534 B "Site Maintenance"; no phrase list). A copy that shows a
+    // text of its own in `thin_chars` or more is the page, whatever its title (one word, a site's label): a shell
+    // shows chrome, notices and short rows only
+    if !shown && !(own && chars >= limit("thin_chars")) && (words.len() >= 2 || chars < 800) {
         let refresh = |n: &Node| n.attr("http-equiv").is_some_and(|v| v.eq_ignore_ascii_case("refresh"));
         let bare = chars < limit("page_chars") && !tree.nodes.iter().any(|n| n.tag == "script" || refresh(n));
         return (false, if bare { "error_page" } else { "js_shell" }.into(), chars, false);
@@ -1429,8 +1569,11 @@ pub fn check(tree: &Tree, html: &str, raw: &Raw, url: &str) -> (bool, String, us
 mod tests {
     use super::*;
 
+    /// The two providers the unit tests model (oxy, bd); a third key has its own (`a_third_provider_takes_its_rungs`)
+    pub const KEYED: [Tier; 4] = [Tier::Plain, Tier::Bd, Tier::Oxy, Tier::OxyJs];
+
     fn plan(mode: Mode) -> Plan {
-        Plan { mode, cap: COST_CAP, keys: Tier::ALL.to_vec(), hedge: HEDGE, ..Plan::default() }
+        Plan { mode, cap: COST_CAP, keys: KEYED.to_vec(), hedge: HEDGE, ..Plan::default() }
     }
 
     /// A search has no gate: Oxylabs runs alone for the hedge, then Bright Data starts beside it (or at once when
@@ -1475,12 +1618,12 @@ mod tests {
             "the search patience"
         );
         let rows = skipped(&nobd, &[hop(Tier::Oxy, "provider_error")], "", "rust news", "");
-        assert_eq!(rows.len(), 1);
+        let bd = "! no_key bd · would try web search ≤$0.0015 · set BRIGHTDATA_API_KEY";
         assert!(
-            rows[0].starts_with("! no_key bd · would try web search ≤$0.0015 · set BRIGHTDATA_API_KEY"),
-            "{rows:?}"
+            rows.len() == 1 && rows[0].starts_with(bd),
+            "a failed search names the key that could serve it: {rows:?}"
         );
-        assert!(rows[0].ends_with(" · bd https://brightdata.com/cp/start"), "the sign-up page: {rows:?}");
+        assert!(rows[0].ends_with(&format!(" → {} setup bd", bin())), "its key form: {rows:?}");
     }
 
     fn hop(t: Tier, code: &str) -> Hop {
@@ -1558,12 +1701,12 @@ mod tests {
         use Tier::*;
         let auto = plan(Mode::Auto);
         let gov = Plan { gov: true, ..plan(Mode::Auto) };
-        assert_eq!(gov.tiers(), [Plain, Oxy, OxyJs], "gov host skips bd: no other render, so oxy no-JS runs");
+        assert_eq!(gov.ladder(&[]), [Plain, Oxy, OxyJs, DecodoJs], "gov skips bd: no other render, oxy no-JS runs");
         let zip = Plan { doc: Some("zip"), ..plan(Mode::Auto) };
         assert_eq!(next(&zip, &[hop(Tier::Plain, "blocked_403")], &[]), Stop, "zip documents: plain only");
         assert!(skipped(&zip, &[hop(Tier::Plain, "blocked_403")], "u1", "u1", "").is_empty());
         let js = Plan { js: true, ..plan(Mode::Auto) };
-        assert_eq!(js.tiers(), [Bd, OxyJs], "js:true skips plain and oxy no-JS");
+        assert_eq!(js.ladder(&[]), [Bd, OxyJs, DecodoJs], "js:true skips plain and the no-JS rungs");
         assert_eq!(next(&js, &[], &[]), Start(Bd));
         // A paid ask runs ONE provider; the next starts only on its failure, never beside it (hedge:off)
         assert_eq!(next(&js, &[], &[(Bd, S(30))]), Wait(S(35)), "no oxyjs beside a slow bd");
@@ -1573,7 +1716,7 @@ mod tests {
         assert!(!plan(Mode::Only(Bd)).hedged(), "a named tier is a paid ask too");
         assert!(plan(Mode::Only(Plain)).hedged(), "provider:plain is free: no hedge:off");
         let nobd = Plan { keys: vec![Plain, Oxy, OxyJs], ..plan(Mode::Auto) };
-        // one key: that provider's every rung, oxy no-JS gating the render (the one-key spike: nytimes 1.9 s)
+        // one key: that provider's every rung, oxy no-JS gating the render (measured: a news page in 1.9 s)
         assert_eq!(next(&nobd, &both(), &[]), Start(Oxy), "no bd key → oxy no-JS");
         assert_eq!(next(&nobd, &[hop(Plain, "blocked_403"), hop(Oxy, "captcha_wall")], &[]), Start(OxyJs));
         let nooxy = Plan { keys: vec![Plain, Bd], ..plan(Mode::Auto) };
@@ -1581,7 +1724,7 @@ mod tests {
         let only = plan(Mode::Only(Plain));
         assert_eq!(next(&only, &[hop(Plain, "js_shell")], &[]), Stop, "provider:plain never escalates");
         let oxy = plan(Mode::Only(Oxy));
-        assert_eq!(oxy.tiers(), [Oxy, OxyJs], "provider:oxy keeps both oxy tiers");
+        assert_eq!(oxy.ladder(&[]), [Oxy, OxyJs], "provider:oxy keeps both oxy tiers");
         assert_eq!(next(&oxy, &[hop(Oxy, "provider_error")], &[]), Start(OxyJs));
         // a refused or rate-limited key is never sent again by a tier that shares it; a tier with its own key runs
         for code in KEY_CODES {
@@ -1597,7 +1740,7 @@ mod tests {
             assert_eq!(next(&search, &[hop(Oxy, code)], &[]), Start(Bd), "search {code}: bd has its own key");
             assert_eq!(next(&search, &[hop(Oxy, code), hop(Bd, code)], &[]), Stop);
         }
-        assert_eq!(Plan { js: true, ..plan(Mode::Only(Oxy)) }.tiers(), [OxyJs]);
+        assert_eq!(Plan { js: true, ..plan(Mode::Only(Oxy)) }.ladder(&[]), [OxyJs]);
         let poor = Plan { cap: 0.002, ..plan(Mode::Auto) };
         assert_eq!(next(&poor, &both(), &[(Bd, S(6))]), Wait(S(59)), "no budget for oxyjs too");
         assert_eq!(next(&poor, &both(), &[(Bd, S(1))]), Wait(S(64)), "no hedge wake without budget");
@@ -1617,6 +1760,30 @@ mod tests {
         }
         assert_eq!(next(&auto, &[hop(Plain, "no_host")], &[]), Stop, "no tier after a dead host");
         assert_ne!(next(&auto, &[hop(Bd, "provider_refused")], &[(OxyJs, S(9))]), Stop, "bd 502 is not final");
+    }
+
+    /// Three keys (decodo beside oxy and bd): its no-JS rung after oxy's behind plain's captcha, never after a shell;
+    /// its render joins bd ∥ oxyjs one hedge after the last start; `js:true` = every render, one at a time.
+    #[test]
+    fn a_third_provider_takes_its_rungs() {
+        use Step::*;
+        use Tier::*;
+        let three = Plan { keys: Tier::ALL.to_vec(), ..plan(Mode::Auto) };
+        assert_eq!(next(&three, &[hop(Plain, "captcha_wall")], &[]), Start(Oxy));
+        assert_eq!(next(&three, &[hop(Plain, "captcha_wall"), hop(Oxy, "x")], &[]), Start(Decodo));
+        let slow = [hop(Plain, "captcha_wall"), hop(Oxy, "provider_timeout")];
+        assert_eq!(next(&three, &slow, &[]), Start(Bd), "a no-JS tier cut: the renders, never decodo's no-JS");
+        let shell = [hop(Plain, "js_shell")];
+        assert_eq!(next(&three, &shell, &[]), Start(Bd), "a shell skips both no-JS rungs");
+        assert_eq!(next(&three, &shell, &[(Bd, S(5))]), Start(OxyJs));
+        assert_eq!(next(&three, &shell, &[(Bd, S(6)), (OxyJs, S(1))]), Wait(S(4)), "a hedge after the last start");
+        assert_eq!(next(&three, &shell, &[(Bd, S(10)), (OxyJs, S(5))]), Start(DecodoJs));
+        let failed = [hop(Plain, "js_shell"), hop(Bd, "x"), hop(OxyJs, "x"), hop(DecodoJs, "x")];
+        assert_eq!(next(&three, &failed, &[]), Stop);
+        let js = Plan { js: true, keys: Tier::ALL.to_vec(), ..plan(Mode::Auto) };
+        assert_eq!(route(&js).0, [(Bd, None), (OxyJs, None), (DecodoJs, None)], "one at a time, table order");
+        let decodo = Plan { keys: vec![Plain, Decodo, DecodoJs], ..plan(Mode::Only(Decodo)) };
+        assert_eq!(decodo.ladder(&[]), [Decodo, DecodoJs], "provider:decodo keeps both decodo tiers");
     }
 
     /// Behind Bright Data with no redirect header, a same-site canonical link is where the ask landed.
@@ -1798,7 +1965,7 @@ mod tests {
         assert_eq!(doc("https://static.zara.net/static/pdfs/ES/a.html"), (None, false), "`pdfs` is not `pdf`");
         assert_eq!(doc("https://x.org/report.docx"), (Some("zip"), false));
         let hint = Plan::new("https://arxiv.org/pdf/2405.15793", Mode::Auto, false, COST_CAP, None);
-        assert_eq!(hint.tiers(), [Plain, Oxy, Bd, OxyJs], "the page ladder");
+        assert_eq!(hint.ladder(&[]), [Plain, Oxy, Decodo, Bd, OxyJs, DecodoJs], "the page ladder");
         assert_eq!(next(&hint, &[hop(Plain, "js_shell")], &[(Oxy, S(9))]), Wait(S(26)), "oxy has 30 s");
         let pdf = Plan { doc: Some("pdf"), ..plan(Mode::Auto) };
         let p403 = || hop(Plain, "blocked_403");
@@ -1809,9 +1976,9 @@ mod tests {
         assert_eq!(next(&pdf, &[p403(), hop(Oxy, "not_pdf")], &[(Bd, S(9))]), Wait(S(56)), "no oxyjs beside bd");
         assert_eq!(next(&pdf, &[p403(), hop(Oxy, "x"), hop(Bd, "pdf_truncated")], &[]), Stop);
         assert_eq!(next(&pdf, &[hop(Plain, "not_found")], &[]), Stop);
-        assert_eq!(Plan { js: true, ..Plan { doc: Some("pdf"), ..plan(Mode::Auto) } }.tiers(), [Plain, Oxy, Bd]);
-        assert_eq!(Plan { gov: true, ..Plan { doc: Some("pdf"), ..plan(Mode::Auto) } }.tiers(), [Plain, Oxy]);
-        assert_eq!(Plan { doc: Some("pdf"), ..plan(Mode::Only(Oxy)) }.tiers(), [Oxy]);
+        assert_eq!(Plan { js: true, ..Plan { doc: Some("pdf"), ..plan(Mode::Auto) } }.ladder(&[]), [Plain, Oxy, Bd]);
+        assert_eq!(Plan { gov: true, ..Plan { doc: Some("pdf"), ..plan(Mode::Auto) } }.ladder(&[]), [Plain, Oxy]);
+        assert_eq!(Plan { doc: Some("pdf"), ..plan(Mode::Only(Oxy)) }.ladder(&[]), [Oxy]);
         // no `.pdf` in the URL: plain's failed answer says PDF (content type), so the run becomes one
         let page = plan(Mode::Auto);
         let said = Hop { kind: "pdf", ..p403() };
@@ -1820,7 +1987,7 @@ mod tests {
         assert_eq!(next(&page, &[said(), hop(Oxy, "provider_error"), hop(Bd, "x")], &[]), Stop, "no oxyjs");
         let rows =
             skipped(&Plan { keys: vec![Plain, Oxy], ..plan(Mode::Auto) }, &[said(), hop(Oxy, "x")], "u1", "u1", "");
-        assert_eq!(rows.len(), 1, "bd's key, no oxyjs budget row: {rows:?}");
+        assert!(rows.len() == 1 && rows[0].starts_with("u1 ! no_key bd · "), "bd's PDF bytes, no oxyjs row: {rows:?}");
         // the driver tells each call it is a PDF run once an answer said so
         let seen = std::sync::Mutex::new(Vec::new());
         let call = |t: Tier, done: &[Hop]| -> Call {
@@ -1910,20 +2077,21 @@ mod tests {
         .unwrap_or_default();
         let mut p = Plan { js: true, ..plan(Mode::Auto) };
         p.avoid = rendered(&m, &p.keys);
-        assert_eq!(p.tiers(), [Tier::OxyJs], "the other render only");
+        assert_eq!(p.ladder(&[]), [Tier::OxyJs, Tier::DecodoJs], "the other renders only");
         assert_eq!(rendered(&m, &[Tier::Plain, Tier::Bd]), None, "one key: bd is still the only render");
     }
 
     /// No kept run takes a tier off the ladder or its retry (nothing keeps runs): every cross-run skip policy lost
-    /// 2–4 of 17 oxy no-JS serves to save ~2 s. Oxy-only:
-    /// oxy no-JS timed out on r/rust and the missing bd key is still named.
+    /// 2–4 of 17 oxy no-JS serves to save ~2 s. Oxy-only: oxy no-JS timed out on r/rust, oxyjs ran after it,
+    /// and the failed run names the missing keys whose renders could still serve it.
     #[test]
     fn no_kept_run_wears_a_tier() {
         use Tier::*;
         let oxy = Plan { keys: vec![Plain, Oxy, OxyJs], ..plan(Mode::Auto) };
         let hops = [hop(Plain, "cloudflare_wall"), hop(Oxy, "provider_timeout"), hop(OxyJs, "x")];
+        assert_eq!(route(&oxy).0.iter().map(|r| r.0).collect::<Vec<_>>(), [Plain, Oxy, OxyJs]);
         let rows = skipped(&oxy, &hops, "", "u1", "");
-        assert!(rows.len() == 1 && rows[0].starts_with("! no_key bd · would try "), "{rows:?}");
+        assert!(rows.len() == 2 && rows[0].starts_with("! no_key bd · would try "), "{rows:?}");
     }
 
     /// With a fake transport: `js:true` calls exactly ONE provider when it answers, however slow (past the 5 s
@@ -2005,8 +2173,9 @@ mod tests {
         assert_eq!(route(&plan(Mode::Auto)), (all, 0.004), "oxy no-JS after plain's captcha, the worst case");
         // Both keys, oxy no-JS after a captcha only; after a shell the page needs JS
         let after = |code| plan(Mode::Auto).ladder(&[hop(Tier::Plain, code)]);
-        assert_eq!(after("js_shell"), [Tier::Plain, Tier::Bd, Tier::OxyJs], "a shell: plain → bd ∥ oxyjs");
-        assert_eq!(after("captcha_wall"), [Tier::Plain, Tier::Oxy, Tier::Bd, Tier::OxyJs], "plain → oxy → bd ∥ oxyjs");
+        let renders = [Tier::Bd, Tier::OxyJs, Tier::DecodoJs];
+        assert_eq!(after("js_shell")[1..], renders, "a shell: plain → bd ∥ oxyjs (→ decodojs with its key)");
+        assert_eq!(after("captcha_wall")[..2], [Tier::Plain, Tier::Oxy], "plain → oxy → decodo → bd ∥ oxyjs");
         let race = Plan { hedge: Duration::ZERO, ..plan(Mode::Auto) };
         assert_eq!(route(&race).0[3], (Tier::OxyJs, Some(Duration::ZERO)));
         // bd is given up on (1 s + grace) before a 60 s hedge: oxyjs follows it instead of racing it
@@ -2015,9 +2184,10 @@ mod tests {
         let nokey = Plan { keys: vec![Tier::Plain], ..plan(Mode::Auto) };
         assert_eq!(route(&nokey).0, vec![(Tier::Plain, None)]);
         let rows = skipped(&nokey, &[hop(Tier::Plain, "blocked_403")], "u1", "u1", "");
-        assert_eq!(rows.len(), 2, "one row per missing key: {rows:?}");
+        assert_eq!(rows.len(), 3, "one row per missing key, the cheapest first: {rows:?}");
         let oxy = "u1 ! no_key oxy · would try no-JS fetch + JS render ≤$0.0025 · set OXYLABS_WEB_API_KEY → ";
-        assert!(rows[0].starts_with(oxy) && rows[1].starts_with("u1 ! no_key bd · would try unblock+JS"), "{rows:?}");
+        assert!(rows[1].starts_with(oxy) && rows[0].starts_with("u1 ! no_key bd · would try unblock+JS"), "{rows:?}");
+        assert!(rows[2].contains("no_key decodo · would try no-JS fetch + JS render ≤$0.0025 · set DECODO_AUTH_TOKEN"));
         // after a JS shell oxy no-JS served 0/15, so a key would buy the render only
         let rows = skipped(&nokey, &[hop(Tier::Plain, "js_shell")], "u1", "u1", "");
         assert!(rows[1].starts_with("u1 ! no_key oxy · would try JS render ≤$0.0015 · "), "{rows:?}");
@@ -2029,13 +2199,19 @@ mod tests {
             "u1 ! budget_hit bd oxyjs not tried · $0.0040 > cost:0.001 → {} u1 fresh:true cost:0.004 ≤$0.0040",
             crate::lang::bin()
         );
-        assert_eq!(rows, [want]);
+        let decodo = "u1 ! no_key decodo · would try no-JS fetch + JS render ≤$0.0025";
+        assert!(rows[0].starts_with(decodo) && rows[1..] == [want], "decodo's key could still serve it: {rows:?}");
+        // three renders are $0.0045, never the float sum's $0.0046
+        let renders = Plan { keys: vec![Tier::Plain, Tier::Bd, Tier::OxyJs, Tier::DecodoJs], ..poor.clone() };
+        let rows = skipped(&renders, &[hop(Tier::Plain, "js_shell")], "u1", "u1", "");
+        assert!(rows.iter().any(|r| r.contains(" not tried · $0.0045 > cost:0.001 ")), "{rows:?}");
         // Priced for the URL's own plan, as its `dry:true` (a .gov page: no bd, `up to $0.0025`)
         let gov = skipped(&poor, &walled, "u1", "u1", "https://www.usa.gov/x");
-        assert!(gov[0].ends_with(" cost:0.004 ≤$0.0025"), "{gov:?}");
+        assert!(gov[1].ends_with(" cost:0.004 ≤$0.0025"), "{gov:?}");
         // The words after the binary heading the arrow, never after its name further in
         let arrow = |head: &str| worst(&format!("{head}{} u1 fresh:true", crate::lang::bin()), "");
-        assert!(arrow("") > 0.0 && arrow("x") == 0.0 && arrow("top up, then ") == 0.0);
+        assert!(arrow("").is_some_and(|r| r.1 > 0.0 && r.0[0].0 == Tier::Plain), "{:?}", arrow(""));
+        assert!(arrow("x").is_none() && arrow("top up, then ").is_none());
         assert!(skipped(&poor, &[hop(Tier::Plain, "too_big")], "u1", "u1", "").is_empty());
         let mobile = Ask { mobile: true, url: "https://a.example/".into(), ..Ask::default() };
         let row = ignored(&mobile, &[hop(Tier::Plain, "js_shell"), hop(Tier::Bd, "ok")], "u1");
@@ -2173,8 +2349,9 @@ mod tests {
         assert_eq!((own.ok, own.lang.as_str()), (true, "es"), "a served Spanish page");
     }
 
-    /// The driver with a fake transport: plain fails, oxy without JS too (one try after a captcha), bd is slow; oxyjs starts when the
-    /// hedge runs out (5 s in `next`, scaled to 200 ms here), wins, and bd is cancelled, its list price unverified.
+    /// The driver with a fake transport: plain fails, oxy without JS too (one try after a captcha), bd is slow; oxyjs
+    /// starts when the hedge runs out (5 s in `next`, scaled to 200 ms here), wins, and bd is cancelled, its list price
+    /// unverified.
     #[test]
     fn slow_first_provider_is_hedged() {
         let p = Plan { hedge: Duration::from_millis(200), ..plan(Mode::Auto) };
@@ -2237,17 +2414,16 @@ mod tests {
         assert_eq!(crate::provider::bill(0.0225, 0.006), "$0.0225 + ≤$0.0060 unverified");
     }
 
-    /// A timeout's fix is a render while one is left to try; a render that ran out its time with none left buys a
-    /// longer time, the agent's own `timeout:` cut the default time; shells from two providers are
+    /// A timeout's fix is a render while one is left to try; a render that ran out its time with none left is the
+    /// end (no arrow), the agent's own `timeout:` cut the default time; shells from two providers are
     /// `no_copy` with no paid next step.
     #[test]
     fn timeout_fix_never_repeats_a_render() {
         use Tier::*;
         let b = crate::lang::bin();
         let (js, retry) = (format!("{b} u1 fresh:true js:true ≤$0.0030"), format!("{b} u1 fresh:true ≤$0.0040"));
-        let free = format!("{retry} (last try not charged)");
+        let free = format!("{retry} · last try not charged");
         let none = "nothing left to try · open https://a.example/ in a browser";
-        let longer = format!("{b} u1 fresh:true timeout:150 ≤$0.0040");
         let (bd, oxy) = (
             format!("{b} u1 fresh:true provider:bd ≤$0.0015"),
             format!("{b} u1 fresh:true provider:oxy js:true ≤$0.0015"),
@@ -2258,7 +2434,7 @@ mod tests {
             // one provider's timeout on a shell is that provider's failure: a render is left
             (&[(Plain, "js_shell"), (Oxy, "provider_timeout")], "provider_timeout", &js),
             (&[(Plain, "x"), (Oxy, "x"), (Bd, "provider_timeout")], "provider_timeout", &js),
-            (&[(Plain, "js_shell"), (Oxy, "x"), (Bd, "x"), (OxyJs, "provider_timeout")], "provider_timeout", &longer),
+            (&[(Plain, "js_shell"), (Oxy, "x"), (Bd, "x"), (OxyJs, "provider_timeout")], "provider_timeout", ""),
             (&[(Plain, "js_shell"), (Oxy, "js_shell")], "js_shell", &oxy),
             // shells from two providers: an app page
             (&[(Plain, "js_shell"), (Bd, "js_shell"), (OxyJs, "js_shell")], "no_copy", none),
@@ -2279,13 +2455,10 @@ mod tests {
         for (path, code, want) in rows {
             let mut hops: Vec<Hop> = path.iter().map(|(t, c)| hop(*t, c)).collect();
             let m = outcome("https://a.example/", &mut hops, 1).meta;
-            let at = crate::lang::At {
-                id: "u1",
-                url: &m.url,
-                arg: fix_arg(&m, &[]).unwrap_or_default(),
-                done: &spent(&m, &[], &Tier::ALL),
-            };
-            assert_eq!((m.code.as_str(), crate::lang::fix(move_code(&m), &at).as_str()), (*code, *want), "{path:?}");
+            let done = spent(&m, &[], &KEYED);
+            let at = |arg| crate::lang::At { id: "u1", url: &m.url, arg, done: &done };
+            let fix = fix_arg(&m, &[]).map_or(String::new(), |a| crate::lang::fix(move_code(&m), &at(a)));
+            assert_eq!((m.code.as_str(), fix.as_str()), (*code, *want), "{path:?}");
         }
         // `timeout:8` once said "nothing left to try": the agent's cut → the default time; a tier's own cut row
         let p = Plan { timeout: Some(S(8)), ..plan(Mode::Auto) };
@@ -2297,40 +2470,71 @@ mod tests {
             id: "u1",
             url: &m.url,
             arg: fix_arg(&m, &[]).unwrap_or_default(),
-            done: &spent(&m, &[], &Tier::ALL),
+            done: &spent(&m, &[], &KEYED),
         };
         assert_eq!(crate::lang::fix(&m.code, &at), retry, "after `timeout:8`: fresh:true, never nothing left");
         let mut hops = vec![hop(Plain, "blocked_403"), hop(OxyJs, "x"), cut(60)];
         let m = outcome("https://a.example/", &mut hops, 1).meta;
         // Read as `cut at 60 s (5m ago)`, its age from the copy's time; none under a minute
-        assert_eq!(fail_detail(&m, "", &[]).0, "bd cut at 60 s");
+        assert_eq!(fail_detail(&m, "").0, "bd cut at 60 s");
         let old = Meta { t: m.t - 300.0, ..m.clone() };
-        assert_eq!(fail_detail(&old, "", &[]).0, "bd cut at 60 s (5m ago)");
-        assert_eq!(fix_arg(&m, &[]), Some("timeout:150"));
+        assert_eq!(fail_detail(&old, "").0, "bd cut at 60 s (5m ago)");
+        assert_eq!(fix_arg(&m, &[]), Some("js:true"), "oxy no-JS left: `lang::fix` names it");
     }
 
-    /// The longer time runs once a session per URL and tier (bd cut at 150 s on another copy
-    /// of the URL): never again; the keyed paid tier left (oxy no-JS here: `lang::fix` names it), else a count with
-    /// no arrow; `timeout:150` is no short budget (a short one is a time under the tier's own).
+    /// No longer call follows our cut: a render cut at 60 s (or at the agent's `timeout:150`) with no
+    /// keyed tier left is the run's end, a count with no arrow; the row names the cut.
     #[test]
-    fn a_longer_time_runs_once() {
+    fn a_cut_render_is_the_end() {
         use Tier::*;
-        // the 150 s call under the agent's `timeout:150`, the 60 s one under none (under `timeout:` every
-        // render cut is the agent's)
         let p = |s: u64| Plan { timeout: (s == 150).then_some(S(s)), ..plan(Mode::Auto) };
         let cut = |s: u64| cut_why(&p(s), Hop { timeout_s: s, ..hop(Bd, "provider_timeout") });
-        let long = cut(150);
-        assert_eq!((long.why.as_str(), cut(60).why.as_str()), ("timeout:150s", "took > 60 s here"));
-        let cuts = [long.row()];
-        let meta = |last: Hop, first: &str| {
-            outcome("https://a.example/", &mut [hop(Plain, first), hop(OxyJs, "x"), last], 1).meta
+        for (s, why) in [(60, "bd cut at 60 s"), (150, "bd timeout:150s")] {
+            let m = outcome("https://a.example/", &mut [hop(Plain, "js_shell"), hop(OxyJs, "x"), cut(s)], 1).meta;
+            assert_eq!((fix_arg(&m, &[]), fail_detail(&m, "").0.as_str()), (None, why));
+        }
+    }
+
+    /// Spotify: the provider refused the render (its 4xx) or gave up (`faulted`): settled, never asked again by
+    /// name or by an arrow's own dry (`fail_row`'s gate); the keyed tier left by name, else a count; a bare
+    /// 5xx is a flake. eBay: bd's rate limit is a wait, so with oxyjs settled bd is the move, never `provider:oxy`
+    /// (its dry plans oxyjs). Another copy's 4xx settles this one only for `url`, a 404 or the same country.
+    #[test]
+    fn a_settled_tier_is_spent() {
+        use Tier::*;
+        let b = crate::lang::bin();
+        let erred = |why: &str| Hop { why: why.into(), country: "US".into(), ..hop(OxyJs, "provider_error") };
+        let m = |why: &str| outcome("https://a.example/", &mut [hop(Plain, "js_shell"), erred(why)], 1).meta;
+        let row = |m: &Meta, others: &[Meta]| {
+            let r = fail_row(m, others, "", "u1", false);
+            (r.2.unwrap_or_default(), r.1)
         };
-        let m = meta(cut(60), "blocked_403");
-        assert_eq!((fix_arg(&m, &cuts), timed_out(&m, &cuts).as_str()), (Some("js:true"), "60 s + 150 s here"));
-        let m = meta(cut(60), "js_shell");
-        assert_eq!((fix_arg(&m, &cuts), fix_arg(&m, &[])), (None, Some("timeout:150")));
-        let m = meta(long, "js_shell");
-        assert_eq!((fix_arg(&m, &[]), timed_out(&m, &[]).as_str()), (None, "150 s here"));
+        let bd = outcome("https://a.example/", &mut [hop(Bd, "js_shell")], 1).meta;
+        let to_bd = format!("{b} u1 fresh:true provider:bd ≤$0.0015");
+        for why in ["400 url: value not supported", "404", "500 faulted: request failed after too many retries"] {
+            assert_eq!(row(&m(why), &[]).0, to_bd, "{why}");
+            assert_eq!(row(&m(why), std::slice::from_ref(&bd)), (String::new(), " · failed 1/2 here".into()), "{why}");
+            assert!(spent(&m(why), &[], &KEYED).contains(&"oxyjs"), "{why}");
+        }
+        assert_eq!(fix_arg(&m("500"), &[bd.hops[0].clone()]), Some("provider:oxy js:true"), "a flake: the named retry");
+        assert_eq!(fail_detail(&m("400 url: value not supported"), "").0, "oxyjs 400 url: value not supported");
+        let ebay = |why: &str| {
+            let mut hops = [hop(Bd, "rate_limited"), erred(why)];
+            outcome("https://a.example/", &mut hops, 1).meta
+        };
+        assert_eq!(row(&ebay("500 faulted: request failed"), &[]).0, to_bd, "a rate limit is a wait");
+        // another copy's 400 on another field, sent FR, settles nothing for an arrow whose request sends another
+        // country (`fresh:true` may plan oxyjs), but does for one sending FR (`provider::sent`); one naming the url,
+        // a 404 or a give-up settles every copy: its dry may not plan it
+        let fr = |why: &str| Hop { country: "FR".into(), ..erred(why) }.row();
+        let geo = |why: &str| Meta { url: "http://a.example/".into(), hops: vec![fr(why)], ..m("x") };
+        let reset = outcome("http://a.example/", &mut [hop(Plain, "connect_failed")], 1).meta;
+        let arrow = |why: &str| row(&reset, &[geo(why)]).0;
+        assert_eq!(arrow("400 geo_location: not supported"), format!("{b} u1 fresh:true ≤$0.0040"), "scoped");
+        let cut = [geo("400 geo_location: not supported")];
+        assert!(!clear(&format!("{b} u1 fresh:true country:fr"), &reset, &cut), "the refused country again");
+        assert_eq!(arrow("400 url: value not supported"), to_bd.as_str(), "every copy");
+        assert_eq!(arrow("404"), to_bd.as_str(), "every copy");
     }
 
     /// 4-hop walks on two sites: the 150 s call failing as the 60 s call did is the same
@@ -2348,49 +2552,34 @@ mod tests {
         assert_eq!(fail_count(&u3, [&meta(60, "US")].into_iter(), Some("")), None, "another country");
     }
 
-    /// A tier whose only signal was OUR cut (`upto`) is no "tried" and no app-page vote: with
-    /// nothing else left it is offered once, named with two keys (TikTok: bd cut at 60 s, served in 36.7 s later;
-    /// a Reddit thread: oxy no-JS cut at 10 s, served 6 of 6 later); once its long call ran (cut OR answered), a count.
+    /// A tier whose only signal was OUR cut (`upto`) casts no app-page vote, but it is tried: with nothing else
+    /// left the run ends (TikTok: bd cut at 60 s; both renders cut), another keyed tier is the move (a Reddit
+    /// thread: oxy no-JS cut at 10 s → oxyjs, then oxy no-JS after the renders' captchas).
     #[test]
-    fn a_cut_tier_is_not_tried() {
+    fn a_cut_tier_is_tried() {
         use Tier::*;
         let b = crate::lang::bin();
         let ours = |t: Tier, s: u64| Hop { upto: t.spec().price, timeout_s: s, ..hop(t, "provider_timeout") };
         let fix = |m: &Meta, cuts: &[HopRow]| {
             let arg = fix_arg(m, cuts);
-            let at = crate::lang::At {
-                id: "u1",
-                url: &m.url,
-                arg: arg.unwrap_or_default(),
-                done: &spent(m, &[], &Tier::ALL),
-            };
+            let at =
+                crate::lang::At { id: "u1", url: &m.url, arg: arg.unwrap_or_default(), done: &spent(m, &[], &KEYED) };
             arg.map(|_| crate::lang::fix(&m.code, &at))
         };
         let mut tiktok = [hop(Plain, "js_shell"), hop(OxyJs, "js_shell"), ours(Bd, 60)];
         let m = outcome("https://a.example/", &mut tiktok, 1).meta;
-        let offer = format!("{b} u1 fresh:true provider:bd timeout:150 ≤$0.0015");
-        assert_eq!((m.code.as_str(), fix(&m, &[])), ("provider_timeout", Some(offer)), "not no_copy, not nothing left");
-        let answered = Hop { timeout_s: 150, ..hop(Bd, "js_shell") }.row();
-        assert_eq!(fix(&m, std::slice::from_ref(&answered)), None, "the 150 s call answered: a count");
-        assert_eq!(timed_out(&m, &[answered]), "cut at 60 s · 150 s failed (js_shell)", "a shell is no serve");
-        for (code, said) in [("ok", "answered"), ("http_502", "failed (502)")] {
-            let long = Hop { timeout_s: 150, ..hop(Bd, code) }.row();
-            assert_eq!(timed_out(&m, &[long]), format!("cut at 60 s · 150 s {said}"), "named apart");
-        }
+        assert_eq!((m.code.as_str(), fix(&m, &[])), ("provider_timeout", None), "not no_copy: the end");
         let mut reddit =
             [hop(Plain, "blocked_403"), ours(Oxy, 10), hop(Bd, "captcha_wall"), hop(OxyJs, "captcha_wall")];
         let m = outcome("https://a.example/", &mut reddit, 1).meta;
         assert_eq!(fix(&m, &[]), Some(format!("{b} u1 fresh:true provider:oxy ≤$0.0025")), "oxy, then oxyjs");
-        // 8 saved copies: both renders cut at 60 s = both tried; bd's longer call, priced, once
+        // 8 saved copies: both renders cut at 60 s = both tried, the end, never js:true
         let mut both = [hop(Plain, "js_shell"), ours(Bd, 60), ours(OxyJs, 60)];
         let m = outcome("https://a.example/", &mut both, 1).meta;
-        assert_eq!(fix(&m, &[]), Some(format!("{b} u1 fresh:true provider:bd timeout:150 ≤$0.0015")), "never js:true");
-        let bd150 = Hop { timeout_s: 150, ..ours(Bd, 150) }.row();
-        assert_eq!(fix(&m, std::slice::from_ref(&bd150)), None, "bd's 150 s call ran: a count");
-        assert_eq!(timed_out(&m, &[bd150]), "60 s + 150 s here");
+        assert_eq!(fix(&m, &[]), None, "never js:true");
         let again = outcome("https://a.example/", &mut [ours(Oxy, 10)], 1).meta;
         let cuts: Vec<HopRow> = m.hops.clone();
-        assert_eq!(fix(&again, &cuts), None, "offered once: then a count");
+        assert_eq!(fix(&again, &cuts), None, "the renders another copy cut: a count");
         assert_eq!(fix(&again, &[]).as_deref(), Some(format!("{b} u1 fresh:true js:true ≤$0.0030").as_str()));
     }
 
@@ -2403,16 +2592,15 @@ mod tests {
         let ours =
             || Hop { upto: 0.0015, timeout_s: 60, why: "took > 60 s here".into(), ..hop(OxyJs, "provider_timeout") };
         let row = |m: &Meta| {
-            let done = spent(m, &[], &Tier::ALL);
-            let at = crate::lang::At { id: "u1", url: &m.url, arg: fix_arg(m, &[]).unwrap_or_default(), done: &done };
-            (fail_detail(m, "", &[]).0, crate::lang::fix(move_code(m), &at))
+            let done = spent(m, &[], &KEYED);
+            let at = |arg| crate::lang::At { id: "u1", url: &m.url, arg, done: &done };
+            (fail_detail(m, "").0, fix_arg(m, &[]).map_or(String::new(), |a| crate::lang::fix(move_code(m), &at(a))))
         };
         let paid = Hop { cost: 0.0015, ..hop(Bd, "captcha_wall") };
-        let offer = format!("{b} u1 fresh:true provider:oxy js:true timeout:150 ≤$0.0015");
         let bd = format!("{b} u1 fresh:true provider:bd ≤$0.0015");
         for (mut hops, want) in [
             (vec![hop(Plain, "cloudflare_wall"), ours()], bd),
-            (vec![hop(Plain, "cloudflare_wall"), paid, ours()], offer),
+            (vec![hop(Plain, "cloudflare_wall"), paid, ours()], String::new()),
         ] {
             let wall = outcome("https://a.example/", &mut hops, 1).meta;
             let cut = Meta { code: "provider_timeout".into(), ..wall.clone() };
@@ -2422,7 +2610,7 @@ mod tests {
             assert_eq!(row(&wall), row(&cut), "the same row apart from the code word");
         }
         // behind a sign-in gate (`one_render`) the run is the gate's only when its render met it too: a cut or
-        // refused render names the run, so its own move (the 150 s offer, the other provider) survives
+        // refused render names the run, so its own move (the other provider, the end) survives
         for (last, want) in
             [("js_shell", "login_wall"), ("provider_timeout", "provider_timeout"), ("provider_error", "provider_error")]
         {
@@ -2474,13 +2662,9 @@ mod tests {
         let fix = |hops: &mut [Hop]| {
             let m = outcome("https://a.example/", hops, 1).meta;
             let arg = fix_arg(&m, &[]);
-            let at = crate::lang::At {
-                id: "u1",
-                url: &m.url,
-                arg: arg.unwrap_or_default(),
-                done: &spent(&m, &[], &Tier::ALL),
-            };
-            (fail_detail(&m, "", &[]).0, arg.map(|_| crate::lang::fix(&m.code, &at)))
+            let at =
+                crate::lang::At { id: "u1", url: &m.url, arg: arg.unwrap_or_default(), done: &spent(&m, &[], &KEYED) };
+            (fail_detail(&m, "").0, arg.map(|_| crate::lang::fix(&m.code, &at)))
         };
         let one = fix(&mut [
             hop(Plain, "js_shell"),
@@ -2522,10 +2706,10 @@ mod tests {
         assert_eq!(check(pin, 403, "", "", "").1, "captcha_wall", "a 4xx with the marker is");
     }
 
-    /// No wall path is named (LinkedIn's `/authwall` row gone): a copy that landed where the asked id (8+ letters or digits)
-    /// is gone and shows none of its own words is `redirected`; one that shows them is served (the outline flags
-    /// it), and a short id or a kept one is no redirect. A sign-in gate hands the asked path back in its query and
-    /// names a sign-in: `login_wall` before `redirected`, whatever the id; a landing that only lost the page,
+    /// No wall path is named (LinkedIn's `/authwall` row gone): a copy that landed where the asked id (8+ letters or
+    /// digits) is gone and shows none of its own words is `redirected`; one that shows them is served (the outline
+    /// flags it), and a short id or a kept one is no redirect. A sign-in gate hands the asked path back in its query
+    /// and names a sign-in: `login_wall` before `redirected`, whatever the id; a landing that only lost the page,
     /// or a bounce that names no sign-in or hands back another site's page, is no gate.
     #[test]
     fn a_lost_id_is_redirected() {
@@ -2545,7 +2729,8 @@ mod tests {
         let back =
             "https://www.linkedin.com/uas/authenticate?r=https%3A%2F%2Flinkedin.com%2Fcompany%2Fexample-data-insights";
         assert_eq!(check(wall, 200, "", back, url).1, "login_wall", "before `redirected`, a full URL handed back");
-        // the testers' misfires: an index page's root, a renamed slug, a dropped sub-tab, a short link's shell
+        // live copies once misread as `redirected`: an index page's root, a renamed slug, a dropped sub-tab, a short
+        // link's shell
         for (fin, asked) in [
             ("https://docs.ex.com/", "https://docs.ex.com/index.html"),
             ("https://ex.com/p/new-name-of-it?ref=old", "https://ex.com/p/oldnameofthething"),
@@ -2680,6 +2865,50 @@ mod tests {
         assert_eq!(check(&real, 200, "", "", "").1, "ok", "a notice on a long page is not a shell");
     }
 
+    /// A would-be shell (two title words, or under 800 visible chars) whose title words are not shown is a JS shell
+    /// whatever text sits around them: nav and footer rows, a `<noscript>` notice, a footer's address, a cookie
+    /// banner over an h1, a `role=contentinfo` footer, a `div.legal`, "requires JavaScript" beside a nav link,
+    /// "activate scripting", "Loading Acme…".
+    #[test]
+    fn shell_fixtures_are_shells() {
+        let shells = [
+            include_str!("../tests/fixtures/shell-nav-footer.html"),
+            include_str!("../tests/fixtures/shell-noscript.html"),
+            include_str!("../tests/fixtures/shell-footer.html"),
+            include_str!("../tests/fixtures/shell-blocks.html"),
+            include_str!("../tests/fixtures/shell-notices.html"),
+        ];
+        let pages = shells.iter().flat_map(|f| f.split("<!-- page -->"));
+        let codes: Vec<String> = pages.map(|h| check(h, 200, "", "", "https://acme.example/app").1).collect();
+        assert_eq!(codes, ["js_shell"; 9]);
+    }
+
+    /// A short copy with one script whose title words are not on screen (a one-word title head, a site's label) is
+    /// the page when it shows a text of its own: one text of ≥ `paragraph_words` words outside noscript, nav,
+    /// header, footer and aside that asks nothing of JavaScript, in ≥ `thin_chars` visible chars. One word less
+    /// and it stays a shell. The thin net after `check` keeps the thread served (446 pruned chars).
+    #[test]
+    fn a_text_of_its_own_is_the_page() {
+        let thread = include_str!("../tests/fixtures/thread-short.html");
+        let url = "https://forum.example/item?id=1";
+        assert_eq!(check(thread, 200, "", "", url).1, "ok", "a 16-word comment under a one-word title");
+        let h = judge(Tier::Plain, Raw { status: 200, body: thread.into(), ..Raw::default() }, url, false, false);
+        assert_eq!((h.ok, h.code.as_str()), (true, "ok"), "the thin net keeps it");
+        let rows = "<li>posted in the town square by a neighbour</li>".repeat(6);
+        let page = |text: &str| {
+            let nav = "<nav>home new past ask show submit login</nav>";
+            let head = "<title>Zephyr | Board</title><script src=board.js></script>";
+            format!("<html><head>{head}</head><body>{nav}<ul>{rows}</ul><p>{text}</p></body></html>")
+        };
+        let twelve = "the ferry runs twice a day from the old pier in summer";
+        let (ok, code, chars, _) = check(&page(twelve), 200, "", "", url);
+        assert_eq!((ok, code.as_str()), (true, "ok"), "12 words, {chars} chars");
+        let eleven = "the ferry runs twice a day from the old pier in";
+        assert_eq!(check(&page(eleven), 200, "", "", url).1, "js_shell", "11 words: no text of its own");
+        let chrome = page("").replace("<nav>", &format!("<nav>{twelve} "));
+        assert_eq!(check(&chrome, 200, "", "", url).1, "js_shell", "12 words in the nav are chrome");
+    }
+
     /// On trimmed saved copies: a copy holding the page is served whatever its status or the wall
     /// scripts it loads; a search page by its result rows, whatever the engine's markup.
     #[test]
@@ -2736,5 +2965,37 @@ mod tests {
         let o = outcome("https://a.example/", &mut hops, 1);
         assert_eq!((o.meta.code.as_str(), o.doc.is_some()), ("cloudflare_wall", true));
         assert_eq!(crate::html::PARSES.with(|n| n.get()) - parses, 1, "one parse for the check and the stored copy");
+    }
+
+    /// A run killed between its reserve and its give-back (`pooled`) holds no floor (its lock let go,
+    /// `cache::run_at`); its hold stays (a call it started may be billed), and the next page gets its rung. A live
+    /// run's floor holds; a queued page's too (its lane's lock). Floors over the cap are even shares (`seed`).
+    #[test]
+    fn a_dead_runs_floor_goes_back() {
+        let dir = std::env::temp_dir().join(format!("fats-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let at = dir.join("u1.pool.json");
+        let pool = Pool::from([(1, [0.0015, 0.0]), (2, [0.0015, 0.0]), (3, [0.0015, 0.001]), (4, [0.0015, 0.0])]);
+        crate::cache::edit(&at, |p: &mut Pool| *p = pool).ok();
+        let run = |n: usize, by: usize| {
+            crate::cache::jsave(&dir.join(format!("u{n}.json")), &crate::cache::Detached { by, ..<_>::default() })
+        };
+        assert!([(1, 0), (2, 0), (3, 0), (4, 1)].iter().all(|&(n, by)| run(n, by).is_ok()));
+        let lock = |n: usize| std::fs::File::create(dir.join(format!("u{n}.lock"))).and_then(|f| f.lock().map(|()| f));
+        let mine = lock(1).ok();
+        let claims_of =
+            || claims(&at, &crate::cache::edit(&at, |p: &mut Pool| p.clone()).unwrap_or_default(), 1, false);
+        assert_eq!(claims_of(), [(3, 0.001, ""), (4, 0.0015, " held")], "u2 and u3 died, u4 waits in u1's lane");
+        let p = Plan { pool: Some((at.clone(), 1)), cap: 0.004, ..plan(Mode::Auto) };
+        assert_eq!(pooled(&p, &[hop(Tier::Plain, "blocked_403")], &[]), Step::Start(Tier::Bd), "u2's floor went back");
+        let held = lock(2).ok();
+        let live = claims_of();
+        assert!(live.iter().any(|c| c == &(2, 0.0015, " held")), "a live run keeps its floor: {live:?}");
+        drop((mine, held));
+        // 2 × $0.0015 over a $0.002 cap: an even share each, never the first page's whole floor and none for the next
+        assert!(seed(&at, [(1, plan(Mode::Auto)), (2, plan(Mode::Auto))].into_iter(), 0.002).is_ok());
+        let pool = crate::cache::edit(&at, |p: &mut Pool| p.clone()).unwrap_or_default();
+        assert_eq!(pool, Pool::from([(1, [0.001, 0.0]), (2, [0.001, 0.0])]));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

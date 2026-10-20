@@ -1,0 +1,6 @@
+  {green}✓{/} {label} {text}
+  {dim}○{/} {label} {dim}{text}{/}
+free|Free fetch|works now, no account needed · $0|turned off · every page goes through a paid provider → fats setup free on|
+oxy|Oxylabs|key set ({from}) · walled pages, JavaScript pages, web search|turned off · key kept → fats setup oxy on|not set · optional, adds walled pages, JavaScript pages, web search → fats setup
+bd|Bright Data|key set ({from}) · walled pages, JavaScript pages, web search|turned off · key kept → fats setup bd on|not set · optional, adds walled pages, JavaScript pages, web search → fats setup
+decodo|Decodo|key set ({from}) · walled pages, JavaScript pages|turned off · key kept → fats setup decodo on|not set · optional, adds walled pages, JavaScript pages → fats setup

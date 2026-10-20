@@ -1,0 +1,13 @@
+{bold}fats setup{/}
+
+fats setup        a list of providers; pick one with ↑↓ and Enter, then paste its key.
+fats setup oxy    jump straight to Oxylabs (also: bd, decodo, gh).
+fats setup oxy off · fats setup oxy on    turn a provider off or on (the key is kept).
+fats setup telemetry    the telemetry screen (also: fats setup → Settings).
+
+You need no key to start: the free fetch reads most pages at $0. A provider key adds
+walled pages, JavaScript pages and web search; each fetch then costs a fraction of a cent.
+
+Keys stay on this computer (a file only you can read). fats never sends them to fatsearch.
+Prefer env vars? OXYLABS_WEB_API_KEY, BRIGHTDATA_API_KEY + BRIGHTDATA_UNLOCKER_ZONE, DECODO_AUTH_TOKEN
+win over saved keys.

@@ -7,6 +7,8 @@
 # CARGO_NET_OFFLINE (cargo itself fetches nothing) AND inside scripts/nonet.sh (no network but loopback), because
 # offline cargo alone does not stop a build script or proc-macro from opening a socket.
 # nonet.sh: macOS = sandbox-exec (verified locally); Linux = a root network namespace (untested until this runs).
+# Windows (the release ships a Windows binary): nonet.sh and check.sh are Unix shell, so that job runs the test
+# suite alone (nextest with the fake providers), offline; fmt, clippy, deny and the gates run on the other two.
 name: ci
 on:
   push:
@@ -19,11 +21,24 @@ env:
 jobs:
   check:
     runs-on: ${{ matrix.os }}
+    # first Windows run 2026-10-20: 71/355 red; reports, does not block the cut until the Windows pass lands
+    # (a job-level continue-on-error: the Windows job still shows red, the workflow run passes; GitHub docs,
+    # workflow syntax, jobs.<job_id>.continue-on-error)
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
-      fail-fast: false # both OSes report; one red must not cancel the other's verdict
+      fail-fast: false # every OS reports; one red must not cancel another's verdict
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS and Windows only on the public repository (a private repository's free minutes count macOS 10×,
+        # Windows 2×); elsewhere those jobs are never created. They are gated locally (check.sh full on a Mac;
+        # scripts/ci-linux.sh replays the ubuntu job) and by the public release workflow. `github` is readable in
+        # `strategy` (GitHub docs, contexts, context availability)
+        os: ${{ github.repository == 'fatsearch/fatsearch' && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
+      - if: runner.os == 'Windows'
+        # the fixtures are compared byte for byte: no CRLF conversion; deep target paths need long paths
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
@@ -33,8 +48,20 @@ jobs:
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28, prebuilt binaries
         with:
           tool: cargo-nextest@0.9.148,cargo-deny@0.20.2
-      - run: cargo fetch --locked && cargo deny fetch
-      - run: scripts/nonet.sh ./check.sh full
+      - if: runner.os != 'Windows'
+        run: cargo fetch --locked && cargo deny fetch
+      - if: runner.os != 'Windows'
+        run: scripts/nonet.sh ./check.sh full
+        env:
+          CARGO_NET_OFFLINE: "true"
+      - if: runner.os == 'Windows'
+        # BoringSSL's x86_64 assembly needs NASM (CMake finds it in %ProgramFiles%\NASM); CMake and LLVM
+        # (libclang, for bindgen) are on the image, as in dist-workspace.toml's chocolatey row
+        run: choco install nasm --no-progress -y
+      - if: runner.os == 'Windows'
+        run: cargo fetch --locked
+      - if: runner.os == 'Windows'
+        run: cargo nextest run --locked --offline --features fake --no-fail-fast
         env:
           CARGO_NET_OFFLINE: "true"
   cooldown:

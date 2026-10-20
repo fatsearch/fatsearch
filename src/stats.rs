@@ -1,11 +1,13 @@
 //! Self-observability: `fats` status, `fats stats`, `fats config`, `fats account`.
 
-use crate::cache::{Cache, Entry, MINE, Meta, jload, jsave, usage};
-use crate::cli::{ASSET_MAX, ASSET_WAIT, FENCE, MAX_BYTES, MAX_BYTES_CEIL, no_doc, path_of};
-use crate::lang::{At, Out, bin, ksize, mib, short};
-use crate::outline::{GREP_CAP, LIST_CAP, Page, READ_CAP, fmt_age, photos};
-use crate::provider::{ACCOUNTS, Account, Api, Tier, account_calls, bill, late, links, spend};
+use crate::cache::{Cache, Entry, MINE, Meta, Week, bump, code_of, jload, jsave, usage};
+use crate::cli::{ASSET_MAX, ASSET_WAIT, FENCE, MAX_BYTES, MAX_BYTES_CEIL, copies, no_doc, path_of};
+use crate::lang::{At, Cmd, Out, bin, ksize, mib, paint, screen, short};
+use crate::outline::{Page, fmt_age, photos};
+use crate::provider::{ACCOUNTS, Account, Api, KEYS, Tier, account_calls, bill, late, links, spend};
 use crate::{fetch, settings};
+use serde_json::{Map, Value, json};
+use std::path::Path;
 use std::time::Duration;
 
 /// Provider health window: the last N calls per provider, whole cache.
@@ -19,34 +21,40 @@ fn mode(p: &std::path::Path) -> Option<u32> {
     None
 }
 
-/// A key file others can read (mode not 0600): the `!` row with the fix. Never reads the key itself.
-fn key_mode(file: &str) -> Option<String> {
-    let p = crate::settings::get().key_dir.value.join(file);
+/// `auth.json` readable by others (mode not 0600): the `!` row with the fix. Never reads the keys.
+fn key_mode() -> Option<String> {
+    let (p, file) = (crate::settings::get().key_dir.value.join(settings::AUTH), settings::AUTH);
     let mode = mode(&p)?;
     (mode & 0o077 != 0)
         .then(|| format!("! key_mode {file} is {mode:o}, readable by others → chmod 600 {}", p.display()))
 }
 
-/// Where a provider's key comes from (`env`, `file`, `none`); never its value.
+/// A provider's key as `setup`, `account` and `config` read it: switched off = none; Bright Data's needs no zone here.
+fn key_of(t: Tier) -> Option<(String, &'static str)> {
+    settings::on(t.switch()).then(|| settings::key(t.switch())).flatten()
+}
+
+/// Where a provider's key comes from (`env`, `auth.json`, `none`, `off`); never its value.
 fn key(t: Tier) -> &'static str {
-    crate::settings::key(t.spec().env, t.spec().file).map_or("none", |k| k.1)
+    if !settings::on(t.switch()) { "off" } else { key_of(t).map_or("none", |k| k.1) }
 }
 
 fn zone() -> String {
     settings::zone().map_or_else(|| format!("none → {} setup", bin()), String::from)
 }
 
+/// A stored record's meta.json is a search's (in `j<N>/`), not a page's (in `u<N>/`).
+pub fn is_serp(meta: &std::path::Path) -> bool {
+    meta.parent().and_then(|d| d.file_name()).is_some_and(|n| n.to_string_lossy().starts_with('j'))
+}
+
 pub fn status(c: &Cache) -> Out {
     let b = bin();
     let (bytes, pics, metas) = usage(&c.root);
-    // a search's record lives in `j<N>/`, a page's in `u<N>/`
-    let is_serp = |p: &&std::path::PathBuf| {
-        p.parent().and_then(|d| d.file_name()).is_some_and(|n| n.to_string_lossy().starts_with('j'))
-    };
-    let searches = metas.iter().filter(is_serp).count();
+    let searches = metas.iter().filter(|m| is_serp(m)).count();
     let pages = metas.len() - searches;
     let mut lines = vec![match c.st.u.last() {
-        None => format!("= s:{} no pages · {b} <url> · {b} ./page.html · {b} guide", c.session),
+        None => format!("= s:{} no pages · {b} <url> · {b} ./page.html", c.session),
         Some(e) => {
             let open = c.st.u.iter().filter(|e| e.serp && e.dir.is_empty() && c.lookup(&e.url).is_none()).count();
             let n = c.st.u.len();
@@ -60,11 +68,12 @@ pub fn status(c: &Cache) -> Out {
     let sizes = if c.root.join(MINE).is_file() { sizes } else { "not swept (dir not created by fats)".into() };
     lines.push(format!("cache {root}{m} · {sizes} · {jobs} jobs"));
     let net = if crate::settings::get().offline.value { "off (FATS_OFFLINE)" } else { "on" };
-    lines.push(match (key(Tier::Oxy), key(Tier::Bd)) {
-        ("none", "none") => format!("keys none → {b} setup · network {net}"),
-        (oxy, bd) => format!("keys oxy:{oxy} bd:{bd} · bd zone {} · network {net}", zone()),
+    let keys: Vec<String> = KEYS.iter().map(|t| format!("{}:{}", t.spec().short, key(*t))).collect();
+    lines.push(match KEYS.iter().all(|t| key(*t) == "none") {
+        true => format!("keys none → {b} setup · network {net}"),
+        false => format!("keys {} · bd zone {} · network {net}", keys.join(" "), zone()),
     });
-    lines.extend(["oxylabs.key", "brightdata.key"].into_iter().filter_map(key_mode));
+    lines.extend(key_mode());
     let run = |(n, r, alive): &(usize, crate::cache::Detached, bool)| {
         let age = (crate::cache::now() - r.t).max(0.0) as u64;
         let state = if *alive { format!("pid {}", r.pid) } else { "! abandoned".into() };
@@ -72,11 +81,10 @@ pub fn status(c: &Cache) -> Out {
         format!("u{n} {} {age}s", if *alive && r.pid == 0 { "starting".into() } else { state })
     };
     let runs: Vec<String> = c.runs().iter().filter(|r| r.1.done.is_none()).map(run).collect();
-    if !runs.is_empty() {
-        lines.push(format!("running {} · read one: {b} u<N>", runs.join(" · ")));
-    }
+    lines.extend((!runs.is_empty()).then(|| format!("running {} · read one: {b} u<N>", runs.join(" · "))));
     lines.extend(health(&metas));
     lines.push(account_line(c, crate::cache::now()));
+    lines.push(crate::telemetry::status());
     lines.push(match FENCE.get() {
         Some(_) => "mcp: serving (this process) · local files from the working directory + the cache".into(),
         None => format!("mcp: ready · {b} mcp = stdio server, one tool fats(cmd)"),
@@ -86,6 +94,7 @@ pub fn status(c: &Cache) -> Out {
     let n = c.st.u.len();
     let next = if n > 0 { format!("outline: {b} u{n} · ") } else { String::new() };
     lines.push(format!("{}{next}stats: {b} stats · config: {b} config", at.unwrap_or_default()));
+    lines.insert(1, crate::lang::to_guide()); // the agent's skill, right under the `=` line
     Out::new(lines)
 }
 
@@ -101,7 +110,14 @@ fn health(paths: &[std::path::PathBuf]) -> Vec<String> {
         let hops: Vec<_> = metas.iter().flat_map(|m| m.hops.iter()).filter(|h| h.provider == t.spec().name).collect();
         let last = &hops[hops.len().saturating_sub(HEALTH)..];
         if last.is_empty() {
-            let none = if fetch::keyed().contains(&t) { "- no calls yet" } else { "no key" };
+            // the state the `keys` line names: off (its key kept or not), no key, or bd's key without its zone
+            let none = match (fetch::keyed().contains(&t), key(t)) {
+                (true, _) => "- no calls yet",
+                (_, "off") if settings::key(t.switch()).is_some() => "off (key kept)",
+                (_, "off") => "off",
+                (_, "none") => "no key",
+                _ => "no zone",
+            };
             rows.push(format!("{} {none}", t.spec().short));
             continue;
         }
@@ -145,33 +161,33 @@ fn kept(dir: Option<std::path::PathBuf>) -> String {
     p.map_or(String::new(), |p| format!(" · provider answers {}", p.display()))
 }
 
-/// One row per search (provider, ms, cost, results) and per fetch: provider, ms, cost, raw bytes → clean ~tok →
-/// outline ~tok, loss, cache hit. A search result shows as `search→u7`, not fetched yet or fetched.
-pub fn stats(c: &Cache) -> Out {
-    let (serps, s, keys, file) = (c.serps(), &c.session, &settings::get().key_dir.value, crate::cache::SPEND_FILE);
-    // the ledger's rows: (unix s, [cost, unverified], the record's dir); a ledger fats cannot write is a `!` row
-    let row = |l: &str| serde_json::from_str::<(f64, [f64; 2], std::path::PathBuf)>(l).ok();
-    let rows: Vec<_> = std::fs::read_to_string(keys.join(file)).unwrap_or_default().lines().filter_map(row).collect();
-    // a probe: one a session with nothing in it never writes
-    let lost = (serps.len() + c.st.u.len() > 0).then(|| settings::save_in(keys, file, b"", true).err()).flatten();
-    // the session's money = its ledger rows written since it began (`State::t`; a wiped root or session restarts
-    // the ids, and the rows of the records wiped with it name the same dirs; unknown = none) + a dead run's calls
-    // in flight while its run file lives (the sweep writes their row when it deletes `run/`)
-    let mine = rows.iter().filter(|r| r.2.starts_with(c.root.join(s)) && c.st.t.is_some_and(|b| r.0 >= b));
-    let ids = c.st.u.iter().enumerate().filter(|(_, e)| e.dir != "-"); // a result forgotten unfetched: no row
-    let pages: Vec<_> = ids.map(|(i, e)| page_row(c, i + 1, e)).collect();
-    let usd = |p: Vec<[f64; 2]>| bill(spend(p.iter().map(|x| x[0])), spend(p.iter().map(|x| x[1])));
-    let tot_c = usd(mine.map(|r| r.1).chain(pages.iter().map(|p| p.1)).collect());
-    let tot_c = if lost.is_some() { "? (ledger not written)".into() } else { tot_c }; // its rows are missing
-    let tot_ms = serps.iter().map(|s| s.1.ms).sum::<u64>() + pages.iter().map(|p| p.2).sum::<u64>();
-    let (fetched, n) = (c.st.u.iter().filter(|e| !matches!(e.dir.as_str(), "" | "-")).count(), serps.len());
-    let mut lines = vec![format!("= stats s:{s} · {n} searches · {fetched} fetches · {tot_ms}ms spent {tot_c}")];
-    lines.extend(serps.iter().map(|(j, m)| search_row(c, *j, m)).chain(pages.into_iter().map(|p| p.0)));
+/// The session index: one row per search (query, results, provider, ms, cost) and per fetch (host · title ·
+/// provider, ms, cost, tok; a failed one its `!` row), the last `list_rows` (`limit:N`, `all`), the rows whose
+/// host or title holds the words after `stats`. `json` = every row whole: raw bytes → clean ~tok → outline ~tok,
+/// loss, tried path. A search result shows as `search→u7`, not fetched yet or fetched.
+pub fn stats(c: &Cache, cmd: &crate::lang::Cmd, json: bool) -> Out {
+    let (n, s, keys, file) = (c.serps().len(), &c.session, &settings::get().key_dir.value, crate::cache::SPEND_FILE);
+    // a ledger fats cannot write is a `!` row
+    let rows = ledger();
+    let (listed, tot_c, lost) = index(c, &rows);
+    let tot_ms = listed.iter().map(|p| p.ms).sum::<u64>();
+    let mut lines = vec![format!("= stats s:{s} · {n} searches · {} fetches · {tot_ms}ms spent {tot_c}", fetched(c))];
+    // the index: the rows whose host or title holds the words (`search::holds`), the last `list_rows` of them
+    // (`limit:N`; `all`; `full`, `json` = every one, each whole), then a line naming the rest, or that none held
+    // the words
+    let (b, at, json) = (bin(), cmd.words.iter().map(|w| format!(" {w}")).collect::<String>(), json || cmd.has("full"));
+    let keep: Vec<&StatRow> = listed.iter().filter(|r| crate::search::holds(&r.name, &cmd.words)).collect();
+    let n = cmd.count("limit").unwrap_or_else(|| settings::limit("list_rows"));
+    let more = if json || cmd.has("all") { 0 } else { keep.len().saturating_sub(n) };
+    lines.extend(keep[more..].iter().map(|r| if json { &r.full } else { &r.lean }.clone()));
+    let none = (keep.is_empty() && !at.is_empty())
+        .then(|| format!("0 of {} rows hold \"{}\" · all: {b} stats all", listed.len(), at.trim_start()));
+    lines.extend((more > 0).then(|| format!("… {more} more · {b} stats{at} all")).or(none));
     // every session's spend: pages and searches are swept within the hour, what they cost stays
-    let since = |t: f64| usd(rows.iter().filter(|r| r.0 >= t).map(|r| r.1).collect());
-    let (day, all, n, at, b) = (since(crate::cache::now() - 86_400.0), since(0.0), rows.len(), keys.join(file), bin());
+    let since = |t: f64| usd_of(&rows.iter().filter(|r| r.0 >= t).map(|r| r.1).collect::<Vec<_>>());
+    let (day, all, n, at) = (since(crate::cache::now() - 86_400.0), since(0.0), rows.len(), keys.join(file));
     lines.push(format!("spend all sessions: 24h {day} · all {all} · {n} paid records · ledger {}", at.display()));
-    lines.extend(lost.map(|why| format!("! cache_write ledger not written: {why} → {b} config (FATS_KEY_DIR)")));
+    lines.extend(lost.map(|why| format!("! cache_write ledger not written: {why} → {b} config · FATS_KEY_DIR")));
     lines.push(match c.st.u.len() {
         0 => format!("next: {b} <url> · {b} ./page.html"),
         n => format!("last page: {b} u{n} · settings: {b} config"),
@@ -179,22 +195,121 @@ pub fn stats(c: &Cache) -> Out {
     Out::new(lines)
 }
 
-/// `stats` row of search `j<job>`.
-fn search_row(c: &Cache, job: usize, m: &Meta) -> String {
+/// The session's pages fetched (a search result not fetched, or forgotten, is none).
+fn fetched(c: &Cache) -> usize {
+    c.st.u.iter().filter(|e| !matches!(e.dir.as_str(), "" | "-")).count()
+}
+
+/// This session's pages fetched and what it spent, as `fats stats` heads it (`fats setup` → Settings → Stats).
+pub fn session(c: &Cache) -> (usize, String) {
+    (fetched(c), index(c, &ledger()).1)
+}
+
+/// The session's index rows (newest last), its money as printed, and why the ledger cannot be written.
+fn index(c: &Cache, rows: &[(f64, [f64; 2], std::path::PathBuf)]) -> (Vec<StatRow>, String, Option<std::io::Error>) {
+    let (serps, s, keys, file) = (c.serps(), &c.session, &settings::get().key_dir.value, crate::cache::SPEND_FILE);
+    // a probe: one a session with nothing in it never writes
+    let lost = (serps.len() + c.st.u.len() > 0).then(|| settings::save_in(keys, file, b"", true).err()).flatten();
+    // the session's money = its ledger rows written since it began (`State::t`; a wiped root or session restarts
+    // the ids, and the rows of the records wiped with it name the same dirs; unknown = none) + a dead run's calls
+    // in flight while its run file lives (the sweep writes their row when it deletes `run/`)
+    let mine = rows.iter().filter(|r| r.2.starts_with(c.root.join(s)) && c.st.t.is_some_and(|b| r.0 >= b));
+    let ids = c.st.u.iter().enumerate().filter(|(_, e)| e.dir != "-"); // a result forgotten unfetched: no row
+    let mut listed: Vec<StatRow> =
+        serps.iter().map(|(j, m)| search_row(c, *j, m)).chain(ids.map(|(i, e)| page_row(c, i + 1, e, ""))).collect();
+    listed.sort_by_key(|r| r.at); // newest last: by job (one counter for searches and fetches), a search first
+    let tot_c = usd_of(&mine.map(|r| r.1).chain(listed.iter().map(|p| [0.0, p.upto])).collect::<Vec<_>>());
+    let tot_c = if lost.is_some() { "? (ledger not written)".into() } else { tot_c }; // its rows are missing
+    (listed, tot_c, lost)
+}
+
+/// The spend ledger's rows: (unix s, [cost, unverified], the record's dir).
+fn ledger() -> Vec<(f64, [f64; 2], std::path::PathBuf)> {
+    let at = settings::get().key_dir.value.join(crate::cache::SPEND_FILE);
+    let row = |l: &str| serde_json::from_str(l).ok();
+    std::fs::read_to_string(at).unwrap_or_default().lines().filter_map(row).collect()
+}
+
+/// `$0.0225 + ≤$0.0060 unverified`: what ledger amounts total (`provider::bill`).
+fn usd_of(p: &[[f64; 2]]) -> String {
+    bill(spend(p.iter().map(|x| x[0])), spend(p.iter().map(|x| x[1])))
+}
+
+/// `fats` on a terminal (`home` screen): what fats is, READY? (`ready`), TRY, YOUR STUFF (`yours`: this
+/// session's pages, the last one, every session's spend this calendar month, UTC), MORE. `status` = the agent's.
+pub fn home(c: &Cache) -> String {
+    let this = month(crate::cache::now()).0;
+    let spent: Vec<_> = ledger().into_iter().filter(|r| month(r.0).0 == this).map(|r| r.1).collect();
+    let pages: Vec<_> = c.st.u.iter().enumerate().filter(|(_, e)| !matches!(e.dir.as_str(), "" | "-")).collect();
+    let yours = pages.last().map_or(String::new(), |(n, e)| {
+        let (id, last, spent) = (format!("u{}", n + 1), short(&e.url, 50), usd_of(&spent).replace("≤$", "up to $"));
+        paint(screen("yours"), &[("pages", pages.len().to_string()), ("id", id), ("last", last), ("spent", spent)])
+    });
+    let home = paint(screen("home"), &[("ready", ready()), ("yours", yours)]);
+    crate::lang::redact(&home, &settings::secrets()) // a URL can carry a key
+}
+
+/// The READY? rows (`ready` screen: the ✓ row, the ○ row, then `name|label|on|off|no key` per provider; an
+/// empty no-key text = it needs none): on and keyed = ✓, else ○ and why (`settings::on`, `settings::key`).
+fn ready() -> String {
+    let mut rows = screen("ready").lines();
+    let marks = [rows.next().unwrap_or_default(), rows.next().unwrap_or_default()];
+    let row = |l: &str| {
+        let [name, label, on, off, none] = l.split('|').collect::<Vec<_>>()[..] else { return String::new() };
+        let (from, texts) = (settings::key(name).map(|k| k.1), [on, off, none]);
+        let at = if !settings::on(name) { 1 } else { usize::from(from.is_none() && !none.is_empty()) * 2 };
+        let text = crate::lang::draw(texts[at], &[("from", from.unwrap_or_default())]);
+        paint(marks[at.min(1)], &[("label", &format!("{label:<20}")), ("text", &text)])
+    };
+    rows.map(row).collect::<Vec<_>>().join("\n")
+}
+
+/// One `stats` row: `lean` (the index line), `full` (every field: `json`), `name` (what a word filters), its ms,
+/// and the cost no ledger row holds: a dead run's calls in flight.
+pub struct StatRow {
+    pub lean: String,
+    full: String,
+    name: String,
+    ms: u64,
+    upto: f64,
+    /// Its place: (job, u), a search's = (job, 0).
+    at: (usize, usize),
+}
+
+impl StatRow {
+    /// `id host · title · what`: one line, the title cut (`outline::title_cut`, never under 30 chars) to what the
+    /// rest leaves of `row_chars` (limits.json); `full` = the same with every field and the whole title (no
+    /// `lean`: `full` is the line). No title, or the host's own name: `id host · what`.
+    fn new(id: &str, host: &str, title: &str, (lean, full): (String, String)) -> StatRow {
+        let lean = if lean.is_empty() { full.clone() } else { lean };
+        let room = settings::limit::<usize>("row_chars")
+            .saturating_sub(id.chars().count() + host.chars().count() + lean.chars().count() + 7);
+        let named = |t: String| if title.is_empty() || title == host { String::new() } else { t + " · " };
+        let (cut, whole) = (named(crate::outline::title_cut(title, room.max(30))), named(title.into()));
+        let (lean, full) = (format!("{id} {host} · {cut}{lean}"), format!("{id} {host} · {whole}{full}"));
+        StatRow { lean, full, name: format!("{host} {title}"), ms: 0, upto: 0.0, at: (0, 0) }
+    }
+}
+
+/// `stats` row of search `j<job>`: `j4 search "rust http client" · 10 results · oxylabs 1800ms $0.0010`; its tried
+/// path in `full`, and on a failed one.
+fn search_row(c: &Cache, job: usize, m: &Meta) -> StatRow {
     let n = m.extra.get("hits").and_then(|h| h.as_array()).map_or(0, |h| h.len());
     let n = if m.ok { format!("{n} results") } else { format!("! {}", m.code) };
     let cc = if m.country.is_empty() { String::new() } else { format!("@{}", m.country) };
     let q = m.url.strip_prefix("search:").unwrap_or(&m.url);
     let prov = if m.provider.is_empty() { "-" } else { &m.provider };
-    let (ms, usd, q, tried) = (m.ms, crate::provider::bill(m.cost, m.upto()), short(q, 60), m.path(true));
+    let (ms, usd, tried) = (m.ms, crate::provider::bill(m.cost, m.upto()), m.path(true));
     let kept = kept(Some(c.root.join(&c.session).join(format!("j{job}"))));
-    format!("j{job} search {prov}{cc} {ms}ms {usd} {n} \"{q}\" · {tried}{kept}")
+    let lean = format!("j{job} search \"{}\" · {n} · {prov}{cc} {ms}ms {usd}", short(q, 60));
+    let full = format!("{lean} · {tried}{kept}");
+    StatRow { lean: if m.ok { lean } else { full.clone() }, full, name: q.into(), ms, upto: 0.0, at: (job, 0) }
 }
 
-/// `stats` row of page `u<u>` (a cache hit costs nothing; a swept page's cost is in the total only), and the cost
-/// no ledger row holds: a dead run's calls in flight.
-fn page_row(c: &Cache, u: usize, e: &Entry) -> (String, [f64; 2], u64) {
-    let (pid, empty) = (format!("u{u}"), e.dir.is_empty());
+/// `stats` row of page `<job>u<u>` (`j3.u2` in a job's list; a cache hit costs nothing; a swept page's cost is in
+/// the total only).
+pub fn page_row(c: &Cache, u: usize, e: &Entry, job: &str) -> StatRow {
+    let (pid, empty, at) = (format!("{job}u{u}"), e.dir.is_empty(), (e.job.unwrap_or_default(), u));
     let id = if e.serp { format!("search→{pid}") } else { pid.clone() };
     // a detached fetch adds its cost here once it ends; THE liveness rule (`Cache::run`, the lock); a dead one = its
     // failed copy (`Detached::cut`), its calls in flight in the row and the total until the sweep stores it
@@ -202,8 +317,8 @@ fn page_row(c: &Cache, u: usize, e: &Entry) -> (String, [f64; 2], u64) {
     let dead = run.as_ref().filter(|r| r.0.dead(r.1, Some(e))).map(|r| r.0.cut());
     if empty && dead.is_none() {
         let idle = if c.lookup(&e.url).is_some() { "cached" } else { "not fetched" };
-        let what = if run.is_some() { "pending" } else { idle };
-        return (format!("{id} {what} {} → {} u{u}", short(&e.url, 60), bin()), [0.0; 2], 0);
+        let what = format!("{} → {} {pid}", if run.is_some() { "pending" } else { idle }, bin());
+        return StatRow { at, ..StatRow::new(&id, &short(&e.url, 60), "", (String::new(), what)) };
     }
     let (meta, doc) = dead.map_or_else(|| c.page(e), |m| (m, Err(crate::cache::NoDoc::Missing)));
     let errs = kept(c.dir(e));
@@ -211,40 +326,67 @@ fn page_row(c: &Cache, u: usize, e: &Entry) -> (String, [f64; 2], u64) {
     let cc = if meta.country.is_empty() { String::new() } else { format!("@{}", meta.country) };
     let name = if meta.provider.is_empty() { "swept" } else { meta.provider.as_str() }; // no meta: its dir went
     let prov = if e.alias { "cache".into() } else { format!("{name}{cc}") };
-    let head = format!("{id} {prov} {ms}ms ${cost:.4}");
+    let head = format!("{prov} {ms}ms ${cost:.4}{}", meta.how());
+    let host = crate::outline::place(&e.url, meta.final_url.as_deref().unwrap_or(&e.url));
+    let host = host.strip_prefix("www.").unwrap_or(&host);
     let pics = c.dir(e).map_or_else(Vec::new, |d| crate::cache::assets(&d));
     let (pic_bytes, pic_ms) = pics.iter().fold((0, 0), |(b, t), a| (b + a.bytes as usize, t + a.ms));
     let line = format!(" · pictures {} plain {}B {pic_ms}ms $0", pics.len(), ksize(pic_bytes));
     let pics = if pics.is_empty() { String::new() } else { line };
-    let tail = format!("{}{}{pics}{errs}", meta.path(true), meta.hedge_off());
-    let row = match doc {
+    let (tail, raw) = (format!("{}{pics}{errs}", meta.path(true)), ksize(meta.bytes as usize));
+    let (title, lean, full) = match doc {
         Ok(doc) => {
+            // a failed copy (a captcha page kept) keeps its `!` code on the row
+            let head = if meta.ok { head } else { format!("{head} ! {}", meta.code) };
             let charset = if meta.charset.is_empty() { String::new() } else { format!(" {}", meta.charset) };
-            let page = Page { id: pid.clone(), eq: pid, doc: &doc, meta: &meta, age: None, at: Default::default() };
-            let outline: usize = crate::outline::outline(&page, None).0.iter().map(|l| crate::clean::tok(l)).sum();
-            let (raw, clean, shots) = (ksize(meta.bytes as usize), ksize(doc.tokens.clean), photos(&doc, &meta));
+            // the `=` line's id and figure, as a read of this copy prints them (`fats u2`, `fats j3.u2`)
+            let eq = if job.is_empty() { e.eq(u) } else { pid.clone() };
+            let page = Page { id: pid.clone(), eq, doc: &doc, meta: &meta, age: None, at: Default::default() };
+            let shown = crate::outline::outline(&page, None).0;
+            let (outline, size) =
+                (shown.iter().map(|l| crate::clean::tok(l)).sum::<usize>(), crate::outline::size(&page, &shown));
+            let (clean, shots) = (ksize(doc.tokens.clean), photos(&doc, &meta));
             let (mode, l) = (&doc.mode, &doc.loss);
             let sizes = format!("{head} raw {raw}B{charset} → clean {clean}~tok ({mode}) → outline {outline}~tok");
             let pruned = format!("{} of {} numbers pruned", l.vs_light_lost, l.light_facts);
             let signal = doc.info.get("signal").map(|v| format!(" · signal {v}")).unwrap_or_default();
-            format!("{sizes}{shots} · {pruned} · price_nums_pruned {}{signal} · {tail}", l.price_pruned)
+            let full = format!("{sizes}{shots} · {pruned} · price_nums_pruned {}{signal} · {tail}", l.price_pruned);
+            (doc.title, format!("{head} · {}tok", ksize(size)), full)
         }
-        // a failed copy = the `!` row its read prints (`cli::no_doc`), what it ran before the move
+        // a failed copy = the `!` row its read prints (`cli::no_doc`), what it ran before the move; a starved one's
+        // newer served copy (`cli::copies`) is its move
         Err(why) if !meta.ok => {
-            let row = no_doc(&pid, "", &meta, &[], &why, None).lines.split_off(1).join("\n");
-            let mid = format!("{} · {tail}", &head[id.len() + 1..]);
-            row.split_once(" → ").map_or(format!("{row} · {mid}"), |(b, n)| format!("{b} · {mid} → {n}"))
+            let starved =
+                fetch::budget_row(&meta, "", &[]).and_then(|_| copies(c, u, (&meta, &Default::default()), &[]).0);
+            let row = no_doc(&pid, "", &meta, &[], &why, starved).lines.split_off(1).join("\n");
+            let (row, mid) = (row.strip_prefix(&format!("{pid} ")).unwrap_or(&row), format!("{head} · {tail}"));
+            let row = row.split_once(" → ").map_or(format!("{row} · {mid}"), |(b, n)| format!("{b} · {mid} → {n}"));
+            (String::new(), String::new(), row)
         }
-        Err(_) => format!("{head} {} raw {}B · {tail}", meta.kind, ksize(meta.bytes as usize)),
+        Err(_) => (String::new(), String::new(), format!("{head} {} raw {raw}B · {tail}", meta.kind)),
     };
-    (row, [0.0, if empty { meta.upto() } else { 0.0 }], ms)
+    StatRow { ms, upto: if empty { meta.upto() } else { 0.0 }, at, ..StatRow::new(&id, host, &title, (lean, full)) }
 }
 
 /// Every setting with its source (flag · env · default · build); refused inputs show next to the value used.
 pub fn config() -> Out {
     let s = crate::settings::get();
     let mut rows = store_rows(s);
-    rows.extend(settings::LIMITS.iter().map(|(k, v)| (*k, v.to_string(), "build · limits.json".into())));
+    let src = |k: &str, at| {
+        let lanes = match k {
+            "batch_parallel" => " · lanes (RAM guard, not a provider limit)",
+            "plain_host_pace_ms" => " · plain waits its turn a host (home-IP brake), never a paid call",
+            _ => "",
+        };
+        let at = match at {
+            "build" => "build · limits.json".into(),
+            "env" => format!("env FATS_{}", k.to_uppercase()),
+            at => at.to_string(),
+        };
+        at + lanes
+    };
+    let limits = settings::LIMITS.keys().map(|k| (*k, settings::limit_of(k)));
+    rows.extend(limits.map(|(k, (v, at))| (k, v.to_string(), src(k, at))));
     rows.extend(fetch_rows(s));
     rows.push(instant_row());
     for t in Tier::ALL {
@@ -252,10 +394,11 @@ pub fn config() -> Out {
         let price = format!("${:.2}/1k", sp.price * 1e3);
         // a provider without a key: its `no_key` row, the one text every command prints
         let k = match key(t) {
+            "off" => " · off (settings.json)".into(),
             _ if sp.env.is_empty() => String::new(),
             "none" if t == t.owner() => format!(" · key none {}", no_key_rows(sp.short, false).concat()),
             "none" => " · key none".into(),
-            k => format!(" · key {k} ({} or {})", sp.env, sp.file),
+            k => format!(" · key {k} ({} or {})", sp.env, settings::AUTH),
         };
         rows.push((sp.short, format!("{}s {price}", sp.timeout.as_secs()), format!("build{k}")));
     }
@@ -263,9 +406,11 @@ pub fn config() -> Out {
     let mut lines = vec![format!("= config · {} settings · source: flag · env · default · build", rows.len())];
     lines.extend(rows.into_iter().map(|(k, v, s)| format!("{k} {v} · {s}")));
     lines.push(format!(
-        "env: FATS_SESSION FATS_CACHE FATS_KEY_DIR FATS_JSON FATS_NOCACHE FATS_OFFLINE FATS_ALLOW_PRIVATE FATS_CHUNK FATS_ACCOUNT_TTL FATS_ACCEPT_MD · status: {b}"
+        "env: FATS_SESSION FATS_CACHE FATS_KEY_DIR FATS_JSON FATS_NOCACHE FATS_OFFLINE FATS_ALLOW_PRIVATE FATS_CHUNK FATS_ACCOUNT_TTL FATS_ACCEPT_MD FATS_TELEMETRY FATS_TELEMETRY_DEBUG DO_NOT_TRACK · status: {b}"
     ));
-    Out::new(lines)
+    let mut out = Out::new(lines);
+    out.warn(settings::unknown(s));
+    out
 }
 
 /// A `config` row: (name, value in effect, where it came from).
@@ -273,7 +418,9 @@ type Row = (&'static str, String, String);
 
 /// A setting's source, and the value refused for env `k` when one was: `env FATS_JSON`, `default (refused x)`.
 fn source(src: &str, k: &str) -> String {
-    let refused = crate::settings::get().rejects.iter().find(|r| r.contains(&format!(" {k}="))).map(|r| {
+    let n = k.trim_start_matches("FATS_").to_lowercase(); // a `settings.json` value's row names it so
+    let at = |r: &&String| r.contains(&format!(" {k}=")) || r.contains(&format!(" {n}="));
+    let refused = crate::settings::get().rejects.iter().find(at).map(|r| {
         format!(" (refused {})", r.split(" · ").next().unwrap_or_default().trim_start_matches("! bad_setting "))
     });
     format!("{src}{}", refused.unwrap_or_default())
@@ -291,13 +438,12 @@ fn store_rows(s: &settings::Settings) -> Vec<Row> {
         ("nocache", s.nocache.value.to_string(), source(s.nocache.src, "FATS_NOCACHE")),
         ("chunk", format!("{}tok", s.chunk.value), source(s.chunk.src, "FATS_CHUNK")),
         ("match", "words (exact first when unpinned)".into(), "default".into()),
-        ("list_cap", format!("{LIST_CAP}tok"), "default".into()),
-        ("grep_cap", format!("{GREP_CAP}tok"), "default".into()),
-        ("read_cap", format!("{READ_CAP}tok"), "default".into()),
         ("max_bytes", format!("{} (ceiling {})", mib(MAX_BYTES), mib(MAX_BYTES_CEIL)), "default · max_bytes:".into()),
         tables(),
         ("network", if s.offline.value { "off" } else { "on" }.into(), s.offline.src.into()),
         ("allow_private", s.allow_private.value.to_string(), source(s.allow_private.src, "FATS_ALLOW_PRIVATE")),
+        ("telemetry", s.telemetry.value.name().into(), source(s.telemetry.src, "FATS_TELEMETRY")),
+        ("telemetry_debug", s.telemetry_debug.value.to_string(), source(s.telemetry_debug.src, "FATS_TELEMETRY_DEBUG")),
     ]
 }
 
@@ -334,23 +480,23 @@ fn fetch_rows(s: &settings::Settings) -> Vec<Row> {
         "text, json, xml bodies (by content type or start) served as they are, l<N> per line, {lines} lines per \
          section · never a provider, never a route"
     );
+    let (on, accept) = (if s.accept_md.value { "on" } else { "off" }, crate::provider::MD_ACCEPT);
     let md = format!(
-        "{} · plain sends Accept: {} · a text/markdown answer is cleaned as a page (md) unless thin or flat vs the \
-         stored copy · a JS shell or 4xx with the page's own og card is served as the card (og)",
-        if s.accept_md.value { "on" } else { "off" },
-        crate::provider::MD_ACCEPT
+        "{on} · plain sends Accept: {accept} · a text/markdown answer is cleaned as a page (md) unless thin or flat vs \
+         the stored copy · a JS shell or 4xx with the page's own og card is served as the card (og)"
     );
     let (max, wait) = (ksize(ASSET_MAX as usize), ASSET_WAIT.as_secs());
     let pictures =
         format!("{b} uN mK: plain only, image/* at most {max}B, {wait}s, $0 · <page>/assets/ · mcp attaches it");
     let ttl = format!("{}m · {b} account re-reads after it; status reads {ACCOUNT_FILE} only", s.account_ttl.value);
     let ladder = path_of(&fetch::route(&fetch::Plan::new("", fetch::Mode::Auto, false, fetch::COST_CAP, None)).0);
+    let auto = format!("auto: {ladder} · oxy no-JS also: files");
     vec![
         // the page ladder the keys present run, a one-key retry included (`fetch::route`, as `dry:true` prints it)
-        ("provider", format!("auto: {} · oxy no-JS also: files", ladder), "default · provider:plain|bd|oxy".into()),
+        ("provider", auto, "default · provider:plain|bd|oxy|decodo".into()),
         ("country", country, source(s.country.src, "FATS_COUNTRY") + " · country:"),
         ("search", search, "default · provider:oxy|bd limit: country: site: since: timeout: cost:".into()),
-        ("device", "desktop".into(), "default · device:mobile (oxy only)".into()),
+        ("device", "desktop".into(), "default · device:mobile (oxy, decodo)".into()),
         ("hedge", fetch::hedges(None) + " (both billed when both run)", "hedge:N sets both · hedge:0 races".into()),
         ("pdf", pdf, "build · timeout: sets oxy's too".into()),
         ("text", text, "build".into()),
@@ -370,14 +516,37 @@ fn fetch_rows(s: &settings::Settings) -> Vec<Row> {
 /// wait outside a provider, the second resolver named as the third party it is.
 fn instant_row() -> Row {
     use crate::cli::{POLL, PREFETCH, WAIT};
-    let (poll, gh) = (POLL.as_millis(), settings::GH_WAIT.as_secs());
-    let (dns, doh, doh_wait) =
-        (fetch::DNS_WAIT.as_secs_f32(), Api::Doh.row().url, crate::provider::DOH_WAIT.as_secs_f32());
+    let (poll, dns) = (POLL.as_millis(), settings::limit::<u64>("dns_wait"));
+    let (doh, doh_wait) = (Api::Doh.row().url, crate::provider::DOH_WAIT.as_secs_f32());
     let instant = format!(
         "wait:{WAIT}s then a fetch or a search slower than wait: (bd) is pending, a gh/account/setup call is cut (provider_timeout wait:) · poll {poll}ms · a run lives while it holds its lock, else abandoned · prefetch fetch:{PREFETCH} \
-         · gh auth token {gh}s · dns {dns}s, on no address a third party: {doh} ({doh_wait}s, the host name only)"
+         · dns dns_wait:{dns}s, else dns_timeout $0 (an error in < 1 s: dns_failed), on no address a third party: {doh} (A then AAAA, {doh_wait}s each, the host name only)"
     );
     ("instant", instant, "default · wait:0..300 fetch:N".into())
+}
+
+/// `fats setup <name>` (its key form, `setup::agent`); `fats setup <name> on|off`, `fats config set <name> <value>`,
+/// `fats config unset <name>`: one `settings.json` change, read from the next command on; `dry:true` names it and
+/// writes nothing. Refused = `! refused · <why>`.
+pub fn change(cmd: &crate::lang::Cmd) -> Out {
+    let s: Vec<&str> = cmd.sub.iter().map(String::as_str).collect();
+    let r = match s[..] {
+        [n] if cmd.has("setup") => return crate::setup::agent(n, cmd.flag("dry")),
+        _ if cmd.flag("dry") => Ok(()),
+        ["telemetry", v] if cmd.has("setup") => settings::set("telemetry", v),
+        [n, v] if cmd.has("setup") => settings::set_on(n, v == "on"),
+        ["set", n, v] => settings::set(n, v),
+        ["unset", n] => settings::unset(n),
+        _ => Err(format!("{} config set <name> <value> · names: {} config", bin(), bin())),
+    };
+    let head = if cmd.has("setup") { "setup" } else { "config" };
+    let what = if cmd.flag("dry") { "would save" } else { "saved" };
+    match r {
+        Ok(()) => {
+            Out::new(vec![format!("= {head} {} · {what} {} · from the next command", s.join(" "), settings::PREFS)])
+        }
+        Err(e) => Out { rc: 1, ..Out::new(vec![format!("! refused · {e}")]).with("error", "refused") },
+    }
 }
 
 // ---------------------------------------------------------------- `fats account`
@@ -401,8 +570,7 @@ pub struct AccountRead {
 /// What `account` and `account dry:true` start from: the account providers with a key, in row order (Bright
 /// Data's account API needs no zone), their names, and the last read (`ACCOUNT_FILE`).
 fn account_state(c: &Cache) -> (Vec<(Tier, String)>, Vec<&'static str>, Option<AccountRead>) {
-    let key = |t: Tier| settings::key(t.spec().env, t.spec().file).map(|k| (t, k.0));
-    let keys: Vec<(Tier, String)> = ACCOUNTS.iter().filter_map(|&t| key(t)).collect();
+    let keys: Vec<(Tier, String)> = ACCOUNTS.iter().filter_map(|&t| Some((t, key_of(t)?.0))).collect();
     let names = keys.iter().map(|k| k.0.spec().short).collect();
     (keys, names, jload(&c.root.join(ACCOUNT_FILE)))
 }
@@ -497,7 +665,7 @@ pub fn account(c: &Cache, fresh: bool, wait: Duration) -> Out {
         _ => {
             let read = AccountRead { t: now, rows: read_accounts(&keys, now, wait) };
             if let Err(e) = jsave(&c.root.join(ACCOUNT_FILE), &read) {
-                return Out::fail("cache_write", format!("= ! cache_write {e}"), format!("{b} config (FATS_CACHE)"));
+                return Out::fail("cache_write", format!("= ! cache_write {e}"), format!("{b} config · FATS_CACHE"));
             }
             (read, false)
         }
@@ -540,30 +708,33 @@ pub fn account(c: &Cache, fresh: bool, wait: Duration) -> Out {
 
 // ---------------------------------------------------------------- `fats setup`
 
-/// `fats setup`: each provider's key from the first place that has it (`settings::find`), checked with its
-/// cheapest read (Oxylabs: the scraper list; Bright Data: the zone list, names and types only, never an endpoint
-/// that answers with a zone password), saved in the key dir (0600) unless it came from there. Bright Data's Web
-/// Unlocker zone: `zone:`, else the configured one, else the account's only one. Never prints a key; `dry:true`
-/// makes no call and writes nothing. The checks run side by side, each given up at `wait`.
+/// `fats setup`: each provider's key (env, else `auth.json`: `settings::key`), checked with its free read
+/// (`provider::check_key`: Oxylabs the scraper list, Bright Data the zone list, Decodo a scrape of a host that does not
+/// exist), saved in `auth.json` (0600) unless it came from there. Bright Data's Web Unlocker zone: `zone:`, else the
+/// configured one, else the account's only one. Never prints a key; `dry:true` makes no call and writes nothing. The
+/// checks run side by side, each given up at `wait`.
 pub fn setup(zone: Option<&str>, dry: bool, wait: Duration) -> Out {
     let b = bin();
     let (mut heads, mut lines, mut ok) = (Vec::new(), Vec::new(), true);
-    let api = |t: Tier| if t == Tier::Bd { Api::BdZones } else { Api::OxyScrapers };
-    let found: Vec<_> = ACCOUNTS.iter().map(|t| settings::find(t.spec().env, t.spec().file, &[])).collect();
-    let keyed = ACCOUNTS.iter().zip(&found).filter_map(|(t, k)| Some((api(*t), k.as_ref()?.0.clone())));
-    let calls = if dry { Vec::new() } else { keyed.map(|(to, key)| crate::provider::read_json(to, key)).collect() };
+    // the free fetch switched off heads the summary, its move back the first row
+    let off = (!settings::on("free")).then(crate::setup::free_off);
+    heads.extend(off.as_ref().map(|o| o.0.to_string()));
+    lines.extend(off.map(|o| o.1));
+    let found: Vec<_> = KEYS.iter().map(|t| key_of(*t)).collect();
+    let keyed = KEYS.iter().zip(&found).filter_map(|(t, k)| Some((*t, k.as_ref()?.0.clone())));
+    let calls = if dry { Vec::new() } else { keyed.map(|(t, key)| crate::provider::check_key(t, key)).collect() };
     let mut reads = crate::provider::all_within(calls, wait).into_iter();
-    for (t, found) in ACCOUNTS.into_iter().zip(found) {
+    for (t, found) in KEYS.into_iter().zip(found) {
         let s = t.spec();
         let (head, rows) = match found {
             None => ("none".into(), no_key_rows(s.short, true)),
             Some((_, at)) if dry => {
-                let row = api(t).row();
+                let row = crate::provider::check_call(t).0.row();
                 let what = format!("{} key from {at} · would read {} {} · $0", s.short, row.method, row.url);
                 ("not checked".into(), vec![what])
             }
             Some((key, at)) => match reads.next().flatten().unwrap_or_else(|| Err(late(wait))) {
-                Ok(j) => keep(t, &key, at, &j, zone),
+                Ok(j) => keep(t, &key, at, j, zone),
                 Err(f) => (format!("! {}", f.code), account_rows(&failed(t, f), None)),
             },
         };
@@ -574,52 +745,37 @@ pub fn setup(zone: Option<&str>, dry: bool, wait: Duration) -> Out {
     let dir = settings::get().key_dir.value.display().to_string();
     let tail = if dry { " · spends nothing now".to_string() } else { format!(" · key dir {dir}") };
     lines.insert(0, format!("={} setup {}{tail} · $0", if dry { " dry" } else { "" }, heads.join(" · ")));
-    lines.push(format!("status: {b} · balance: {b} account"));
+    lines.extend(crate::telemetry::row());
+    lines.push(format!("status: {b} · balance: {b} account · {}", crate::lang::to_guide()));
     let mut out = Out { rc: i32::from(!ok), ..Out::new(lines) }; // a failed check = rc 1
     out.set("cost", 0.0).set("dry", dry);
     out
 }
 
-/// A key that passed its check: the head and row, with the zone for Bright Data; saved unless it came from the key dir.
-fn keep(t: Tier, key: &str, at: &str, j: &serde_json::Value, zone: Option<&str>) -> (String, Vec<String>) {
-    let s = t.spec();
-    let mut files = vec![(s.file, key.to_string())];
-    let what = match t {
-        Tier::Bd => match pick_zone(j, zone) {
-            Ok(z) => {
-                files.push((settings::ZONE_FILE, z.clone()));
-                format!("zone {z}")
-            }
+/// A key that passed its check: the head and row, with the zone for Bright Data; saved (`settings::save_key`)
+/// unless it and the zone are there already.
+fn keep(t: Tier, key: &str, at: &str, got: (String, Vec<String>), zone: Option<&str>) -> (String, Vec<String>) {
+    let (s, (mut what, zones)) = (t.spec(), got);
+    let zone = match t {
+        Tier::Bd => match crate::setup::pick_zone(&zones, zone) {
+            Ok(z) => Some(z),
             Err(row) => return ("! no_zone".into(), vec![row]),
         },
-        _ => format!("{} scrapers", j["scrapers"].as_array().map_or(0, Vec::len)),
+        _ => None,
     };
-    files.retain(|(f, _)| at != "file" || *f != s.file);
-    let dir = &settings::get().key_dir.value;
-    if let Some(e) = files.iter().find_map(|(f, v)| settings::save_in(dir, f, v.as_bytes(), false).err()) {
-        let fix = format!("{} config (FATS_KEY_DIR)", bin());
-        return ("! cache_write".into(), vec![format!("{} ! cache_write {e} → {fix}", s.short)]);
-    }
-    let saved: Vec<&str> = files.iter().map(|f| f.0).collect();
-    let saved = if saved.is_empty() { "kept".into() } else { format!("saved {} (600)", saved.join(" ")) };
-    (format!("ok {what}"), vec![format!("{} ok {what} · key from {at} · {saved}", s.short)])
-}
-
-/// Bright Data's Web Unlocker zone from its zone list: `zone:`, else the configured one, else the only one.
-/// Err = the `! no_zone` row naming the account's unblocker zones.
-fn pick_zone(j: &serde_json::Value, arg: Option<&str>) -> Result<String, String> {
-    let zones = j.as_array().into_iter().flatten().filter(|z| z["type"] == "unblocker");
-    let names: Vec<&str> = zones.filter_map(|z| z["name"].as_str()).collect();
-    let saved = || settings::find("BRIGHTDATA_UNLOCKER_ZONE", settings::ZONE_FILE, &[]).map(|z| z.0);
-    let want = arg.map(String::from).or_else(saved);
-    match (want, names.as_slice()) {
-        (Some(w), _) if names.contains(&w.as_str()) => Ok(w),
-        (None, [one]) => Ok(one.to_string()),
-        (want, _) => {
-            let what = want.map_or("pick one".into(), |w| format!("{w} is not a Web Unlocker zone here"));
-            let list = if names.is_empty() { "none (add one in the control panel)".into() } else { names.join(", ") };
-            let at = At { id: "setup", arg: names.first().copied().unwrap_or("<name>"), ..Default::default() };
-            Err(crate::lang::bang("bd", "no_zone", &format!("{what} · unblocker zones: {list}"), &at))
+    what = zone.as_ref().map_or(what, |z| format!("zone {z}"));
+    let kept = at == settings::AUTH && zone.as_deref().is_none_or(|z| settings::zone() == Some(z));
+    let saved = if kept {
+        Ok("kept".into())
+    } else {
+        settings::save_key(s.short, key, zone.as_deref())
+            .map(|()| format!("saved {}{} (600)", settings::AUTH, if zone.is_some() { " settings.json" } else { "" }))
+    };
+    match saved {
+        Ok(saved) => (format!("ok {what}"), vec![format!("{} ok {what} · key from {at} · {saved}", s.short)]),
+        Err(e) => {
+            let fix = format!("{} config · FATS_KEY_DIR", bin());
+            ("! cache_write".into(), vec![format!("{} ! cache_write {e} → {fix}", s.short)])
         }
     }
 }
@@ -682,7 +838,7 @@ pub fn account_dry(c: &Cache, fresh: bool) -> Out {
         lines.push(format!("cache account.json {age} old (ttl {ttl}m) → no calls · fresh:true reads again"));
     }
     for (t, api, req) in &calls {
-        let what = api.row().what.replace("{from}", &from).replace("{to}", &to);
+        let what = crate::lang::draw(api.row().what, &[("from", &from), ("to", &to)]);
         lines.push(format!("{} {} {} · {what}", t.spec().short, api.row().method, api.url(req)));
     }
     for t in ACCOUNTS.iter().filter(|t| !names.contains(&t.spec().short)) {
@@ -711,9 +867,145 @@ fn account_line(c: &Cache, now: f64) -> String {
     format!("account: {n} provider{}{bang} · {age} ago · {b} account", if n == 1 { "" } else { "s" })
 }
 
+/// The summary's wire contract, also held by the receiving end: a count's ceiling, entries per map (crash spots
+/// apart), providers in `keys`.
+const MAX_COUNT: u64 = 1_000_000;
+const MAX_ENTRIES: usize = 64;
+const MAX_CRASHES: usize = 32;
+const MAX_KEYS: usize = 16;
+
+/// The classes a command's answer is a page read in: their answer's tokens are a `read` sample.
+const PAGE_READS: [&str; 5] = ["read", "filter", "outline", "cards", "links"];
+
+/// A command's class, a fixed word, never its words, ids or URL: a reserved word as itself (`stats`, `cards`),
+/// else what it does. Reading words (`more`, `full`) are a read.
+fn class(cmd: &Cmd) -> &'static str {
+    let word = cmd.reserved.iter().find(|w| !["more", "up", "all", "full", "json"].contains(w));
+    let page = !cmd.ids.is_empty() || !cmd.urls.is_empty() || !cmd.files.is_empty() || !cmd.jobs.is_empty();
+    match () {
+        _ if cmd.ask.is_some() => "usage",
+        _ if cmd.flag("dry") => "dry",
+        _ if cmd.idle => "status",
+        _ if crate::cli::is_gh(cmd) => "gh",
+        _ if !cmd.sub.is_empty() => "set",
+        _ if let Some(w) = word => w,
+        _ if !cmd.media.is_empty() => "media",
+        _ if crate::cli::is_search(cmd) => "search",
+        _ if !cmd.words.is_empty() => "filter",
+        _ if cmd.has("more") || cmd.has("up") || cmd.ids.iter().any(|i| i.sec.is_some()) => "read",
+        _ if page => "outline",
+        _ => "other",
+    }
+}
+
+/// Who runs fats: `mcp` through `fats mcp`, else the first host whose env marker is set (words.json `hosts`,
+/// each read in that host's own code), else `shell` on a terminal, else `unknown`.
+pub fn host_of(mcp: bool, set: impl Fn(&str) -> bool, tty: bool) -> &'static str {
+    let marked = crate::lang::WORDS.hosts.iter().find(|h| set(h.0)).map(|h| h.1);
+    if mcp { "mcp" } else { marked.unwrap_or(if tty { "shell" } else { "unknown" }) }
+}
+
+/// Count a command (`cli::run`): who ran it, its class, a read's answer tokens, and the code of a failed one
+/// that stores no record (a fetch's or search's counts with its calls, `cache::tally`).
+pub fn tally_run(root: &Path, cmd: &Cmd, out: &Out) {
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let (class, host) = (class(cmd), host_of(FENCE.get().is_some(), set, tty));
+    let stores = PAGE_READS.contains(&class) || ["search", "gh", "media"].contains(&class);
+    let code = out.rec.get("error").and_then(|v| v.as_str()).filter(|_| !stores).map(code_of);
+    // a read's tokens, counted before the lock is taken
+    let tok = (PAGE_READS.contains(&class) && out.rc == 0).then(|| crate::clean::tok(&out.lines.join("\n")) as u64);
+    bump(root, std::fs::File::lock, |w| {
+        w.add(&["host", host], true);
+        w.add(&["cmd", class], true);
+        tok.into_iter().for_each(|n| w.sample("tok\tread", n));
+        w.add(&["codes", code.as_deref().unwrap_or_default()], code.is_some());
+    });
+}
+
+/// `file.rs:N kind` of a panic in OUR code (`outline.rs:412 index out of bounds`): its file under this crate's
+/// `src/` and the message's leading lowercase words, at most `cap` chars, cut at the first other char (a digit,
+/// a value, a quote, a path); None = a panic elsewhere (std, a dependency). Either separator names the same file
+/// (Windows writes `src\outline.rs`), the key always `/`.
+pub fn crash_key(file: &str, line: u32, msg: &str, cap: usize) -> Option<String> {
+    let (file, ours) = (file.replace('\\', "/"), file!().replace('\\', "/"));
+    let file = file.strip_prefix(ours.strip_suffix("stats.rs")?)?;
+    let kind: String = msg.chars().take_while(|&c| c.is_ascii_lowercase() || c == ' ').take(cap).collect();
+    Some(format!("{file}:{line} {}", kind.trim()).trim_end().into())
+}
+
+/// Count a panic in `root`'s tally: `crash_key`, nothing else of it; dropped while the tally's lock is held (by the
+/// panicking thread, maybe: a wait would never end).
+pub fn crash(root: &Path, file: &str, line: u32, msg: &str, cap: usize) {
+    let Some(k) = crash_key(file, line, msg, cap) else { return };
+    bump(root, |f| f.try_lock().map_err(Into::into), |w| w.add(&["crash", &k], true));
+}
+
+/// The binary's first step: its start time (`telemetry::STARTED`) and its panic hook: `crash`, then the default hook
+/// prints it. Root and cap are read now, never inside a panic.
+pub fn hook() {
+    std::sync::LazyLock::force(&crate::telemetry::STARTED);
+    let (root, cap, shown) =
+        (settings::get().cache.value.clone(), settings::limit("crash_chars"), std::panic::take_hook());
+    std::panic::set_hook(Box::new(move |p| {
+        if let Some(l) = p.location() {
+            crash(&root, l.file(), l.line(), p.payload_as_str().unwrap_or_default(), cap);
+        }
+        shown(p);
+    }));
+}
+
+/// `week`'s usage summary from `root`'s tally: counts, codes and fixed names only (`keys` = the providers with a
+/// key, never one); paid providers and hosts listed at 0 too, tiers once seen; the wire contract's caps, the
+/// biggest counts kept.
+pub fn weekly_of(root: &Path, week: &str) -> Value {
+    let w: Week = jload(&root.join("telemetry/week").join(format!("{week}.json"))).unwrap_or_default();
+    let switch = |ts: Vec<Tier>| {
+        let mut v: Vec<&str> = ts.into_iter().filter(|t| *t != Tier::Plain).map(Tier::switch).collect();
+        v.dedup();
+        v
+    };
+    let (paid, mut keys) = (switch(Tier::ALL.to_vec()), switch(fetch::keyed()));
+    keys.truncate(MAX_KEYS);
+    let hosts = crate::lang::WORDS.hosts.iter().map(|h| h.1).chain(["mcp", "shell", "unknown"]);
+    let host: Map<String, Value> = hosts.map(|h| (h.into(), 0.into())).collect();
+    let provider: Map<String, Value> =
+        paid.iter().map(|p| (p.to_string(), json!({"calls": 0, "served": 0, "search": 0}))).collect();
+    let pct = |k: &str, q: usize| {
+        let mut s = w.samples.get(k).cloned().unwrap_or_default();
+        s.sort_unstable();
+        let n = s.get(s.len() * q / 100).copied().unwrap_or_default();
+        let unit = 10u64.pow(n.checked_ilog10().unwrap_or(0).saturating_sub(1)); // 2 significant digits: 1234 → 1200
+        n.saturating_add(unit / 2) / unit * unit
+    };
+    let tok = |k: &str| json!({"p50": pct(k, 50), "p90": pct(k, 90)});
+    let mut v = json!({"s": 1, "v": env!("CARGO_PKG_VERSION"), "os": std::env::consts::OS,
+        "arch": crate::telemetry::arch(), "week": week, "keys": keys,
+        "provider": provider, "host": host, "cmd": {}, "tier": {}, "codes": {},
+        "tok": {"page": tok("tok\tpage"), "read": tok("tok\tread")},
+        "ms": {"plain_p50": pct("ms\tplain", 50), "paid_p50": pct("ms\tpaid", 50)}, "crash": {}});
+    let mut rows: Vec<(&String, &u64)> = w.n.iter().collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(*r.1));
+    for (path, n) in rows {
+        let p: Vec<&str> = path.split('\t').collect();
+        let cap = if p[0] == "crash" { MAX_CRASHES } else { MAX_ENTRIES };
+        let Some(map) = v.get_mut(p[0]) else { continue }; // a key the summary has no place for is dropped
+        if p.len() > 1 && map.as_object().is_some_and(|m| m.len() < cap || m.contains_key(p[1])) {
+            *p[1..].iter().fold(map, |at, k| &mut at[*k]) = (*n).min(MAX_COUNT).into();
+        }
+    }
+    let tiers = v["tier"].as_object_mut().into_iter().flat_map(|t| t.values_mut()).filter_map(Value::as_object_mut);
+    for t in tiers {
+        ["ok", "fail", "billed", "upto"].into_iter().for_each(|k| _ = t.entry(k).or_insert(0.into()));
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{now, week_of};
+    use std::collections::BTreeMap;
 
     /// The request budget shown is the newest answer's, whatever order the cache walk found them in.
     #[test]
@@ -728,8 +1020,7 @@ mod tests {
     /// A call cancelled after the other provider won is still a call, its bill unverified: health shows it.
     #[test]
     fn health_counts_cancelled_calls() {
-        let dir = std::env::temp_dir().join(format!("fats-health-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
+        let dir = crate::scratch::Scratch::new("health");
         let meta = serde_json::json!({"t": 1.0, "hops": [
             {"provider": "plain", "code": "js_shell", "ms": 300, "cost": 0.0},
             {"provider": "oxylabs", "code": "provider_error", "ms": 2000, "cost": 0.0},
@@ -739,36 +1030,81 @@ mod tests {
         let p = dir.join("meta.json");
         std::fs::write(&p, meta.to_string()).expect("write meta");
         let rows = health(&[p]);
-        std::fs::remove_dir_all(&dir).ok();
         let want = [
             "plain 0/1 300ms ✗",
             "bd 0/1 - – · 1 cancelled, billed $0.0000 + ≤$0.0015 unverified",
             "oxy 0/1 2000ms ✗",
             "oxyjs 1/1 9000ms ✓",
         ];
-        assert_eq!(rows[1..], want);
+        assert_eq!(rows[1..5], want);
     }
 
     /// A run left at `wait:3`, then `kill -9`: `stats` reads THE liveness rule (`Cache::run`) as `fats u1`
     /// does: `pending` while the run's lock is held, `! abandoned` once it is gone, never `pending` for a dead run.
     #[test]
     fn stats_reads_the_run_lock() {
-        let root = std::env::temp_dir().join(format!("fats-stats-lock-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let c = Cache::at(root.clone(), "t".into());
+        let root = crate::scratch::Scratch::new("stats-lock");
+        let c = Cache::at(root.to_path_buf(), "t".into());
         let lock = c.run_claim(1).expect("the launcher's lock");
         let status = "plain:js_shell✗ · bd running".into();
         let run = crate::cache::Detached { url: "https://ex.com/a".into(), job: 1, status, ..Default::default() };
         c.run_put(1, &run).expect("run file");
         let e = Entry { url: run.url.clone(), ..Default::default() };
-        let row = || page_row(&c, 1, &e);
-        assert!(row().0.starts_with("u1 pending "), "{}", row().0);
+        let row = || page_row(&c, 1, &e, "");
+        assert!(row().lean.starts_with("u1 ex.com/a · pending → "), "{}", row().lean);
         drop(lock);
-        assert!(row().0.starts_with("u1 ! abandoned "), "{}", row().0);
+        assert!(row().lean.starts_with("u1 ex.com · ! abandoned "), "{}", row().lean);
         // Its call in flight is a call we cut, in the row and the total; plain's is free
-        let (row, cost, _) = row();
-        assert!(row.contains(" · bd:abandoned✗≤$0.0015 (unverified) → ") && cost == [0.0, 0.0015], "{row}");
-        std::fs::remove_dir_all(&root).ok();
+        let r = row();
+        assert!(r.lean.contains(" · bd:abandoned✗≤$0.0015 (unverified) → ") && r.upto == 0.0015, "{}", r.lean);
+    }
+
+    /// The index rows: a long title cut at a word to fit `row_chars` (`…`), whole in `full`; a host's own name
+    /// is no title; a search row; a failed search keeps its tried path.
+    #[test]
+    fn stats_rows_fit_one_line() {
+        let title = "The Rust Programming Language and every book, guide and reference the project keeps online";
+        let r = StatRow::new("u2", "rust-lang.org", title, ("plain 229ms $0 · 445tok".into(), "x".into()));
+        assert!(r.lean.starts_with("u2 rust-lang.org · The Rust Programming") && r.lean.contains("… · plain 229ms"));
+        assert!(
+            r.lean.chars().count() <= settings::limit::<usize>("row_chars")
+                && r.full == format!("u2 rust-lang.org · {title} · x"),
+            "{}",
+            r.lean
+        );
+        assert_eq!(StatRow::new("u3", "a.io", "a.io", (String::new(), "! x".into())).lean, "u3 a.io · ! x");
+        let root = crate::scratch::Scratch::new("stats-rows");
+        let c = Cache::at(root.to_path_buf(), "t".into());
+        let hits = serde_json::json!([{"url": "https://a.io/"}, {"url": "https://b.io/"}]);
+        let mut m = Meta {
+            url: "search:rust http".into(),
+            provider: "oxylabs".into(),
+            ok: true,
+            ms: 1800,
+            cost: 0.001,
+            ..Meta::default()
+        };
+        m.extra.insert("hits".into(), hits);
+        assert_eq!(search_row(&c, 4, &m).lean, "j4 search \"rust http\" · 2 results · oxylabs 1800ms $0.0010");
+        let hop = crate::cache::HopRow {
+            provider: "brightdata".into(),
+            code: "provider_timeout".into(),
+            ..Default::default()
+        };
+        let m = Meta {
+            ok: false,
+            code: "provider_timeout".into(),
+            provider: String::new(),
+            cost: 0.0,
+            hops: vec![hop],
+            ..m
+        };
+        let r = search_row(&c, 5, &m);
+        assert!(
+            r.lean.starts_with("j5 search \"rust http\" · ! provider_timeout · - 1800ms ") && r.lean.contains(" · bd"),
+            "{}",
+            r.lean
+        );
     }
 
     /// The cache rule: young, same providers, every row ok; anything else reads again.
@@ -796,16 +1132,12 @@ mod tests {
     fn account_bang_rows_link() {
         let b = bin();
         let row = |p: &str, code: &str| Account { provider: p.into(), code: code.into(), ..Account::default() };
-        // The fetch row's text (buys, price, every variable), `setup` never pointing at itself
-        assert_eq!(
-            account_rows(&row("oxy", "no_key"), None),
-            [format!(
-                "! no_key oxy · would try no-JS fetch + JS render ≤$0.0025 · set OXYLABS_WEB_API_KEY → {b} setup · oxy https://dashboard.oxylabs.io/en/registration"
-            )]
-        );
+        // The fetch row's text (buys, price, every variable) and its key form; `setup` never pointing at itself
+        let oxy = "! no_key oxy · would try no-JS fetch + JS render ≤$0.0025 · set OXYLABS_WEB_API_KEY";
+        assert_eq!(account_rows(&row("oxy", "no_key"), None), [format!("{oxy} → {b} setup oxy")]);
         let bd = "! no_key bd · would try unblock+JS ≤$0.0015 · set BRIGHTDATA_API_KEY + BRIGHTDATA_UNLOCKER_ZONE";
         let page = " · bd https://brightdata.com/cp/start";
-        assert_eq!(account_rows(&row("bd", "no_key"), None), [format!("{bd} → {b} setup{page}")]);
+        assert_eq!(account_rows(&row("bd", "no_key"), None), [format!("{bd} → {b} setup bd")]);
         assert_eq!(no_key_rows("bd", true), [format!("{bd}{page}")]);
         assert_eq!(
             account_rows(&row("oxy", "bad_key"), None),
@@ -832,8 +1164,8 @@ mod tests {
         assert_eq!((rows(0.999), rows(1.0)), (1, 1), "prints as $1.00: not low");
     }
 
-    /// A scoped key's missing reads are named by endpoint, never by the wording of its `what` (review 2026-10-14
-    /// #15): every Bright Data read has its word, and each word lands in its own place.
+    /// A scoped key's missing reads are named by endpoint, never by the wording of its `what`: every Bright Data read
+    /// has its word, and each word lands in its own place.
     #[test]
     fn scoped_reads_by_endpoint() {
         let calls = account_calls(Tier::Bd, ("a", "b"), Some("z"));
@@ -847,5 +1179,118 @@ mod tests {
         let row = account_rows(&a, None).concat();
         assert!(row.starts_with("bd  key ok (scoped: no zones api, no requests api) · n/a left · "), "{row}");
         assert!(row.contains(" · requests no permission · zones: zones no permission"), "{row}");
+    }
+
+    /// The ISO week, its year included: 2027-01-01 is a Friday of 2026's week 53.
+    #[test]
+    fn weeks_are_iso() {
+        assert_eq!((week_of(1_792_497_600.0), week_of(1_798_804_800.0)), ("2026-W43".into(), "2026-W53".into()));
+    }
+
+    /// A panic's count key: our file under `src/`, its line and the message's leading lowercase words, cut before
+    /// any value; std's and a dependency's panics are not ours.
+    #[test]
+    fn crash_keys_hold_no_values() {
+        let k = |f: &str, m: &str| crash_key(f, 412, m, 48);
+        let oob = k("src/outline.rs", "index out of bounds: the len is 3 but the index is 5");
+        assert_eq!(oob.as_deref(), Some("outline.rs:412 index out of bounds"));
+        assert_eq!(k("src\\outline.rs", "index out of bounds").as_deref(), Some("outline.rs:412 index out of bounds"));
+        assert_eq!(k("src/cli.rs", "https://secret.example/q?x=1 broke").as_deref(), Some("cli.rs:412 https"));
+        assert_eq!(
+            k("src/cli.rs", "byte index 9 is not a char boundary; it is inside 'é'").as_deref(),
+            Some("cli.rs:412 byte index")
+        );
+        assert_eq!(k("src/cli.rs", "Hidden ").as_deref(), Some("cli.rs:412"));
+        assert_eq!(k("src/cli.rs", "attempt 2 add with overflow").as_deref(), Some("cli.rs:412 attempt"));
+        assert_eq!(crash_key("src/cli.rs", 1, &"a".repeat(80), 5).as_deref(), Some("cli.rs:1 aaaaa"));
+        assert_eq!(k("/rustc/abc/library/core/src/slice/index.rs", "index out of bounds"), None);
+        assert_eq!(k("/Users/x/.cargo/registry/src/serde-1/src/de.rs", "oops"), None);
+    }
+
+    /// The host by its env marker, each one alone, the first in words.json order when several are set; `mcp`
+    /// first; no marker = `shell` on a terminal, else `unknown`.
+    #[test]
+    fn host_by_marker() {
+        let only = |k: &'static str| move |v: &str| v == k;
+        let got = ["CLAUDECODE", "CODEX_THREAD_ID", "PI_CODING_AGENT", "CURSOR_TRACE_ID"]
+            .map(|k| host_of(false, only(k), false));
+        assert_eq!(got, ["claude_code", "codex", "pi", "unknown"]);
+        assert_eq!(host_of(false, |k| k != "CLAUDECODE", true), "codex");
+        assert_eq!((host_of(true, |_| true, true), host_of(false, |_| false, true)), ("mcp", "shell"));
+    }
+
+    /// The summary from a seeded tally: calls per tier and provider (a cut call neither ok nor failed), codes from
+    /// our table only (anything else = `other`), the record's own code once, p50/p90, a PDF, a crash, every paid
+    /// provider and host listed; never a URL, query or path.
+    #[test]
+    fn weekly_counts_codes_only() {
+        let root = crate::scratch::Scratch::new("weekly");
+        let hop = |p: &str, code: &str, ms: u64, cost: f64, upto: f64| json!({"provider": p, "code": code, "ms": ms, "cost": cost, "upto": upto});
+        let page: Meta = serde_json::from_value(json!({"url": "https://secret.example/a", "provider": "oxylabs-js",
+            "ok": true, "kind": "pdf", "hops": [hop("plain", "js_shell", 300, 0.0, 0.0),
+            hop("oxylabs-js", "ok", 9000, 0.0015, 0.0), hop("brightdata", "abandoned", 9000, 0.0, 0.0015)]}))
+        .unwrap_or_default();
+        let failed: Meta = serde_json::from_value(json!({"url": "https://secret.example/b", "provider": "",
+            "code": "no_key", "hops": [hop("plain", "https://secret.example/b", 120, 0.0, 0.0)]}))
+        .unwrap_or_default();
+        let serp: Meta = serde_json::from_value(json!({"url": "search:secret words", "provider": "oxylabs",
+            "ok": true, "kind": "serp", "hops": [hop("oxylabs", "ok", 900, 0.001, 0.0)]}))
+        .unwrap_or_default();
+        crate::cache::tally(&root, &page, Some(2049)); // rounded to 2 significant digits
+        for (n, m) in [(100, &failed), (400, &serp)] {
+            crate::cache::tally(&root, m, Some(n));
+        }
+        crash(&root, "src/outline.rs", 7, "attempt to subtract with overflow", 48);
+        let w = weekly_of(&root, &week_of(now()));
+        assert_eq!(w["tier"]["plain"], json!({"ok": 0, "fail": 2, "billed": 0, "upto": 0}));
+        assert_eq!(w["tier"]["oxyjs"], json!({"ok": 1, "fail": 0, "billed": 1, "upto": 0}));
+        assert_eq!(w["tier"]["bd"], json!({"ok": 0, "fail": 0, "billed": 0, "upto": 1}));
+        assert_eq!(w["tier"]["oxy_search"]["billed"], 1);
+        assert_eq!(w["codes"], json!({"js_shell": 1, "no_key": 1, "other": 1}));
+        assert_eq!(
+            w["provider"],
+            json!({"bd": {"calls": 1, "served": 0, "search": 0},
+            "oxy": {"calls": 1, "served": 1, "search": 1}, "decodo": {"calls": 0, "served": 0, "search": 0}})
+        );
+        assert_eq!((w["tok"]["page"].clone(), w["cmd"]["pdf"].clone()), (json!({"p50": 400, "p90": 2000}), json!(1)));
+        assert_eq!(w["ms"], json!({"plain_p50": 0, "paid_p50": 9000}));
+        assert_eq!(w["crash"], json!({"outline.rs:7 attempt to subtract with overflow": 1}));
+        assert_eq!(w["host"].as_object().map(|h| h.len()), Some(6));
+        let text = w.to_string();
+        for leak in ["secret", "http", "search:", root.to_string_lossy().as_ref()] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+    }
+
+    /// The wire contract's caps, on the client too: a count at most 1,000,000, at most 32 crash spots and 64
+    /// entries a map, the biggest counts kept.
+    #[test]
+    fn weekly_caps_its_maps() {
+        let root = crate::scratch::Scratch::new("weekly-caps");
+        let rows =
+            (0..40).map(|i| (format!("crash\tcli.rs:{i} oops"), i)).chain((0..70).map(|i| (format!("codes\tc{i}"), i)));
+        let mut n: BTreeMap<String, u64> = rows.collect();
+        n.insert("cmd\tread".into(), 5_000_000);
+        n.insert("bogus\tx".into(), 1); // a key the summary has no place for: dropped
+        crate::cache::jsave(&root.join("telemetry/week/2026-W40.json"), &Week { n, ..Week::default() }).expect("tally");
+        let w = weekly_of(&root, "2026-W40");
+        let len = |k: &str| w[k].as_object().map(|m| m.len());
+        assert_eq!((len("crash"), len("codes"), w["cmd"]["read"].as_u64()), (Some(32), Some(64), Some(1_000_000)));
+        assert!(w["crash"].get("cli.rs:39 oops").is_some() && w["crash"].get("cli.rs:0 oops").is_none());
+        assert!(w.get("bogus").is_none(), "{w}");
+    }
+
+    /// A panic while the tally's lock is held (by the panicking thread, maybe) drops its count, never waits.
+    #[test]
+    fn a_crash_never_waits_for_the_tally() {
+        let root = crate::scratch::Scratch::new("crash-lock");
+        crash(&root, "src/cli.rs", 1, "first", 48);
+        let week = root.join("telemetry/week").join(format!("{}.json", week_of(now())));
+        let lock = std::fs::File::create(week.with_extension("lock")).expect("lock file");
+        lock.lock().expect("held");
+        crash(&root, "src/cli.rs", 2, "second", 48);
+        drop(lock);
+        let w: Week = jload(&week).unwrap_or_default();
+        assert_eq!(w.n.keys().collect::<Vec<_>>(), ["crash\tcli.rs:1 first"]);
     }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run a command with no network but loopback: CI's build, clippy and test steps after `cargo fetch --locked`, so a
 # build script or proc-macro that opens a socket or looks up a name fails. `--offline` alone only stops cargo
-# itself from fetching. New file; replaces CI's false "builds offline, so no build script can reach the network".
+# itself from fetching.
 #   macOS: sandbox-exec, outbound IP denied except localhost, the mDNSResponder socket denied (no name lookups).
 #          Verified 2026-10-14 (macOS 26.5): curl and getaddrinfo fail, loopback works, the build and all tests pass.
 #   Linux: a fresh network namespace (only `lo`, brought up) made as root, then the command as the calling user.

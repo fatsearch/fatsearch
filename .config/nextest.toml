@@ -1,0 +1,19 @@
+# Tests that assert a wall-clock bar (a pace, a wait, a cut) run one at a time: on a 2-core runner, two of
+# them side by side starve each other and miss a bar the code meets. The other tests still run in parallel.
+# `cargo nextest show-config test-groups --features fake` lists the members.
+[test-groups]
+timing = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = """
+test(=a_batch_runs_in_lanes)
+| test(=wait_zero_is_instant_and_keeps_words)
+| test(=any_one_key_gets_the_page)
+| test(=pending_promises_the_sessions_median)
+| test(=a_paced_batch_waits_and_spends_nothing)
+| test(=a_new_host_is_paced_from_its_first_start)
+| test(=a_dead_runs_cost_outlives_its_run_dir)
+| test(=provider::tests::plain_calls_to_one_host_are_paced)
+| test(=mcp::tests::huge_header_is_refused_fast)
+"""
+test-group = "timing"

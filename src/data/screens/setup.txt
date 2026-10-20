@@ -1,0 +1,98 @@
+§ free
+Free fetch
+ ╭─ Free fetch
+ │ Status  {status}
+ │ Gets    most pages: docs, blogs, news, Wikipedia, GitHub, PDFs
+ │ Can't   bot walls, JS-only pages, web search, sites that block home IPs
+ │         → that's what the paid providers add (their IPs, not yours)
+ ╰─
+   Good to know
+   Free fetch reads pages from your own internet connection: sites see your home IP.
+   Some sites block it or show a bot check; then fats says so and points to a provider.
+   Off = every page goes through your paid provider: never your IP, but paid per page.
+§ provider
+{name}
+ ╭─ {name}
+ │ Status  {status}
+ │ Rank    {rank}
+ │ Free    {free}
+ │ Cost    {cost} · paid to them · the key stays on this computer
+ ╰─
+   How it works
+   1  Open the key page (no account? register first, ~1 min: {signup})
+   2  {step}
+   3  Paste it back here
+§ mcp
+Agent connection (MCP)
+ ╭─ Agent connection (MCP)
+ │ Status  {status}
+ │ What    lets Claude Code, Codex or Cursor use fats by itself
+ │ Do      add it once (below), then ask: “read example.com”
+ │         runs only while your agent runs · no server, no account
+ ╰─
+   Add it to your agent once (copy the line)
+   Claude Code  claude mcp add --scope user fats -- fats mcp
+   Codex        codex mcp add fats -- fats mcp
+   Cursor       ~/.cursor/mcp.json: { "mcpServers": { "fats": { "command": "fats", "args": ["mcp"] } } }
+§ done
+Done
+ ╭─ Done
+ │         FATSEARCH is set up. Close setup and go back to the terminal.
+ │         Keys are saved on this computer. Change them any time: {b} setup
+ │         Free fetch always works, with or without keys.
+ │
+ ╰─
+   fats works without keys (plain fetch, $0). Keys add walled pages, JS pages and web search.
+§ intro
+FATSEARCH is ready: free fetch works already. Want more? Oxylabs (#1) or Decodo, both $5 free.
+§ agent
+= setup {short} · waiting for the key at {url} · 10 min · $0
+tell the user (never ask for the key in chat):
+1. open {mint}  (no account yet: {signup})
+2. {step}. Do NOT paste it in this chat.
+3. open {url} , paste the key, press Save
+then: {b} setup   (when the user says done; end your turn, do not poll · checks it, $0)
+browser not on this machine (SSH)? put the key in the agent's environment as {env}=<key> instead
+§ telemetry
+Telemetry
+ ╭─ Telemetry
+ │ Status  {status}
+ │ Never   URLs, searches, page text, files, keys, your IP, any id
+ │ Sent    fatsearch version, OS, which package (npm, Homebrew, cargo…), commands used, errors,
+ │         which providers worked, crashes in our code
+ ╰─
+   Help improve FATSEARCH!
+   We never collect private data. Would you like to share anonymous usage counts (no URLs, searches or keys; crashes as file:line) to help us prioritize features and fixes?
+   See exactly what's sent: {b} telemetry show
+§ settings
+Settings
+ ╭─ Settings
+ │ Status  {status}
+ │ What    how agents reach fats, where pages are kept, what this session spent,
+ │         what fats shares
+ │ Do      Enter opens the list · ← back here
+ ╰─
+§ cache
+Cache
+ ╭─ Cache
+ │ Status  {status}
+ │ What    the pages and searches fats read: a second read is $0 and instant
+ │ Swept   a page once its time is up, read or not: nothing to clean by hand
+ │ Change  the place: FATS_CACHE=<dir> · every setting: {b} config
+ ╰─
+§ stats
+Stats
+ ╭─ Stats
+ │ Status  {status}
+ │ What    every page and search of this session: provider, time, cost, tokens
+ │ Money   every session, the last 24 h and all time: {b} stats
+ │ More    every field: {b} stats full · rows naming a site: {b} stats <word>
+ ╰─
+§ back
+← Back
+ ╭─ ← Back
+ │         Back to the provider list.
+ │
+ │
+ │
+ ╰─

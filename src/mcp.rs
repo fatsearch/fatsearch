@@ -17,7 +17,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 /// The tool description: one line + two examples (~60 tokens) for clients that drop `instructions`.
 pub const DESCRIPTION: &str = "Web pages, PDFs and local documents as small cached Markdown with ids. \
 cmd = one fats command line, e.g. `https://example.com/menu.pdf` (fetch → outline with ids) or \
-`u1#3` / `u1 tuna price` (read section 3 / the lines with those words).";
+`u1#3` / `u1 tuna price` (read section 3 / the lines with those words). First time? Call fats(\"guide\").";
 
 /// Sent once at `initialize`: the card plus how to read the replies.
 pub fn instructions() -> String {
@@ -27,7 +27,8 @@ pub fn instructions() -> String {
          Every reply starts with a `=` line (what happened, which id); ids it prints (u1, u1#3, l4) are what the \
          next cmd takes. A `!` row names what failed and, after →, the command that fixes it. Pages stay cached \
          in this session: re-reading u1#3 fetches nothing. Local files: the working directory and the cache only. \
-         `guide` prints the card; an empty cmd prints the status."
+         An empty cmd prints the status. Anonymous usage stats (no URL, search or key): \
+         `fats telemetry show` = what is sent · off: `fats setup telemetry off`.\n\nFirst time? Call fats(\"guide\")"
     )
 }
 
@@ -71,12 +72,13 @@ impl ServerHandler for Fats {
         let Some(cmd) = req.arguments.as_ref().and_then(|a| a.get("cmd")).and_then(|v| v.as_str()) else {
             return Err(ErrorData::invalid_params("arguments.cmd: want a string, e.g. u1#3", None));
         };
-        let cmd = cmd.to_string();
+        let (cmd, asked) = (vec![cmd.to_string()], vec![cmd.to_string()]);
         // `cli::run` blocks (and runs its own fetch runtime), so it gets a blocking thread
-        let (text, rc, image) = tokio::task::spawn_blocking(move || crate::cli::run(&[cmd]))
+        let (text, rc, image) = tokio::task::spawn_blocking(move || crate::cli::run(&cmd))
             .await
             .map_err(|e| ErrorData::internal_error(format!("fats crashed: {e}"), None))?;
-        tokio::task::spawn_blocking(crate::cache::sweep); // the cache lifetime, off the answer's path
+        // the cache sweep, the notice (stderr, never in the answer), the update check: off the answer's path
+        tokio::task::spawn_blocking(move || crate::telemetry::tick(&asked));
         // pixels only when the command asked (`u1 m1`), after the line that says their cost; never
         // `structuredContent` beside them (Claude Code drops image blocks when it is set, issue 54737); a saved
         // file Claude cannot read as pixels (avif, heic, …, or one that does not decode) is said, never dropped
@@ -137,11 +139,12 @@ pub fn serve() -> i32 {
 mod tests {
     use super::*;
 
-    fn saved(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("fats-mcp-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+    /// `bytes` saved as `name` in a scratch dir of its own: (the dir, removed on drop; the file).
+    fn saved(name: &str, bytes: &[u8]) -> (crate::scratch::Scratch, std::path::PathBuf) {
+        let dir = crate::scratch::Scratch::new(&format!("mcp-{name}"));
         std::fs::write(dir.join(name), bytes).expect("write");
-        dir.join(name)
+        let file = dir.join(name);
+        (dir, file)
     }
 
     /// A noisy PNG that fits the view (1000x1000) but not Bedrock's 5 MB of base64 goes as a JPEG of the same size.
@@ -155,7 +158,7 @@ mod tests {
         let mut png = std::io::Cursor::new(Vec::new());
         noisy.write_to(&mut png, image::ImageFormat::Png).expect("png");
         assert!(png.get_ref().len() > 3_700_000, "the raw file is over the cap");
-        let (b64, mime) = pixels(&saved("noisy.png", png.get_ref())).expect("pixels");
+        let (b64, mime) = pixels(&saved("noisy.png", png.get_ref()).1).expect("pixels");
         assert_eq!(mime, "image/jpeg");
         assert!(b64.len() < 5_000_000, "{} B of base64", b64.len());
     }
@@ -170,12 +173,12 @@ mod tests {
         let crc = crc32(&png[12..29]);
         png[29..33].copy_from_slice(&crc.to_be_bytes());
         let t0 = std::time::Instant::now();
-        assert!(pixels(&saved("huge.png", &png)).is_none());
+        assert!(pixels(&saved("huge.png", &png).1).is_none());
         assert!(t0.elapsed().as_millis() < 500, "{:?}", t0.elapsed());
         // a real file past the side cap is not decoded either
         let mut wide = std::io::Cursor::new(Vec::new());
         image::GrayImage::new(12_001, 1).write_to(&mut wide, image::ImageFormat::Png).expect("png");
-        assert!(pixels(&saved("wide.png", wide.get_ref())).is_none());
+        assert!(pixels(&saved("wide.png", wide.get_ref()).1).is_none());
     }
 
     /// PNG chunk CRC (ISO 3309, as the PNG spec gives it).

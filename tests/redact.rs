@@ -1,9 +1,13 @@
 //! No provider answer and no key is ever printed: the provider calls run in-process against a fake transport
 //! (`fats::provider::fake`, no network) that answers like a provider that echoes the key (ScrapingBee's 401
 //! does), and every line goes through the one printer and its redactor. One process, one cache; the tests
-//! take turns (`lock`) because they share it.
+//! take turns (`lock`) because they share it, each in it fresh, removed after (`Scratch`).
+
+#[path = "../src/scratch.rs"]
+mod scratch;
 
 use fats::provider::{Api, Reply};
+use scratch::Scratch;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -20,6 +24,8 @@ static ACCOUNT: AtomicU8 = AtomicU8::new(0);
 static JS: AtomicUsize = AtomicUsize::new(0);
 /// Oxylabs scrapes of a `/slowq` page (150 ms each), with when each started: a batch's runs in flight.
 static LANES: Mutex<Vec<(String, std::time::Instant)>> = Mutex::new(Vec::new());
+/// When `walled()` read each request.
+static HITS: Mutex<Vec<std::time::Instant>> = Mutex::new(Vec::new());
 
 /// The Oxylabs key: random-looking, as real keys are.
 const OXY: &str = "oxyK3y-7f9QzR2mWb5Lp8TnVc";
@@ -29,7 +35,7 @@ const JUNK: &str = "<html><body><pre>Traceback (most recent call last): {\"debug
     exploded\"}</pre></body></html>";
 
 fn dir() -> PathBuf {
-    std::env::temp_dir().join(format!("fats-redact-{}", std::process::id()))
+    Scratch::path("redact")
 }
 
 /// Bright Data's refusal message: sent in a header, never stored or printed.
@@ -46,10 +52,11 @@ const ACCT: &str = "8675309001";
 const GH: &str = "ghp_f4keT0kenQx8LmZr2Wv9";
 
 /// What the providers answer, by the target URL (or query) in the request: `/401` echoes the key in a 401,
-/// `/500` sends junk with the key in it, `/long` an Oxylabs page that passes the content check, `govblock` is Bright Data's 200 + empty body + `x-brd-error`, `/empty`
-/// a bare 200 with nothing, `/ok` and `okq` an Oxylabs page and search, `burst` a 429 `RATE_LIMIT_EXCEEDED`
-/// (`burst now` with `retry-after: 7`), `quota` a 429 without that title; anything else answers 401. Every Oxylabs
-/// answer carries rate-limit headers with an account number and a bucket name in the header names.
+/// `/500` sends junk with the key in it, `/long` an Oxylabs page that passes the content check, `govblock` is Bright
+/// Data's 200 + empty body + `x-brd-error`, `/empty` a bare 200 with nothing, `/ok` and `okq` an Oxylabs page and
+/// search, `burst` a 429 `RATE_LIMIT_EXCEEDED` (`burst now` with `retry-after: 7`), `quota` a 429 without that title;
+/// anything else answers 401. Every Oxylabs answer carries rate-limit headers with an account number and a bucket name
+/// in the header names.
 fn provider(api: Api, key: &str, req: &Value) -> Reply {
     CALLS.fetch_add(1, Ordering::SeqCst);
     let target = req["url"]
@@ -67,8 +74,11 @@ fn provider(api: Api, key: &str, req: &Value) -> Reply {
     if api == Api::OxyScrape && target.contains("/slowq/") {
         LANES.lock().unwrap_or_else(|e| e.into_inner()).push((target.into(), std::time::Instant::now()));
     }
+    if api == Api::DecodoScrape {
+        return decodo_reply(key, req, target);
+    }
     let fake = pdf_reply(api, req, target).or_else(|| prefetch_reply(api, target)).or_else(|| gh_login(api, target));
-    if let Some(r) = fake.or_else(|| one_key(api, req, target)) {
+    if let Some(r) = fake.or_else(|| one_key(api, req, target)).or_else(|| doh(api, req, target)) {
         return r;
     }
     // `/huge-status`: a `status_code` past u16 (65940 mod 65536 = 404)
@@ -159,6 +169,12 @@ fn fixture(f: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
 }
 
+/// `/500esc`: a JSON answer echoing the key in `\u00XX` escapes and upper-cased.
+fn escaped_echo(key: &str) -> String {
+    let esc: String = key.chars().map(|c| format!("\\u{:04x}", c as u32)).collect();
+    format!(r#"{{"detail":"bad key {esc} {}"}}"#, key.to_uppercase())
+}
+
 fn reply(api: Api, key: &str, target: &str) -> Reply {
     let limited = r#"{"status":429,"title":"RATE_LIMIT_EXCEEDED","detail":"Too many requests."}"#;
     let mode = ACCOUNT.load(Ordering::SeqCst);
@@ -193,8 +209,6 @@ fn reply(api: Api, key: &str, target: &str) -> Reply {
             let html = format!("<html><head><title>Learned Route Works</title></head><body><h1>Learned Route Works</h1><p>{p}</p></body></html>");
             (200, vec![], serde_json::json!({"results": [{"html": html}]}).to_string())
         }
-        // the second resolver: `dead.*` does not exist, every other name does
-        (Api::Doh, t) => (200, vec![], format!(r#"{{"Status":{}}}"#, if t.starts_with("dead.") { 3 } else { 0 })),
         // `/vanished`: Bright Data brings the site's 404 at once; Oxylabs takes 3 s (`x-fake-delay-ms`)
         (Api::BdRequest, t) if t.contains("/vanished") => {
             (200, vec![], r#"{"status_code":404,"headers":{},"body":"<html><body>Not here</body></html>"}"#.into())
@@ -207,8 +221,8 @@ fn reply(api: Api, key: &str, target: &str) -> Reply {
         }
         // `/stall`: both providers answer after 3 s (past `timeout:1`); bd's `/vanished` matched above
         (Api::OxyScrape | Api::BdRequest, t) if t.contains("/vanished") || t.contains("/stall") => (200, h(&[("x-fake-delay-ms", "3000")]), r#"{"results":[{"html":"<html>late</html>"}]}"#.into()),
-        // `/slow`: a good page after 2 s (a fetch past `wait:`); `/slow6` after 6 s (past the old default 5 s); `/slowq`
-        // after 150 ms (a batch's lanes)
+        // `/slow`: a good page after 2 s (a fetch past `wait:`); `/slow6` after 6 s (past a batch's `wait:3`);
+        // `/slowq` after 150 ms (a batch's lanes)
         (Api::OxyScrape, t) if t.contains("/slow") => {
             let ms = if t.contains("/slow6") { "6000" } else if t.contains("/slowq") { "150" } else { "2000" };
             let html = format!("<html><head><title>Slow Page</title></head><body><h1>Slow Page</h1><p>{}</p></body></html>", "A page that comes late still comes whole, with every number: 12 apples, 3 pears. ".repeat(12));
@@ -224,6 +238,7 @@ fn reply(api: Api, key: &str, target: &str) -> Reply {
         (_, "burst now") => (429, h(&[("retry-after", "7")]), limited.into()),
         (_, t) if t.contains("burst") => (429, vec![], limited.into()),
         (_, "quota") => (429, vec![], r#"{"status":429,"title":"SOMETHING_ELSE"}"#.into()),
+        (_, t) if t.contains("/500esc") => (500, vec![], escaped_echo(key)),
         (_, t) if t.contains("/500") => (500, vec![], format!("{JUNK} key={key}")),
         (Api::BdRequest, t) if let Some(c) = BRD.iter().find(|c| t.contains(c.0)) => {
             (200, h(&[("x-brd-error", BD_REFUSAL), ("x-brd-error-code", c.1), ("x-brd-status-code", "403")]), String::new())
@@ -245,7 +260,8 @@ fn prefetch_reply(api: Api, target: &str) -> Option<Reply> {
             let hits: Vec<Value> = urls.iter().map(|u| serde_json::json!({"url": u, "title": "R"})).collect();
             serde_json::json!({"results": hits}).to_string()
         }
-        // `shellq`: two pages on the local wall (plain 403); Oxylabs without JS sends an empty shell, Bright Data the page
+        // `shellq`: two pages on the local wall (plain 403); Oxylabs without JS sends an empty shell, Bright Data the
+        // page
         (Api::OxySearch, t) if t.starts_with("shellq") => {
             let hit = |i: usize| serde_json::json!({"url": format!("{}/shell{i}-{}", walled(), t.replace(' ', "-")), "title": "R"});
             serde_json::json!({"results": [hit(1), hit(2)]}).to_string()
@@ -325,10 +341,28 @@ fn one_key(api: Api, req: &Value, target: &str) -> Option<Reply> {
             });
         }
         "kq" => r#"{"results":[{"url":"https://ex.com/oxyk","title":"From Oxy"}]}"#.to_string(),
+        // `/k-capslow`: plain's captcha, Oxylabs without JS past its 10 s cut
+        t if t.contains("/k-capslow") && !render => {
+            let late = vec![("x-fake-delay-ms".to_string(), "12000".to_string())];
+            return Some(Reply { status: 200, headers: late, body: br#"{"results":[{"html":"late"}]}"#.to_vec() });
+        }
         t if t.contains("/k-wall") && !render => {
             "<html><head><title>Just a moment...</title></head><body></body></html>".into()
         }
-        t if (t.contains("/k-shell") || t.contains("/k-sherr")) && (api == Api::BdRequest || !render) => shell.into(),
+        t if t.contains("/k-sh") && (api == Api::BdRequest || !render) => shell.into(),
+        // `/k-sh400`: the Oxylabs render refuses the target (its RFC 9457 400); `/k-shfault`: its
+        // own retries gave up (500 `faulted`)
+        t if t.contains("/k-sh400") || t.contains("/k-shfault") => {
+            let (status, body) = if t.contains("/k-sh400") {
+                (
+                    400,
+                    r##"{"title":"INVALID_BODY_PROPERTY","errors":[{"detail":"Value not supported.","pointer":"#/url"}]}"##,
+                )
+            } else {
+                (500, r#"{"status":500,"title":"REQUEST_FAILED_AFTER_TOO_MANY_RETRIES","state":"faulted"}"#)
+            };
+            return Some(Reply { status, headers: vec![], body: body.into() });
+        }
         // `/k-sherr`: Bright Data's shell, the Oxylabs render's first call a 500 (Instagram)
         t if t.contains("/k-flaky") || t.contains("/k-sherr") => {
             let mut seen = FLAKY.lock().unwrap_or_else(|e| e.into_inner());
@@ -347,7 +381,50 @@ fn one_key(api: Api, req: &Value, target: &str) -> Option<Reply> {
         (Api::BdRequest, _) => serde_json::json!({"status_code": 200, "headers": {}, "body": html}).to_string(),
         _ => serde_json::json!({"results": [{"html": html}]}).to_string(),
     };
-    Some(Reply { status: 200, headers: vec![], body: body.into_bytes() })
+    // `/k-wall/late…`: Bright Data serves after the default 5 s hedge, the Oxylabs render at once
+    let late =
+        (api == Api::BdRequest && target.contains("/k-wall/late")).then(|| ("x-fake-delay-ms".into(), "5600".into()));
+    Some(Reply { status: 200, headers: late.into_iter().collect(), body: body.into_bytes() })
+}
+
+/// The second resolver's answer to a `kind` (A, AAAA) question: `dead.*` does not exist (NXDOMAIN), `mute.*` gets
+/// no verdict (SERVFAIL), `down.*` none either (the resolver unreachable: a 503), `void.*` exists with no address
+/// (NODATA), `six.*` has an AAAA only, every other name an A.
+fn doh(api: Api, req: &Value, name: &str) -> Option<Reply> {
+    let kind = req["type"].as_str().filter(|_| api == Api::Doh)?;
+    if name.starts_with("down.") {
+        return Some(Reply { status: 503, headers: vec![], body: b"unavailable".to_vec() });
+    }
+    let rcode = [("dead.", 3), ("mute.", 2)].iter().find(|r| name.starts_with(r.0)).map_or(0, |r| r.1);
+    let has = match kind {
+        "A" => !name.starts_with("void.") && !name.starts_with("six."),
+        _ => name.starts_with("six."),
+    };
+    let ty = if kind == "A" { 1 } else { 28 };
+    let answer = if has { format!(r#","Answer":[{{"name":"{name}","type":{ty},"data":"x"}}]"#) } else { String::new() };
+    Some(Reply { status: 200, headers: vec![], body: format!(r#"{{"Status":{rcode}{answer}}}"#).into_bytes() })
+}
+
+/// The Decodo key (`DECODO_AUTH_TOKEN`).
+const DECODO: &str = "dcd0Tok-Vb7nQ2xLm9RwZ4kP";
+
+/// Decodo's Web Data API: a wrong key = its 401 echoing it; the key check's dead host = its 400; `/k-…` pages the
+/// one-key pages (`k-wall`: a wall without `headless`); `/d5xx`: the site's 502 relayed without JS, Decodo's own
+/// 500 with it. Every answer is `results[0].{content, status_code, url, headers}`.
+fn decodo_reply(key: &str, req: &Value, target: &str) -> Reply {
+    let js = req["headless"] == "html";
+    let echo = |status| Reply { status, headers: vec![], body: format!("{JUNK} token={key}").into_bytes() };
+    let (status, html) = match target {
+        _ if key != DECODO => return echo(401),
+        fats::provider::NO_HOST => return echo(400),
+        t if t.contains("/d5xx") && js => return echo(500),
+        t if t.contains("/d5xx") => (502, "<html><body>Bad gateway</body></html>".to_string()),
+        t if t.contains("/k-wall") && !js => (403, "<html><head><title>Just a moment...</title></head></html>".into()),
+        t if t.contains("/k-") => (200, html_page("Decodo Page", &"Decodo fetched this page whole. ".repeat(20))),
+        _ => return echo(401),
+    };
+    let r = serde_json::json!({"content": html, "status_code": status, "url": target, "headers": {"x-site": "1"}});
+    Reply { status: 200, headers: vec![], body: serde_json::json!({"results": [r]}).to_string().into_bytes() }
 }
 
 const PDF: &[u8] = include_bytes!("fixtures/three-pages.pdf");
@@ -380,8 +457,8 @@ fn escaped(mut b: &[u8]) -> String {
 }
 
 /// PDF URLs on the local server (`walled`): `paper.pdf` Oxylabs sends escaped; `page.pdf` (and `/pdf/page`, no
-/// suffix) Oxylabs answers with a sign-in page, Bright Data with the file; `cut.pdf` both send the cut file. Bright Data sends bytes only when
-/// asked for `format: raw` (its JSON string is a lossy copy).
+/// suffix) Oxylabs answers with a sign-in page, Bright Data with the file; `cut.pdf` both send the cut file. Bright
+/// Data sends bytes only when asked for `format: raw` (its JSON string is a lossy copy).
 fn pdf_reply(api: Api, req: &Value, target: &str) -> Option<Reply> {
     let page = "<html><head><title>Sign in</title></head><body>Sign in to read</body></html>";
     let file = match target.rsplit('/').next()? {
@@ -427,6 +504,7 @@ fn walled() -> String {
                 let n = c.read(&mut buf).unwrap_or(0);
                 let head = String::from_utf8_lossy(&buf[..n]);
                 let path = head.split(' ').nth(1).unwrap_or_default().to_string();
+                HITS.lock().unwrap_or_else(|e| e.into_inner()).push(std::time::Instant::now());
                 let guide = html_page("Merge PDF files", &"Pick the files, drop them here and merge them into one. ".repeat(12));
                 // `/shell`: an app shell (200, a title the body never shows) to any client
                 let shell = "<html><head><title>Loading workspace dashboard</title></head><body><div id=\"root\">\
@@ -447,6 +525,8 @@ fn walled() -> String {
                     ("200 OK", "text/html", d.as_bytes())
                 } else if path.contains("/i/flow/onboarding") {
                     ("200 OK", "text/html", LOGIN_SHELL.as_bytes())
+                } else if path.contains("/k-capslow") {
+                    ("403 Forbidden", "text/html", b"<html><body><div id=px-captcha></div></body></html>".as_slice())
                 } else if path.ends_with("shell") || path.contains("/land/") {
                     ("200 OK", "text/html", shell.as_bytes())
                 } else if path.ends_with("/report.docx") {
@@ -468,12 +548,68 @@ fn walled() -> String {
                     "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\n{signal}{to}content-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
                 );
-                c.write_all(h.as_bytes()).and_then(|_| c.write_all(body)).ok();
+                let (late, out) = (late_ms(&path), [h.as_bytes(), body].concat());
+                std::thread::spawn(move || (std::thread::sleep(std::time::Duration::from_millis(late)), c.write_all(&out).ok()));
             }
         });
         base
     })
     .clone()
+}
+
+/// A loopback host whose https is refused for its certificate (self-signed, made at start: no key in the tree)
+/// and whose http answers `301` back to https on the same port, the shape of a host with an expired certificate.
+/// The first byte tells them apart (`0x16` = a TLS ClientHello). Returns the https base URL.
+fn bad_cert() -> String {
+    static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        use btls::{asn1::Asn1Time, ec, hash::MessageDigest, nid::Nid, pkey::PKey, ssl, x509};
+        use std::io::{Read, Write};
+        let key = ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).and_then(|g| ec::EcKey::generate(&g));
+        let key = key.and_then(PKey::from_ec_key).expect("key");
+        let mut name = x509::X509NameBuilder::new().expect("name");
+        name.append_entry_by_text("CN", "fats-test.invalid").expect("cn");
+        let name = name.build();
+        let mut cert = x509::X509::builder().expect("cert");
+        cert.set_version(2).expect("v3");
+        cert.set_subject_name(&name).and_then(|()| cert.set_issuer_name(&name)).expect("names");
+        cert.set_pubkey(&key).expect("pubkey");
+        let (from, to) = (Asn1Time::days_from_now(0).expect("now"), Asn1Time::days_from_now(1).expect("end"));
+        cert.set_not_before(&from).and_then(|()| cert.set_not_after(&to)).expect("dates");
+        cert.sign(&key, MessageDigest::sha256()).expect("sign");
+        let cert = cert.build();
+        let mut tls = ssl::SslAcceptor::mozilla_intermediate(ssl::SslMethod::tls()).expect("acceptor");
+        tls.set_private_key(&key).and_then(|()| tls.set_certificate(&cert)).expect("pair");
+        let tls = tls.build();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let host = format!("127.0.0.1:{}", l.local_addr().expect("addr").port());
+        let base = format!("https://{host}");
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut first = [0u8; 1];
+                if c.peek(&mut first).unwrap_or(0) == 1 && first[0] == 0x16 {
+                    // the client rejects the certificate mid-handshake: the server side's error is expected
+                    tls.accept(c).ok();
+                    continue;
+                }
+                let mut buf = [0u8; 4096];
+                let n = c.read(&mut buf).unwrap_or(0);
+                let path = String::from_utf8_lossy(&buf[..n]).split(' ').nth(1).unwrap_or("/").to_string();
+                let to = format!("location: https://{host}{path}");
+                let head =
+                    format!("HTTP/1.1 301 Moved Permanently\r\n{to}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                c.write_all(head.as_bytes()).ok();
+            }
+        });
+        base
+    })
+    .clone()
+}
+
+/// How long `walled()` holds a page: `/long/late…` and a `preq late…` search's results 1.5 s (the server free for
+/// other requests meanwhile), the rest none.
+fn late_ms(path: &str) -> u64 {
+    u64::from(path.contains("/long") && path.contains("late")) * 1500
 }
 
 /// Where `walled()`'s landings send the asked path back: (landing, how plain reads it). `/go/<n>-…` redirects to
@@ -499,7 +635,8 @@ fn landing(path: &str) -> Option<String> {
 /// description and a logo. `/md` and `/md-thin`: the
 /// server's Markdown when asked for it (`accept: text/markdown`), else HTML; `/md-thin`'s Markdown is a stub;
 /// `/md-only`: the same stub, and a 403 to an HTML ask; `/md-flat`: HTML to the first ask, then Markdown without
-/// a heading.
+/// a heading. `/latest`: a bare page whose one move is a meta refresh to a `/doc/` page (`/latest-5s`: after 5 s;
+/// `/latest-gone`: to a 403; `/moved/Release-Notes-20261020`: to the `/doc/` page of the same id).
 fn og_md(path: &str, md: bool) -> Option<(&'static str, String)> {
     static FLAT_MD: AtomicUsize = AtomicUsize::new(0);
     let shell = |meta: &str| {
@@ -518,6 +655,10 @@ fn og_md(path: &str, md: bool) -> Option<(&'static str, String)> {
     };
     if !og.is_empty() {
         return Some(("text/html", shell(&og)));
+    }
+    // `/oops`: an error page under a 200 (no script, none of its own words)
+    if path.ends_with("/oops") {
+        return Some(("text/html", "<html><head><title>Oops</title></head><body>Gone wrong.</body></html>".into()));
     }
     // `/long…`: a plain page that passes the content check (what a prefetch stores)
     if path.contains("/long") {
@@ -544,6 +685,16 @@ fn og_md(path: &str, md: bool) -> Option<(&'static str, String)> {
         "md-flat" if md && FLAT_MD.fetch_add(1, Ordering::SeqCst) > 0 => Some(("text/markdown", prose.repeat(3))),
         "md-flat" => Some(("text/html", html)),
         "md" | "md-thin" => Some(("text/html", html)),
+        last if matches!(last, "latest" | "latest-5s" | "latest-gone") || path.contains("/moved/") => {
+            let delay = if path.ends_with("5s") { 5 } else { 0 };
+            let to = match last {
+                "latest-gone" => "/w/gone".into(),
+                "latest" | "latest-5s" => "/w/doc/Announcing-The-Release".into(),
+                id => format!("/w/doc/{id}"),
+            };
+            let tag = format!("<meta http-equiv=\"refresh\" content=\"{delay}; url={to}\">");
+            Some(("text/html", format!("<html><head><title>Redirecting</title>{tag}</head><body></body></html>")))
+        }
         _ => None,
     }
 }
@@ -565,13 +716,44 @@ fn written() -> String {
     out
 }
 
+/// The variables a test under `lock` changes, each put back as it was when the guard drops.
+#[derive(Default)]
+struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+impl Env {
+    /// Sets `k` to `v`, or removes it on None.
+    fn set(&mut self, k: &'static str, v: Option<&str>) -> &mut Self {
+        if !self.0.iter().any(|(n, _)| *n == k) {
+            self.0.push((k, std::env::var_os(k)));
+        }
+        put(k, v.map(std::ffi::OsStr::new));
+        self
+    }
+}
+impl Drop for Env {
+    fn drop(&mut self) {
+        for (k, v) in std::mem::take(&mut self.0) {
+            put(k, v.as_deref());
+        }
+    }
+}
+/// The one environment write after `lock`'s first: `Env` only.
+#[expect(unsafe_code, reason = "under `lock`: every other test in this process waits; nextest runs one per process")]
+fn put(k: &str, v: Option<&std::ffi::OsStr>) {
+    // SAFETY: under `lock`, so no other thread of this process reads or writes the environment meanwhile
+    unsafe {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+}
+
 #[expect(unsafe_code, reason = "set_var once, before the first settings read, while every other test waits")]
-fn lock() -> MutexGuard<'static, ()> {
+fn lock() -> (Scratch, MutexGuard<'static, ()>) {
     static ONCE: Once = Once::new();
     static TURN: Mutex<()> = Mutex::new(());
     let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     ONCE.call_once(|| {
-        std::fs::remove_dir_all(dir()).ok();
         // SAFETY: set once, before the first settings read, while every other test in this process waits on
         // `TURN`; nothing else in the process reads the environment concurrently.
         unsafe {
@@ -583,13 +765,18 @@ fn lock() -> MutexGuard<'static, ()> {
             std::env::set_var("BRIGHTDATA_UNLOCKER_ZONE", "my_unlocker");
             std::env::set_var("GH_TOKEN", GH);
             std::env::set_var("FATS_ALLOW_PRIVATE", "1"); // plain fetches the local `walled` site
-            for k in ["FATS_OFFLINE", "FATS_JSON", "FATS_NOCACHE", "FATS_CHUNK"] {
+            // counted (full only), never sent: `telemetry::tick` runs in main and the MCP loop, neither here
+            std::env::set_var("FATS_TELEMETRY", "full");
+            std::env::set_var("FATS_PLAIN_HOST_PACE_MS", "0"); // unbraked: one test names it (`plain_host_pace_ms:`)
+            let quiet = ["CI", "BUILD_NUMBER", "TF_BUILD", "TEAMCITY_VERSION", "GITHUB_ACTIONS", "DO_NOT_TRACK"];
+            for k in ["FATS_OFFLINE", "FATS_JSON", "FATS_NOCACHE", "FATS_CHUNK"].into_iter().chain(quiet) {
                 std::env::remove_var(k);
             }
         }
         fats::provider::fake(provider);
     });
-    turn
+    // the dir goes before the turn does (a tuple drops in order)
+    (Scratch::new("redact"), turn)
 }
 
 fn run(cmd: &str) -> String {
@@ -619,7 +806,7 @@ fn no_tried_tier_in_fixes(out: &str) {
 
 /// Nothing a provider said and no key, in lines or JSON.
 fn clean(out: &str) {
-    for leak in [OXY, BD, GH, "Invalid api key", "Traceback", "exploded", "<pre>"] {
+    for leak in [OXY, BD, GH, DECODO, "Invalid api key", "Traceback", "exploded", "<pre>"] {
         assert!(!out.contains(leak), "printed {leak:?}: {out}");
     }
     assert!(!out.contains(&OXY[3..15]), "a 12-char run of the key: {out}");
@@ -654,6 +841,19 @@ fn refused_key_names_the_key_not_the_answer() {
     }
 }
 
+/// A key echoed in `\u00XX` escapes and upper-cased never reaches the kept answers: a JSON answer is masked as
+/// decoded, and the mask matches ASCII case-folded.
+#[test]
+fn an_escaped_or_upper_key_is_masked_when_kept() {
+    let _t = lock();
+    let out = run("https://ex.com/500esc provider:oxy");
+    let kept = written();
+    clean(&out);
+    let esc: String = OXY.chars().map(|c| format!("\\u{:04x}", c as u32)).collect();
+    assert!(kept.contains("bad key *** ***"), "both echoes masked: {out}");
+    assert!(!kept.contains(&esc) && !kept.to_lowercase().contains(&OXY.to_lowercase()), "no key kept");
+}
+
 /// (2) A 500 with HTML/JSON junk: one `!` row, the body never shown; kept (masked) in the snapshot's
 /// error.txt, mode 0600, and `fats stats` names the file.
 #[test]
@@ -663,7 +863,7 @@ fn error_body_is_kept_not_shown() {
     clean(&out);
     let rows: Vec<&str> = out.lines().skip(1).filter(|l| l.contains(" ! ")).collect();
     assert_eq!(rows.len(), 1, "{out}");
-    assert!(out.starts_with("= ") && rows[0].contains("! provider_error ex.com/500 → "), "{out}");
+    assert!(out.starts_with("= ") && rows[0].contains("! provider_error oxyjs 500 → "), "{out}");
     let stats = run("stats");
     clean(&stats);
     let (path, kept) = stats
@@ -779,7 +979,7 @@ fn bright_data_refusal_names_its_code() {
     let rate = format!("! rate_limited bd bucket_rate_limit → {b} u");
     assert!(
         out.contains("bd:rate_limited✗$0 (not charged)")
-            && out.lines().any(|l| l.contains(&rate) && l.ends_with(" fresh:true ≤$0.0040 (last try not charged)"))
+            && out.lines().any(|l| l.contains(&rate) && l.ends_with(" fresh:true ≤$0.0040 · last try not charged"))
             && !out.contains("nothing left"),
         "{out}"
     );
@@ -844,7 +1044,7 @@ fn dry_country_from_domain() {
 fn router_shown() {
     let config = run("config");
     assert!(!config.lines().any(|l| l.starts_with("route ")) && !config.contains("routes.json"), "{config}");
-    assert!(config.contains("FATS_CHUNK FATS_ACCOUNT_TTL FATS_ACCEPT_MD · status"), "{config}");
+    assert!(config.contains("FATS_ACCEPT_MD FATS_TELEMETRY FATS_TELEMETRY_DEBUG DO_NOT_TRACK · status"), "{config}");
     let b = fats::lang::bin();
     for want in [
         "\ntext text, json, xml bodies (by content type or start) served as they are, l<N> per line, 300 lines",
@@ -872,7 +1072,7 @@ fn a_wall_showing_the_page_serves_nothing() {
 }
 
 /// No learned start and no `js:true` site order:
-/// every page walks the whole ladder, `provider:auto` the same, `js:true` the table order at a fixed `~25s`, one
+/// every page walks the whole ladder, `provider:auto` the same, `js:true` the table order at a fixed `≈25s`, one
 /// provider at a time (its worst case = `up to`); `config` says so.
 #[test]
 fn every_page_walks_the_table_order() {
@@ -880,13 +1080,13 @@ fn every_page_walks_the_table_order() {
     for (mods, want) in [
         ("", "fetch plain → oxy (after a captcha) → bd ∥ oxyjs after 5s → new u"),
         ("provider:auto", "fetch plain → oxy (after a captcha) → bd ∥ oxyjs after 5s → new u"),
-        ("js:true", "fetch bd → oxyjs → new u1 · up to $0.0030 · ~25s · hedge:off, one provider at a time"),
+        ("js:true", "fetch bd → oxyjs → new u1 · up to $0.0030 · ≈25s · hedge:off, one provider at a time"),
         (
             "js:true provider:auto",
-            "fetch bd → oxyjs → new u1 · up to $0.0030 · ~25s · hedge:off, one provider at a time",
+            "fetch bd → oxyjs → new u1 · up to $0.0030 · ≈25s · hedge:off, one provider at a time",
         ),
     ] {
-        let dry = run(&format!("https://www.route.example/long {mods} dry:true"));
+        let dry = run(&format!("https://www.route.example.com/long {mods} dry:true"));
         assert!(dry.contains(want) && !dry.contains("route:") && !dry.contains("failed"), "{mods}: {dry}");
     }
     router_shown();
@@ -958,7 +1158,7 @@ fn account_refusals(file: &std::path::Path, n: usize) {
     assert!(!out.contains("again:") && out.contains(&format!("\ncalls: {b} account dry:true")), "{out}");
 }
 
-/// `fats account`: the saved answers → the oracle's rows; the 15-minute cache (hit, expired, `fresh:true`);
+/// `fats account`: the saved answers → the expected rows; the 15-minute cache (hit, expired, `fresh:true`);
 /// `dry:true` and status never call a provider; a refused key → the keys page, a low balance → the billing page;
 /// no key and no provider answer is printed or written.
 #[test]
@@ -1108,11 +1308,14 @@ fn og_card_serves_a_js_shell() {
     let out = run(&format!("{}/og-own", walled()));
     let head = out.lines().next().unwrap_or_default();
     assert!(head.contains(" NASA · 127.0.0.1 · 0 sections · 1 photo · ") && head.contains("tok · og plain"), "{out}");
-    assert!(head.contains("$0.0000 · ! js_shell → ") && head.contains(" js:true ≤$0.0030 ~25s"), "{out}");
+    assert!(
+        head.contains("$0.0000 · ! js_shell → ") && head.contains(" js:true · bd, then oxyjs ≤$0.0030 ≈25s"),
+        "{out}"
+    );
     assert!(out.lines().any(|l| l.starts_with("m1 photo jpg | (no alt) → http://127.0.0.1:")), "{out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), n, "the ladder stops at the card: {out}");
     let id = head.split_whitespace().nth(1).unwrap_or_default().rsplit('.').next().unwrap_or_default().to_string();
-    assert!(run("stats").contains("(og)"), "stats names the mode");
+    assert!(run("stats full").contains("(og)"), "stats names the mode");
     let rec: Value = serde_json::from_str(&run(&format!("{id} json"))).unwrap_or_default();
     assert_eq!(rec["mode"], "og", "the record names the mode");
     // a doc of another version is rebuilt from the stored body: the card again, never the shell's own text
@@ -1129,7 +1332,19 @@ fn og_card_serves_a_js_shell() {
     assert!(!again.lines().next().unwrap_or_default().contains(" og "), "{again}");
 }
 
-/// Never a card from the render (review 2026-10-14 #7): its shell is the render's own answer, and with the render
+/// The render arrow names the tier its `dry:true` would call: with only the Oxylabs key, `(oxyjs) ≤$0.0015`, never
+/// the both-keys route's bd price.
+#[test]
+fn og_card_arrow_names_the_render_tier() {
+    let _t = lock();
+    let mut env = Env::default();
+    env.set("BRIGHTDATA_API_KEY", None);
+    let out = run(&format!("{}/og-own fresh:true", walled()));
+    let head = out.lines().next().unwrap_or_default();
+    assert!(head.contains(" · ! js_shell → ") && head.ends_with(" js:true · oxyjs ≤$0.0015 ≈25s"), "{out}");
+}
+
+/// Never a card from the render: its shell is the render's own answer, and with the render
 /// spent a `! js_shell` would have no next step. The run fails as the shell it is.
 #[test]
 fn og_card_never_from_the_render() {
@@ -1151,13 +1366,13 @@ fn og_card_needs_the_pages_own_card() {
         let out = run(&format!("{}/{path}", walled()));
         assert!(!out.contains(" og plain") && CALLS.load(Ordering::SeqCst) > n, "{path}: {out}");
     }
-    // no og:title, a description and a logo (review 2026-10-14 #20): the gate cannot tell a site-wide card from
+    // no og:title, a description and a logo: the gate cannot tell a site-wide card from
     // the page's here, so it serves the card, but never as the whole page: the logo is not counted and the
     // render stays the next step
     let out = run(&format!("{}/og-logo", walled()));
     let head = out.lines().next().unwrap_or_default();
     assert!(head.contains(" 0 photos · ") && head.contains("tok · og plain"), "{out}");
-    assert!(head.contains(" · ! js_shell → ") && head.contains(" js:true ≤$"), "{out}");
+    assert!(head.contains(" · ! js_shell → ") && head.contains(" js:true · bd, then oxyjs ≤$"), "{out}");
 }
 
 /// A server's Markdown (`Accept: text/markdown` on plain): cleaned as a page, `md` on the `=` line, headings as
@@ -1178,12 +1393,12 @@ fn server_markdown_is_a_page() {
         out.contains("the limits [l1]") && out.contains("pricing [l2]") && !out.contains("not a heading ("),
         "{out}"
     );
-    assert!(run("stats").contains("(md)") && run("stats").contains(" · signal ai-train=yes, search=yes · "));
+    assert!(run("stats full").contains("(md)") && run("stats full").contains(" · signal ai-train=yes, search=yes · "));
     let thin = run(&format!("{}/md-thin", walled()));
     let head = thin.lines().next().unwrap_or_default();
     assert!(head.contains(" 4 sections · 0 photos · ") && head.contains(" plain✓md:thin "), "{thin}");
     assert!(!head.contains(" md "), "the HTML is served: {thin}");
-    // the HTML ask failing keeps the Markdown copy (review 2026-10-14 #14): served, no paid tier
+    // the HTML ask failing keeps the Markdown copy: served, no paid tier
     let n = CALLS.load(Ordering::SeqCst);
     let only = run(&format!("{}/md-only", walled()));
     let head = only.lines().next().unwrap_or_default();
@@ -1238,8 +1453,8 @@ fn pdf_path_is_a_hint() {
 
 /// Words that look like commands never become a paid search: `status`, `ls`, `--version` run as commands, a typo
 /// one edit from one (`stat`, `acount`) asks, and so does a first word up to two edits from one before a URL or
-/// id (`fetchh https://x`, the dogfood row that ran a paid site search), a `file:` URL is a local path. A query that holds a configured key
-/// is refused before any provider (or jobs.json) sees it.
+/// id (`fetchh https://x` once ran a paid site search), a `file:` URL is a local path. A query that
+/// holds a configured key is refused before any provider (or jobs.json) sees it.
 #[test]
 fn command_like_words_never_search() {
     let _t = lock();
@@ -1285,10 +1500,34 @@ fn dead_host_is_final() {
     assert!(dry.contains("! no_host") && !dry.contains("fetch plain"), "{dry}");
     let out = run("https://alive.invalid/long");
     assert!(out.starts_with("= j") && out.contains("Learned Route Works") && out.contains("oxyjs✓"), "{out}");
+    // NODATA (the name exists, no A, no AAAA) is no address either: `no_host` at once, no ladder, no http arrow
+    let (calls, t0) = (CALLS.load(Ordering::SeqCst), std::time::Instant::now());
+    let (out, rc) = run_rc("https://void.ex.com/page wait:30");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(1) && rc == 1, "{:?} {out}", t0.elapsed());
+    assert!(out.contains("! no_host") && out.contains("$0.0000") && !out.contains("http://"), "{out}");
+    assert_eq!(CALLS.load(Ordering::SeqCst), calls + 2, "A, then AAAA, no provider: {out}");
+    let out = run("https://six.ex.com/long");
+    assert!(out.contains("Learned Route Works"), "an AAAA is an address: {out}");
 }
 
-/// The spend ledger: a paid fetch and a paid search each add one `[t, [cost, unverified], "<record dir>"]` row next to the
-/// keys (no URL, no query: the sweep takes those within the hour), and `stats` sums every row; once the page and
+/// A name no resolver can ask for (a 64-char or empty label, a hyphen at a label's end) is `no_host` by its shape on
+/// a real run too: neither resolver asked (a `lag.` name's system lookup takes 2 s, the second resolver is a
+/// call), $0, never `dns_failed … → check the network`.
+#[test]
+fn unaskable_host_is_never_looked_up() {
+    let _l = lock();
+    for host in [format!("lag.{}.com", "a".repeat(64)), "lag.a..com".into(), "lag.-a.com".into(), "lag.a-.com".into()] {
+        let (calls, t0) = (CALLS.load(Ordering::SeqCst), std::time::Instant::now());
+        let (out, rc) = run_rc(&format!("https://{host}/page fresh:true wait:30"));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1) && rc == 1, "{:?} {out}", t0.elapsed());
+        let head = out.lines().next().unwrap_or_default();
+        assert!(head.contains("! no_host") && head.contains("$0.0000") && !out.contains("network"), "{out}");
+        assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no resolver, no provider: {out}");
+    }
+}
+
+/// The spend ledger: a paid fetch and a paid search each add one `[t, [cost, unverified], "<record dir>"]` row next to
+/// the keys (no URL, no query: the sweep takes those within the hour), and `stats` sums every row; once the page and
 /// the search are swept, the session total still carries what they cost.
 #[test]
 fn spend_outlives_the_pages() {
@@ -1309,13 +1548,14 @@ fn spend_outlives_the_pages() {
     let total = |s: &str| s.lines().next().and_then(|l| l.split(" spent ").nth(1)).unwrap_or_default().to_string();
     let was = total(&stats);
     let dirs: Vec<String> = new.iter().filter_map(|l| Some(parse(l)?.2)).collect();
-    assert!(dirs.iter().all(|d| d.starts_with(&*dir().join("cache/t").to_string_lossy())), "{dirs:?}");
+    // by path components: a stored dir may mix `\` and `/` on Windows (`cache\t/u1`)
+    assert!(dirs.iter().all(|d| std::path::Path::new(d).starts_with(dir().join("cache").join("t"))), "{dirs:?}");
     dirs.iter().for_each(|d| std::fs::remove_dir_all(d).expect("swept"));
     let after = run("stats");
     assert_eq!(total(&after), was, "{after}");
     let name = |d: &str| d.rsplit('/').next().unwrap_or_default().to_string();
     let (page, search) = (name(&dirs[0]), name(&dirs[1]));
-    assert!(after.lines().any(|l| l.starts_with(&format!("{page} swept 0ms $0.0000"))), "{after}");
+    assert!(after.lines().any(|l| l.starts_with(&format!("{page} ex.com · swept 0ms $0.0000"))), "{after}");
     assert!(!after.contains(&format!("{search} search")), "a swept search's money is in the total only: {after}");
 }
 
@@ -1353,8 +1593,9 @@ fn paid_ask_calls_one_provider() {
     assert!(rc == 1 && out.contains("! not_found") && out.contains("tried bd:not_found✗$0.0015 ·"), "{out}");
     let out = run("https://ex.com/slow js:true hedge:0");
     assert!(out.contains("bd:bad_key✗ oxyjs✓ 2") && out.contains(" · hedge:off"), "{out}");
-    let stats = run("stats"); // each paid call's request shape, bd with no country sent
-    assert!(stats.contains(" · bd/60s:bad_key✗ oxyjs@US/60s✓ · hedge:off"), "stats shows the run unhedged: {stats}");
+    let stats = run("stats full"); // each paid call's request shape, bd with no country sent
+    let unhedged = stats.contains("$0.0015 · hedge:off raw ") && stats.contains(" · bd/60s:bad_key✗ oxyjs@US/60s✓");
+    assert!(unhedged, "stats shows the run unhedged: {stats}");
     let read = run("https://ex.com/slow"); // a paid run is read from the cache, and says so there too
     assert!(read.lines().next().is_some_and(|l| l.contains(" · cache 0s · hedge:off")), "{read}");
 }
@@ -1390,8 +1631,8 @@ fn a_search_without_results_is_not_billed() {
     let again = run(j);
     assert!(again.starts_with(&format!("= ! provider_error {j} search \"nolist rust\" · tried {tried}")), "{again}");
     let stats = run("stats");
-    let row = format!("{j} search - ");
-    assert!(stats.lines().any(|l| l.starts_with(&row) && l.contains(" ! provider_error \"nolist rust\"")), "{stats}");
+    let row = format!("{j} search \"nolist rust\" · ! provider_error · - ");
+    assert!(stats.lines().any(|l| l.starts_with(&row)), "{stats}");
     // A search sends a country on both providers (Google's `gl`), each call's timeout beside it
     let shaped = "oxy@US/15s:provider_error✗$0 (not charged) bd@US/15s:provider_error✗$0 (not charged)";
     assert!(stats.contains(shaped), "{stats}");
@@ -1425,10 +1666,10 @@ fn the_first_answer_and_a_cache_read_print_one_arrow() {
     assert_eq!(flags(&run(&id)), Some(tail), "{id}");
 }
 
-/// A fetch slower than `wait:` answers `pending` at the cap and goes on detached: its id says pending at once while
-/// it runs, status lists it, then the id read with the arrow's `wait:` is the page as the run ends (one
-/// poll, not a turn per 5 s) and stats has its cost. `wait:0` answers at once (`starting` when its run has not
-/// begun yet).
+/// A fetch slower than `wait:` answers `pending` at the cap and goes on detached: its id read with `wait:0` says
+/// pending at once while it runs, status lists it, then the id read with the arrow's `wait:` is the page as the run
+/// ends (one poll, not a turn per 5 s) and stats has its cost. `wait:0` answers at once (`starting` when its run has
+/// not begun yet).
 #[test]
 fn slow_fetch_answers_pending() {
     use std::time::{Duration, Instant};
@@ -1445,11 +1686,11 @@ fn slow_fetch_answers_pending() {
             out.starts_with("= j")
                 && out.contains(" pending ")
                 && (out.contains(" · oxy running → ") || wait == "wait:0" && out.contains(" · starting → "))
-                && out.contains(&format!(" {id} wait:30 (free")),
+                && out.contains(&format!(" {id} wait:30 · free, ")),
             "{out}"
         );
         let t0 = Instant::now();
-        let again = run(&id);
+        let again = run(&format!("{id} wait:0"));
         assert!(again.contains(" pending ") && t0.elapsed() < Duration::from_secs(1), "{again}");
         // a run that has not taken its lock yet is `starting` in status too, never `! abandoned` (seen under load)
         let status = run("status");
@@ -1459,7 +1700,10 @@ fn slow_fetch_answers_pending() {
         assert!(page.contains(" Slow Page · ") && t0.elapsed() < Duration::from_secs(5), "{page}");
         let stats = run("stats");
         // the country the call sent, US where nothing named one (`stats` shows what was sent)
-        assert!(stats.lines().any(|l| l.starts_with(&format!("{id} oxylabs@US ")) && l.contains("$0.0010")), "{stats}");
+        assert!(
+            stats.lines().any(|l| l.starts_with(&format!("{id} ex.com · ")) && l.contains(" · oxylabs@US 2")),
+            "{stats}"
+        );
         assert!(!run("status").contains("running u"), "nothing left running");
     }
 }
@@ -1486,23 +1730,23 @@ fn pending_promises_the_sessions_median() {
     let _l = lock();
     let ids: Vec<String> = (1..=4)
         .map(|i| run(&format!("https://ex.com/slow/m{i} provider:oxy fresh:true wait:0")))
-        .inspect(|out| assert!(out.contains(" wait:30 (free; check again in 30 s)"), "{out}"))
+        .inspect(|out| assert!(out.contains(" wait:30 · free, check again in 30 s"), "{out}"))
         .map(|out| out.split(['.', ' ']).nth(2).unwrap_or_default().to_string())
         .collect();
     for id in &ids {
         assert!(run(&format!("{id} wait:5")).contains(" Slow Page · "));
     }
     let out = run("https://ex.com/slow/m5 provider:oxy fresh:true wait:1");
-    assert!(out.contains(" oxy running → ") && out.contains(" wait:30 (free, usually ready in ~1s)"), "{out}");
+    assert!(out.contains(" oxy running → ") && out.contains(" wait:30 · free, usually ready in ≈1s"), "{out}");
     // never past the running call's own deadline, read 0.3 s in: `timeout:` caps every call, the oxy no-JS
     // gate (it ran 20 s under `timeout:1`) and a render alike, in either spelling
     let later = |cmd: &str| {
         let id = run(cmd).split(['.', ' ']).nth(2).unwrap_or_default().to_string();
         std::thread::sleep(std::time::Duration::from_millis(300));
-        run(&id)
+        run(&format!("{id} wait:0"))
     };
     let out = later("https://ex.com/slow/m6 provider:oxy fresh:true wait:0 timeout:1");
-    assert!(out.contains(" wait:30 (free, usually ready in ~1s)"), "{out}");
+    assert!(out.contains(" wait:30 · free, usually ready in ≈1s"), "{out}");
     for i in 7..=9 {
         assert!(
             run(&format!("https://ex.com/slow/r{i} js:true provider:oxy fresh:true wait:5")).contains(" Slow Page ")
@@ -1510,11 +1754,11 @@ fn pending_promises_the_sessions_median() {
     }
     for t in ["1", "1s"] {
         let out = later(&format!("https://ex.com/slow/r{t} js:true provider:oxy fresh:true wait:0 timeout:{t}"));
-        assert!(out.contains(" oxyjs running → ") && out.contains(" wait:30 (free, usually ready in ~1s)"), "{out}");
+        assert!(out.contains(" oxyjs running → ") && out.contains(" wait:30 · free, usually ready in ≈1s"), "{out}");
     }
     // another host is another route: no number from ex.com's calls (any host's bd calls once promised 28 s, 60.5)
     let out = run("https://ex.org/slow/m7 provider:oxy fresh:true wait:1");
-    assert!(out.contains(" oxy running → ") && out.contains(" wait:30 (free; check again in 30 s)"), "{out}");
+    assert!(out.contains(" oxy running → ") && out.contains(" wait:30 · free, check again in 30 s"), "{out}");
     // `timeout:` is the run's one wall: the no-JS call is cut at it, and no render follows
     let t0 = std::time::Instant::now();
     let out = run("https://ex.com/slow/m8 provider:oxy fresh:true wait:5 timeout:1");
@@ -1536,22 +1780,22 @@ fn footer_names_background_runs() {
         tails.extend(s.lines().last().filter(|l| l.starts_with("~ ")).map(String::from));
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let next = format!(" {id} wait:30 (free; check again in 30 s)");
+    let next = format!(" {id} wait:30 · free, check again in 30 s");
     let first = tails.first().filter(|t| t.starts_with(&format!("~ {id} pending ")) && t.contains(" · next: "));
     assert!(first.is_some_and(|t| t.contains(&next)), "{tails:?}");
     assert_eq!(tails.last(), Some(&format!("~ {id} done")), "{tails:?}");
     assert!(!run("config").contains("\n~ "), "told once");
 }
 
-/// A batch runs in lanes, one process each, at most `batch_parallel` (4), dealt round-robin in input order whatever
-/// the host: the rest queue behind them under the same `wait:`, `pending` at it (50 URLs once started 50 processes
-/// at once). Every queued URL is fetched in the end; one host's URLs run side by side (one run a host made 3 walled
-/// pages of one site wait for each other).
+/// A batch runs in lanes, one process each, at most `batch_parallel` (8; 4 here, the mod), dealt round-robin in
+/// input order whatever the host: the rest queue behind them under the same `wait:`, `pending` at it (without lanes
+/// 50 URLs started 50 processes at once). Every queued URL is fetched in the end; one host's URLs run side by side
+/// (one lane a host made 3 walled pages of one site wait for each other).
 #[test]
 fn a_batch_runs_in_lanes() {
     let _l = lock();
     let urls: Vec<String> = (0..50).map(|i| format!("https://h{}.ex.com/slowq/{i}", i % 10)).collect();
-    let out = run(&format!("{} provider:oxy fresh:true wait:1 cost:1", urls.join(" ")));
+    let out = run(&format!("{} provider:oxy fresh:true wait:1 cost:1 batch_parallel:4", urls.join(" ")));
     assert!(out.starts_with("= j") && out.contains(" 50 inputs · ") && out.contains(" pending · "), "{out}");
     assert!(out.contains(".ex.com · queued after u"), "{out}");
     let t0 = std::time::Instant::now();
@@ -1585,6 +1829,219 @@ fn a_batch_runs_in_lanes() {
     assert_eq!(rows.get(1), Some(&format!("= {id} (same as above)").as_str()), "{dup}");
 }
 
+/// A scheduler slice, the pace gap bar's slack; Windows' default timer ticks every 15.6 ms on top (a sleep or a
+/// wake lands on a tick: Windows CI measured one 165 ms gap at a 200 ms pace).
+const SLICE_MS: u128 = if cfg!(windows) { 25 + 16 } else { 25 };
+
+/// THE home-IP brake waits, it never buys: 12 plain pages of one host with every key = $0 and no `!` row (a call
+/// that skipped its turn would buy Bright Data, $0.0015 for a free page); the wait shows apart from the fetch ms.
+/// The gaps are timed where the local site reads each request, not where the brake lets the call start: connect,
+/// accept and 8 lanes on a loaded machine's scheduler move each by a few ms, so the bar is the pace less
+/// `SLICE_MS`; the brake's own starts are pinned in `a_new_host_is_paced_from_its_first_start`.
+#[test]
+fn a_paced_batch_waits_and_spends_nothing() {
+    let _l = lock();
+    let urls: Vec<String> = (0..12).map(|i| format!("{}/doc/brake-page-{i}", walled())).collect();
+    let out = run(&format!("{} wait:30 plain_host_pace_ms:200", urls.join(" ")));
+    assert!(out.contains(" 12 inputs · 12 ok · ") && out.contains(" $0.0000\n"), "{out}");
+    assert!(!out.contains(" ! ") && !out.contains("\n!"), "{out}");
+    let stats = run("stats");
+    assert!(stats.contains(" · waited 0.") && !stats.contains("paced"), "the wait apart from the ms: {stats}");
+    // a new host's first batch too: every lane opened the pace file before the first start, each still waits
+    let mut at = HITS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    at.sort();
+    let gaps: Vec<u128> = at.windows(2).map(|w| w[1].duration_since(w[0]).as_millis()).collect();
+    assert!(gaps.len() == 11 && gaps.iter().all(|&g| g >= 200 - SLICE_MS), "requests ms apart: {gaps:?}");
+}
+
+/// The brake on a host's first starts: lanes that all opened its pace file before the first one started (a new
+/// batch's processes start at once) still start one `plain_host_pace_ms` apart. A start is the one the turn wrote,
+/// read back through the held turn (a lane's clock read after `pace` returns also counts the scheduler's delay).
+#[test]
+fn a_new_host_is_paced_from_its_first_start() {
+    use std::io::Seek;
+    let _l = lock();
+    let go = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let lane = |go: std::sync::Arc<std::sync::Barrier>| {
+        fats::settings::mods(&[("plain_host_pace_ms".into(), "200".into())]);
+        go.wait();
+        let mut turn = fats::provider::pace("https://first-batch.example/a").0?;
+        turn.rewind().ok()?;
+        std::io::read_to_string(&turn).ok()?.get(..20)?.parse::<f64>().ok()
+    };
+    let lanes: Vec<_> = (0..6).map(|_| go.clone()).map(|go| std::thread::spawn(move || lane(go))).collect();
+    let mut at: Vec<f64> = lanes.into_iter().filter_map(|l| l.join().ok().flatten()).collect();
+    at.sort_by(f64::total_cmp);
+    let gaps: Vec<f64> = at.windows(2).map(|w| (w[1] - w[0]) * 1000.0).collect();
+    assert!(gaps.len() == 5 && gaps.iter().all(|&g| g >= 195.0), "starts ms apart: {gaps:?}");
+    // the last start is the one written, whatever the file's mtime says (a copy, a sync); a file that will not open
+    // (a folder by the host's name) is no turn and no wait: the call runs unbraked
+    fats::settings::mods(&[("plain_host_pace_ms".into(), "200".into())]);
+    let pace = fats::settings::get().cache.value.join("pace");
+    let file = std::fs::File::options().write(true).open(pace.join("first-batch.example"));
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    assert!(file.and_then(|f| f.set_modified(old)).is_ok());
+    assert!(fats::provider::pace("https://first-batch.example/b").1 >= 150, "the written start, not the mtime");
+    std::fs::create_dir_all(pace.join("folder.example").join("x")).ok();
+    let t0 = std::time::Instant::now();
+    assert!(fats::provider::pace("https://folder.example/").0.is_none() && t0.elapsed().as_millis() < 50);
+    fats::settings::mods(&[]);
+}
+
+/// A batch's `cost:` is ONE pool (`fetch::pooled`): a paid call holds its price before it starts, so walled pages
+/// whose every rung bills never sum past it (2 walled pages at `cost:0.002` billed $0.0030 when each page got its
+/// own share); 8 pages that each need one $0.0015 render all get it at `cost:0.012`, also on 2 lanes with the
+/// default hedge when the first two pages' Bright Data is slow: each page holds one paid try (its dearest rung) from
+/// the launch, so a hedge never buys a queued page's (the two hedged, 2 pages behind them were `budget_hit`). A page
+/// left without its rung fails as `budget_hit` on the `=` line, its row naming the typed cap and who spent it, its
+/// one arrow.
+#[test]
+fn a_batch_cost_is_one_pool() {
+    let _l = lock();
+    let urls: Vec<String> =
+        (0..8).map(|i| format!("{}/k-wall/{}r{i}", walled(), if i < 2 { "late" } else { "" })).collect();
+    let out = run(&format!("{} fresh:true wait:30 cost:0.012 batch_parallel:2", urls.join(" ")));
+    assert!(out.contains(" 8 inputs · 8 ok · ") && !out.contains("budget_hit"), "{out}");
+    let billed = |out: &str| out.lines().next()?.rsplit("spent $").next()?.parse::<f64>().ok();
+    for (n, cap) in [(2, 0.002), (2, 0.003), (3, 0.0045), (5, 0.0075), (5, 0.004)] {
+        let urls: Vec<String> = (0..n).map(|i| format!("{}/holdwall/p{n}-{cap}-{i}", walled())).collect();
+        let out = run(&format!("{} fresh:true wait:30 cost:{cap}", urls.join(" ")));
+        assert!(billed(&out).is_some_and(|b| b > 0.0 && b <= cap + 1e-9), "{n} pages, cost:{cap}: {out}");
+        assert!(out.contains(" ! budget_hit "), "{out}");
+    }
+    // a cap that stops a page alone: no one else spent it
+    let out = run(&format!("{}/k-wall/r9 {}/k-wall/r10 fresh:true wait:30 cost:0.001", walled(), walled()));
+    assert!(out.contains(" ! budget_hit bd oxyjs not tried · $0.0030 > cost:0.001 → "), "{out}");
+}
+
+/// A page short of the pool only by a page still on plain waits for it: of two at `cost:0.002` ($0.001 each), the
+/// shell needing a $0.0015 render gets it once the other's plain serves (never budget_hit beside a $0 page).
+/// A page queued behind it in its lane holds its floor until its turn: no wait for it, `budget_hit` at once.
+#[test]
+fn a_page_waits_for_a_floor_coming_back() {
+    let _l = lock();
+    let w = walled();
+    let out = run(&format!("{w}/long/late-pool {w}/pool/shell fresh:true wait:30 cost:0.002"));
+    assert!(out.contains(" 2 inputs · 2 ok · ") && out.contains(" · plain:js_shell✗ bd✓ "), "{out}");
+    assert!(!out.contains("budget_hit") && out.lines().next().is_some_and(|l| l.ends_with("spent $0.0015")), "{out}");
+    let out = run(&format!("{w}/pool/shell/q-shell {w}/long/late-q fresh:true wait:30 cost:0.002 batch_parallel:1"));
+    assert!(out.contains(" 2 inputs · 1 ok · 1 ! budget_hit · "), "{out}");
+}
+
+/// The page the pool left without a paid try fails as `budget_hit`: its `=` line, the batch line's count, its
+/// `stats` row and its row with the one arrow, with a copy or without one (a bare `! captcha_wall` with no way out
+/// when plain kept no doc); a page that bought a rung keeps the code the rung met, its budget row the arrow. Who
+/// spent the pool names every page, this one too, and sums to what was billed once the batch is done (a row
+/// written as its page stopped named another's unbilled hold). Two pages over a cap that covers one: one pays (the
+/// other gave its share back; which one is a race), never none. A batch never quotes past its cap in `dry:true`.
+#[test]
+fn a_page_the_pool_starved_says_budget_hit() {
+    let _l = lock();
+    let w = walled();
+    let two = format!("{w}/holdwall/a {w}/holdwall/b fresh:true wait:30 cost:0.002");
+    let dry = run(&format!("{w}/holdwall/a {w}/holdwall/b {w}/holdwall/c wait:30 cost:0.002 dry:true"));
+    assert!(dry.contains("\nbatch up to $0.0020 · cap $0.0020\n"), "{dry}");
+    let out = run(&two);
+    let (b, a) = starved(&out);
+    let head = out.lines().next().unwrap_or_default();
+    assert!(
+        head.contains(" 0 ok · ") && head.contains(" 1 ! cloudflare_wall · ") && head.contains(" 1 ! budget_hit · ")
+    );
+    let copy = format!("{a} ! cloudflare_wall · page content shown ");
+    let spent = format!("{a} ! budget_hit oxyjs not tried · $0.0030 > cost:0.002 (spent $0.0015: {a} $0.0015) → ");
+    let hungry = format!("{b} ! budget_hit bd oxyjs not tried · $0.0030 > cost:0.002 (spent $0.0015: {a} $0.0015) → ");
+    assert!([copy, spent, hungry].iter().all(|r| out.contains(&format!("\n{r}"))), "{out}");
+    // no doc: plain found nothing to keep
+    let none = "http://127.0.0.1:9/holdwall/k-capslow-a http://127.0.0.1:9/holdwall/k-capslow-b fresh:true wait:30";
+    let out = run(&format!("{none} cost:0.0015"));
+    let b = starved(&out).0;
+    // the other holds its $0.0015 render until it stops, then $0.0010 billed: either is what `b` met
+    let row = format!("\n{b} ! budget_hit bd oxyjs not tried · $0.0030 > cost:0.0015 (spent $0.001");
+    for read in [out.clone(), run(&b)] {
+        assert!(read.contains(&format!(".{b} ! budget_hit · 127.0.0.1 · tried plain:connect_failed✗ · ")), "{read}");
+        let arrows = read.lines().filter(|l| l.starts_with(&format!("{b} ")) && l.contains(" → ")).count();
+        assert!(read.contains(&row) && arrows == 1 && !read.contains(" held"), "one row, one arrow: {read}");
+    }
+    assert!(run("stats").lines().any(|l| l.starts_with(&format!("{b} ")) && l.contains(" ! budget_hit")));
+    // every page spent: the parts sum to the cap
+    let three: Vec<String> = (0..3).map(|i| format!("{w}/holdwall/sum{i}")).collect();
+    let out = run(&format!("{} fresh:true wait:30 cost:0.0045", three.join(" ")));
+    let [a, b, c] = <[String; 3]>::try_from(ids(&out)).unwrap_or_default();
+    let sum = format!(" (spent $0.0045: {a} $0.0015, {b} $0.0015, {c} $0.0015) → ");
+    assert!(out.contains(&sum), "{out}");
+}
+
+/// A batch's page ids (`u1`), in its `=` lines' order.
+fn ids(out: &str) -> Vec<String> {
+    let id = |l: &str| Some(l.strip_prefix("= j")?.split(' ').next()?.split_once('.')?.1.to_string());
+    out.lines().filter_map(id).collect()
+}
+
+/// Of a two-page batch: the page the pool starved (`budget_hit` before any paid rung), and the other.
+fn starved(out: &str) -> (String, String) {
+    let [a, b] = <[String; 2]>::try_from(ids(out)).unwrap_or_default();
+    if out.contains(&format!("\n{b} ! budget_hit bd ")) { (b, a) } else { (a, b) }
+}
+
+/// A starved page's way out: with no key a raised cost buys nothing (`setup`); once a newer copy of it served
+/// (its arrow followed), it and its `stats` row point there at $0, never the same `cost:` arrow again.
+#[test]
+fn a_starved_pages_newer_copy_is_its_move() {
+    let _l = lock();
+    // no doc: plain could not connect
+    let out =
+        run("http://127.0.0.1:9/k-wall/starve-a http://127.0.0.1:9/k-wall/starve-b fresh:true wait:30 cost:0.0015");
+    let b = starved(&out).0;
+    assert!(out.contains(&format!("\n{b} ! budget_hit ")), "{out}");
+    let mut keys = Env::default();
+    keys.set("OXYLABS_WEB_API_KEY", None).set("BRIGHTDATA_API_KEY", None);
+    let none = run(&b);
+    assert!(none.contains(&format!(" → {} setup", fats::lang::bin())) && !none.contains("fresh:"), "{none}");
+    drop(keys);
+    let fixed = run(&format!("{b} fresh:true wait:30 cost:0.003"));
+    let c = fixed.lines().next().and_then(|l| l.strip_prefix("= ")?.split(' ').next()?.rsplit('.').next());
+    let c = c.unwrap_or_default().to_string();
+    let row = run("stats").lines().find(|l| l.starts_with(&format!("{b} "))).unwrap_or_default().to_string();
+    for read in [run(&b), row] {
+        assert!(read.contains(&format!(" → {} {c}", fats::lang::bin())) && !read.contains("cost:0.00"), "{read}");
+    }
+}
+
+/// No paid call before a verdict on the host's address: a name no resolver answers for is final at $0. The system
+/// resolver's error back at once (the fake's: no network) is `dns_failed` with its words, the arrow the same page
+/// fresh, no `dns_wait:` (a longer wait cures nothing there); none within `dns_wait` is `dns_timeout`, its arrow
+/// more time (at 1.5 s every provider ran: a name of 127.0.0.1 billed a render). A slow system resolver (the fake's
+/// `lag.*`: 2 s) is waited for up to `dns_wait`, never asked twice.
+#[test]
+fn no_address_verdict_no_paid_call() {
+    let _l = lock();
+    // SERVFAIL (`mute.`) and an unreachable second resolver (`down.`) alike: no verdict, never a ladder
+    for host in ["mute", "down"] {
+        let calls = CALLS.load(Ordering::SeqCst);
+        let (out, rc) = run_rc(&format!("https://{host}.ex.com/page fresh:true wait:30"));
+        assert_eq!(CALLS.load(Ordering::SeqCst), calls + 1, "the second resolver only: {out}");
+        let row = out.lines().find(|l| l.starts_with('u') && l.contains(" ! dns_failed ")).unwrap_or_default();
+        assert!(rc == 1 && row.contains(" dns_failed plain nodename nor servname provided, or not known → "), "{out}");
+        assert!(row.ends_with(" fresh:true") && !out.contains("dns_wait:") && !out.contains("dns_timeout"), "{out}");
+        assert!(out.contains(" spent $0.0000"), "{out}");
+    }
+    // `dry:true` looks nothing up (no network at all, CI's sandbox has none): no resolver call, no wait on a
+    // slow one, its route quoted; `dns_timeout` is the real run's verdict only
+    let (calls, t0) = (CALLS.load(Ordering::SeqCst), std::time::Instant::now());
+    for url in ["https://mute.ex.com/page", "https://lag.ex.com/page"] {
+        let dry = run(&format!("{url} fresh:true dns_wait:1 dry:true"));
+        assert!(dry.contains(" fetch plain") && !dry.contains("dns_timeout"), "{dry}");
+    }
+    assert!(t0.elapsed() < std::time::Duration::from_secs(1), "no lookup: {:?}", t0.elapsed());
+    assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no second resolver either");
+    let (out, rc) = run_rc("https://lag.ex.com/page fresh:true wait:30 dns_wait:1");
+    assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no answer by 1 s, no call at all: {out}");
+    assert!(rc == 1 && out.contains("dns_timeout") && out.contains(" spent $0.0000"), "{out}");
+    assert!(out.contains(" fresh:true dns_wait:15"), "no answer in time, more time: {out}");
+    let out = run("https://lag.ex.com/page fresh:true wait:30");
+    assert!(!out.contains("dns_timeout"), "answered at 2 s, inside the 5 s wait: {out}");
+}
+
 /// A batch's ids are the input order's, so `dry:true` names the ids the run fills: new URLs and a cache hit
 /// between them, two hosts, one URL twice.
 #[test]
@@ -1604,7 +2061,7 @@ fn a_batch_dry_names_the_run_ids() {
 }
 
 /// One URL in flight is fetched once: a second call for it (and `fresh:true` on its id) answers the first run's
-/// `pending`, it starts no run of its own.
+/// `pending` at `wait:0`, its page as it ends within `wait:`; it starts no run of its own.
 #[test]
 fn one_fetch_per_url_in_flight() {
     let _l = lock();
@@ -1614,15 +2071,13 @@ fn one_fetch_per_url_in_flight() {
     for again in ["https://ex.com/slow/once provider:oxy fresh:true wait:0", &format!("{id} fresh:true wait:0")] {
         let out = run(again);
         assert!(
-            out.contains(" pending ") && out.contains(&format!(" {id} wait:30 (free; check again in 30 s)")),
+            out.contains(" pending ") && out.contains(&format!(" {id} wait:30 · free, check again in 30 s")),
             "{again}: {out}"
         );
     }
-    let t0 = std::time::Instant::now();
-    while run(&id).contains(" pending ") && t0.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(run(&id).contains(" Slow Page · "), "{}", run(&id));
+    // without `wait:` the id waits for the run in flight: its page is the fresh copy, no second call
+    let page = run(&format!("{id} fresh:true"));
+    assert!(page.contains(" Slow Page · ") && !page.contains(" pending "), "{page}");
     assert_eq!(ONCE.load(Ordering::SeqCst), 1, "provider calls for one URL in flight");
 }
 
@@ -1634,7 +2089,7 @@ fn wait_zero_is_instant_and_keeps_words() {
     let _l = lock();
     let out = run("https://ex.com/slow apples provider:oxy fresh:true wait:0");
     let id = out.split(['.', ' ']).nth(2).unwrap_or_default().to_string();
-    assert!(out.contains(" pending ") && out.contains(&format!(" {id} apples wait:30 (free; check")), "{out}");
+    assert!(out.contains(" pending ") && out.contains(&format!(" {id} apples wait:30 · free, check")), "{out}");
     let t0 = Instant::now();
     let again = run(&format!("{id} fresh:true wait:0"));
     let ms = t0.elapsed().as_millis();
@@ -1661,7 +2116,8 @@ fn oxylabs_404_is_not_found() {
 
 /// A finished Oxylabs job that relays the site's own 503 is billed (its "Not charged" is only its own API
 /// error envelope, developers.oxylabs.io/products/web-api/troubleshooting), printed `(assumed)` until one is
-/// reconciled on the dashboard; Bright Data's inner 5xx stays `$0 (not charged)` (`bright_data_refusal_names_its_code`).
+/// reconciled on the dashboard; Bright Data's inner 5xx stays `$0 (not charged)`
+/// (`bright_data_refusal_names_its_code`).
 #[test]
 fn oxylabs_relayed_site_5xx_is_billed() {
     let _l = lock();
@@ -1691,14 +2147,16 @@ fn setup_checks_and_saves_keys() {
     assert_eq!(CALLS.load(Ordering::SeqCst), calls, "dry: no call");
     let (out, rc) = run_rc("setup");
     assert_eq!(rc, 0, "{out}");
-    assert!(out.starts_with("= setup oxy ok 351 scrapers · bd ok zone my_unlocker · key dir "), "{out}");
-    assert!(
-        out.contains("\nbd ok zone my_unlocker · key from env · saved brightdata.key brightdata.zone (600)\n"),
-        "{out}"
-    );
+    assert!(out.starts_with("= setup oxy ok 351 scrapers · bd ok zone my_unlocker · decodo none · key dir "), "{out}");
+    assert!(out.contains("\nbd ok zone my_unlocker · key from env · saved auth.json settings.json (600)\n"), "{out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls + 2, "one read per provider: {out}");
-    for (f, v) in [("oxylabs.key", OXY), ("brightdata.key", BD), ("brightdata.zone", "my_unlocker")] {
-        assert_eq!(std::fs::read_to_string(keys.join(f)).ok().as_deref(), Some(v), "{f}");
+    let saved = |f: &str| std::fs::read_to_string(keys.join(f)).unwrap_or_default();
+    for (f, v) in [
+        ("auth.json", format!("\"oxy\": \"{OXY}\"")),
+        ("auth.json", format!("\"bd\": \"{BD}\"")),
+        ("settings.json", "\"bd_zone\": \"my_unlocker\"".into()),
+    ] {
+        assert!(saved(f).contains(&v), "{f}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1716,7 +2174,7 @@ fn setup_checks_and_saves_keys() {
     assert_eq!(rc, 1, "{out}");
     let b = fats::lang::bin();
     let row = format!(
-        "\nbd ! no_zone nope is not a Web Unlocker zone here · unblocker zones: zone_b, my_unlocker → {b} setup zone:zone_b\n"
+        "\nbd ! no_zone nope is not a Web Unlocker zone here · unblocker zones: zone_b, my_unlocker → {b} setup bd zone:zone_b\n"
     );
     assert!(out.contains(&row), "{out}");
     std::fs::remove_dir_all(&keys).ok();
@@ -1724,7 +2182,7 @@ fn setup_checks_and_saves_keys() {
     let (out, rc) = run_rc("setup");
     ACCOUNT.store(0, Ordering::SeqCst);
     assert!(rc == 1 && out.starts_with("= setup oxy ! bad_key · bd ! bad_key"), "{out}");
-    assert!(!keys.join("oxylabs.key").exists(), "a refused key is not saved");
+    assert!(!keys.join("auth.json").exists(), "a refused key is not saved");
     for k in [OXY, BD] {
         assert!(!out.contains(k), "{out}");
     }
@@ -1752,11 +2210,7 @@ fn search_prefetches_top_results() {
     // three pages through plain only, whatever `provider:` the search named: free
     let row = format!("\nprefetching {a} u{} {c} free, plain only (detached; fetch:0 = none) · status: ", first + 1);
     assert!(out.contains(&row), "{out}");
-    // every run ends before the next test counts calls
-    let t0 = std::time::Instant::now();
-    while (first..first + 3).any(|n| run(&format!("u{n}")).contains(" pending ")) && t0.elapsed().as_secs() < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    settle(&(first..first + 3).map(|n| format!("u{n}")).collect::<Vec<_>>());
     let page = run(&a);
     assert!(
         page.starts_with("= j") && page.contains(" Plain Prefetch Works · 127.0.0.1") && !page.contains("pending"),
@@ -1767,9 +2221,10 @@ fn search_prefetches_top_results() {
     let capped = run("preq b provider:oxy cost:0.0015 fetch:3");
     let started = capped.split("prefetching ").nth(1).map(|r| r.split(" free").next().unwrap_or_default());
     assert_eq!(started.map(|r| r.split(' ').count()), Some(3), "{capped}");
+    settle(&started.unwrap_or_default().split(' ').map(String::from).collect::<Vec<_>>());
     assert!(!run("preq c provider:oxy fetch:0").contains("prefetching"));
-    // past `batch_parallel` (4) the rest queue in its lanes: 4 processes for 6 results
-    let six = run("preq e provider:oxy fetch:6");
+    // past `batch_parallel` (8; 4 by its mod) the rest queue in its lanes: 4 processes for 6 results
+    let six = run("preq e provider:oxy fetch:6 batch_parallel:4");
     let ids: Vec<&str> =
         six.split("prefetching ").nth(1).and_then(|r| r.split(" free").next()).unwrap_or_default().split(' ').collect();
     let by = |id: &&str| {
@@ -1778,8 +2233,41 @@ fn search_prefetches_top_results() {
     };
     let heads = ids.iter().filter(|id| by(id) == Some(0)).count();
     assert_eq!((ids.len(), heads), (6, 4), "{six}");
+    settle(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
     let dry = run("preq d provider:oxy dry:true");
     assert!(dry.contains("\nthen fetch:1 prefetches the top 1 detached · free, plain only\n"), "{dry}");
+}
+
+/// The first read right after a search waits for the result's prefetch like a fetch (default `wait:`), and
+/// answers its page the moment the run ends; `wait:0` answers `pending` at once. One string, as `fats mcp` passes it.
+#[test]
+fn a_read_after_a_search_waits_for_its_prefetch() {
+    use std::time::{Duration, Instant};
+    let _l = lock();
+    let mcp = |cmd: &str| fats::cli::run(&[cmd.to_string()]).0;
+    let first = |out: &str| out.split("prefetching ").nth(1).and_then(|r| r.split(' ').next()).map(String::from);
+    let out = mcp("preq late provider:oxy");
+    let id = first(&out).unwrap_or_else(|| panic!("{out}"));
+    let t0 = Instant::now();
+    let page = mcp(&format!("{id} free copy"));
+    let ms = t0.elapsed().as_millis();
+    assert!(page.contains(" 1 hit ") && page.contains("A free copy") && !page.contains(" pending "), "{ms} ms {page}");
+    assert!(t0.elapsed() < Duration::from_secs(5), "returns as the run ends, never at the cap: {ms} ms");
+    let out = mcp("preq late0 provider:oxy");
+    let id = first(&out).unwrap_or_else(|| panic!("{out}"));
+    let t0 = Instant::now();
+    let now = mcp(&format!("{id} wait:0"));
+    assert!(now.contains(" pending ") && t0.elapsed() < Duration::from_secs(1), "{now}");
+    settle(&[id]);
+}
+
+/// Waits (≤ 5 s) until none of `ids` is `pending`: every detached run ends before the next test counts calls,
+/// and before the test's dir goes (a run thread still writing would make it again).
+fn settle(ids: &[String]) {
+    let t0 = std::time::Instant::now();
+    while ids.iter().any(|id| run(id).contains(" pending ")) && t0.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// `site:` is re-checked on every result (the engine may ignore it): results off the host get no id and are
@@ -1827,7 +2315,7 @@ fn prefetch_never_renders() {
     assert_eq!((JS.load(Ordering::SeqCst), CALLS.load(Ordering::SeqCst)), (js, calls), "a prefetch calls no provider");
     let foot = format!("\n~ prefetch u{first} failed · blocked_403 · not charged · prefetch u{} failed · ", first + 1);
     assert!(run("config").contains(&foot), "the reason, free");
-    // a read word with no id reads what is there (review 2026-10-14 #6): `more` the search's list (its cursor
+    // a read word with no id reads what is there: `more` the search's list (its cursor
     // survived the prefetch's own state writes), `up` the failed page's best copy, never the paid ladder
     for (bare, says) in [("more", "search \"shellq a\""), ("up", " Forbidden · ")] {
         let o = run(bare);
@@ -1849,7 +2337,7 @@ fn gh_lists_repositories() {
     assert!(out.contains("\" · 2 results · github · ") && out.contains(" · spent $0.0000\n"), "{out}");
     assert!(out.contains("  ★12.4k owner/repo · A repo · pushed 2026-10-01\n"), "{out}");
     assert!(out.contains("  ★7 owner/bare · pushed 2025-01-02\n"), "no description: {out}");
-    assert!(run("stats").contains(" search github ") && run("stats").contains(" · gh✓"));
+    assert!(run("stats").contains(" search \"") && run("stats full").contains(" · gh✓"));
     let dry = run("gh ghok dry:true");
     assert!(dry.contains("\nsearch github \"ghok\" by stars · limit:10 → new u"), "{dry}");
     for (q, row) in [("ghwait", "retry in 42s → "), ("ghspent", "retry in 6")] {
@@ -1886,18 +2374,21 @@ fn gh_lists_repositories() {
     // the account call failing beside an empty search is the answer's `!` row, never a quiet `0 results`
     let (out, rc) = run_rc("gh ghcore0 fetch:0");
     assert!(rc != 0 && out.contains("\n! rate_limited gh user ghcore0 retry in 720s → "), "{out}");
-    let stats = run("stats");
-    assert!(stats.contains(" 5 results \"tokio-rs\" · gh✓ gh✓"), "both calls: {stats}");
+    let stats = run("stats full");
+    assert!(
+        stats.contains(" search \"tokio-rs\" · 5 results · github ") && stats.contains(" · gh✓ gh✓"),
+        "both calls: {stats}"
+    );
     let out = run("gh ghbad fetch:0");
     clean(&out);
-    let fix = "\n! bad_key gh → gh auth login, or unset GH_TOKEN · gh https://github.com/settings/tokens";
-    assert!(out.contains(fix), "{out}");
+    let fix = format!("\n! bad_key gh → {} setup · gh https://github.com/settings/tokens", fats::lang::bin());
+    assert!(out.contains(&fix), "{out}");
     assert!(out.starts_with("= ! bad_key j") && out.contains(" search \"ghbad\" · tried gh:bad_key✗ · "), "{out}");
-    assert!(run(out.split(' ').nth(3).unwrap_or_default()).contains(fix), "{out}");
+    assert!(run(out.split(' ').nth(3).unwrap_or_default()).contains(&fix), "{out}");
     // GitHub is a search of its own, never a tier: a page fetch cannot be sent to it
     for cmd in ["https://ex.com/a provider:gh dry:true", "https://ex.com/a provider:github"] {
         let (out, rc) = run_rc(cmd);
-        assert!(rc == 2 && out.contains(" · use provider:auto|plain|bd|oxy"), "{cmd}: {out}");
+        assert!(rc == 2 && out.contains(" · use provider:auto|plain|bd|oxy|decodo"), "{cmd}: {out}");
     }
 }
 
@@ -1915,27 +2406,10 @@ fn gh_lists_a_login_the_search_leaves_out() {
 /// Without a token (no `GH_TOKEN`, no `gh` on the PATH) the list says GitHub's tighter limit on its `=` line, in
 /// the HOW part; the record's `provider` stays `github` (the row layout and the JSON contract read it).
 #[test]
-#[expect(unsafe_code, reason = "under `lock`: every other test in this process waits; nextest runs one per process")]
 fn gh_without_a_token_says_its_limit() {
     let _l = lock();
-    struct Env(Option<std::ffi::OsString>);
-    impl Drop for Env {
-        fn drop(&mut self) {
-            // SAFETY: under `lock`, as above
-            unsafe {
-                std::env::set_var("GH_TOKEN", GH);
-                if let Some(p) = self.0.take() {
-                    std::env::set_var("PATH", p);
-                }
-            }
-        }
-    }
-    let _env = Env(std::env::var_os("PATH"));
-    // SAFETY: as above
-    unsafe {
-        std::env::remove_var("GH_TOKEN");
-        std::env::set_var("PATH", "");
-    }
+    let mut env = Env::default();
+    env.set("GH_TOKEN", None).set("PATH", Some(""));
     let out = run("gh ghok fetch:0");
     assert!(out.contains(" · 2 results · github · no token: 10 searches/min · "), "{out}");
     assert!(run("gh ghok fetch:0 json:true").contains(r#""provider":"github""#));
@@ -1978,7 +2452,8 @@ fn a_sign_in_is_named_by_the_landing() {
 }
 
 /// Plain, Bright Data and the Oxylabs render all bring the app's JS shell (no card): shells
-/// from two providers are an app page, `! no_copy`, and with every render tried nothing is left (no paid hint).
+/// from two providers are an app page, `! no_copy`; with every keyed render tried the move is the key whose
+/// render is untried (`! no_key decodo`), never "nothing left".
 /// One provider's shell is that provider's failure: the other provider still renders (airbnb).
 #[test]
 fn two_providers_shells_are_an_app_page() {
@@ -1994,11 +2469,12 @@ fn two_providers_shells_are_an_app_page() {
         "{out}"
     );
     let row = out.lines().find(|l| l.contains("! no_copy ")).unwrap_or_default();
-    assert!(row.contains("→ nothing left to try · open http"), "every render was tried: {out}");
+    assert!(row.ends_with(" setup") && !out.contains("nothing left"), "every keyed render was tried: {out}");
+    assert!(out.contains("\nu1 ! no_key decodo · would try JS render ≤$0.0015 · set DECODO_AUTH_TOKEN"), "{out}");
     let id = head.split(['.', ' ']).nth(2).unwrap_or_default();
     // `dry:true` on that id with `js:true` quotes the refetch, never `local read · $0`
     let dry = run(&format!("{id} js:true dry:true"));
-    assert!(dry.contains("/w/deadshell fetch bd → oxyjs → new u") && dry.contains(" · up to $0.0030 · ~"), "{dry}");
+    assert!(dry.contains("/w/deadshell fetch bd → oxyjs → new u") && dry.contains(" · up to $0.0030 · ≈"), "{dry}");
     let rendered = run(&format!("{}/shell fresh:true js:true", walled()));
     assert!(rendered.contains("Rendered Shell") && rendered.contains(" · hedge:off"), "{rendered}");
 }
@@ -2007,20 +2483,9 @@ fn two_providers_shells_are_an_app_page() {
 /// both. A wall and a shell are served by whichever provider can; a 500 gets one retry with one key; a search
 /// runs on either key; no hint names the missing provider.
 #[test]
-#[expect(unsafe_code, reason = "under `lock`: every other test in this process waits; nextest runs one per process")]
 fn any_one_key_gets_the_page() {
     let _t = lock();
-    struct Back;
-    impl Drop for Back {
-        fn drop(&mut self) {
-            // SAFETY: under `lock`, as above
-            unsafe {
-                std::env::set_var("OXYLABS_WEB_API_KEY", OXY);
-                std::env::set_var("BRIGHTDATA_API_KEY", BD);
-            }
-        }
-    }
-    let _back = Back;
+    let mut env = Env::default();
     let w = walled();
     // (keys, page, the tier path it must print)
     let rows: &[(&str, &str, &str)] = &[
@@ -2037,26 +2502,18 @@ fn any_one_key_gets_the_page() {
         ("both", "k-sherr", "plain:blocked_403✗ bd:js_shell✗$0.0015 oxyjs:provider_error✗$0 (not charged)"),
     ];
     for (keys, page, path) in rows {
-        // SAFETY: under `lock`, as above; `Back` puts both keys back
-        unsafe {
-            std::env::set_var("OXYLABS_WEB_API_KEY", OXY);
-            std::env::set_var("BRIGHTDATA_API_KEY", BD);
-            match *keys {
-                "oxy" => std::env::remove_var("BRIGHTDATA_API_KEY"),
-                "bd" => std::env::remove_var("OXYLABS_WEB_API_KEY"),
-                _ => {}
-            }
-        }
+        env.set("OXYLABS_WEB_API_KEY", (*keys != "bd").then_some(OXY));
+        env.set("BRIGHTDATA_API_KEY", (*keys != "oxy").then_some(BD));
         let out = run(&format!("{w}/{page}-{keys} provider:auto fresh:true wait:30"));
         assert!(out.lines().next().unwrap_or_default().contains(path), "{keys} {page}: {out}");
         assert!(*page != "k-sherr" || out.contains(" fresh:true provider:oxy js:true ≤$0.0015"), "{out}");
         let missing = [("oxy", "provider:bd"), ("bd", "provider:oxy")].iter().find(|k| k.0 == *keys);
         let missing = missing.map_or("no hint is missing", |k| k.1);
         assert!(!out.contains(missing), "a hint names the missing key's provider: {keys} {page}: {out}");
-        if *keys != "both" && page.contains("shell") {
-            assert!(out.contains("! no_key oxy · would try") || *keys == "oxy", "what the missing key buys: {out}");
-        }
         if (*keys, *page) == ("bd", "k-shell") {
+            // a failed run names the key that could still render it, never "nothing left"
+            let oxy = "! no_key oxy · would try JS render ≤$0.0015";
+            assert!(out.contains(oxy) && !out.contains("nothing left"), "what the missing key buys: {out}");
             // The row is the run's record: once in the answer, and on every later read of the id
             let again = run(out.split(['.', ' ']).nth(2).unwrap_or_default());
             let once = |o: &str| o.matches("! no_key oxy · would try").count() == 1;
@@ -2075,13 +2532,39 @@ fn any_one_key_gets_the_page() {
             // its move waits, as a page's: `fats j2 wait:30` answers with the list once stored
             let t0 = std::time::Instant::now();
             let got = run(&format!("{job} wait:30"));
-            assert!(got.contains("search result, not fetched ex.com/bdk") && t0.elapsed().as_secs() < 5, "{got}");
+            assert!(got.contains(" ex.com/bdk · not fetched → ") && t0.elapsed().as_secs() < 5, "{got}");
         }
     }
 }
 
+/// The provider's own reason on the `!` row and in `stats`; a render it refused (a 400) or gave up on (`faulted`)
+/// is settled for the URL: never asked again, by name or by a ladder, so a tier left is the move, else the end.
+#[test]
+fn a_settled_render_is_never_asked_again() {
+    let _t = lock();
+    let w = walled();
+    for (page, why) in [("k-sh400", "oxyjs 400 url: value not supported"), ("k-shfault", "oxyjs 500 faulted: request")]
+    {
+        let out = run(&format!("{w}/{page} provider:auto fresh:true wait:30"));
+        clean(&out);
+        let row = out.lines().find(|l| l.starts_with("u") && l.contains(" ! provider_error ")).unwrap_or_default();
+        // no provider move left; decodo's missing key could serve: `→ fats setup`
+        let setup = format!(" · failed 1/1 here → {} setup", fats::lang::bin());
+        assert!(row.contains(why) && row.ends_with(&setup), "{page}: {out}");
+        assert!(!out.contains("provider:oxy"), "{page}: no arrow names oxy, oxyjs and bd spent: {out}");
+        let stats = run("stats full");
+        assert!(stats.contains(&format!("(not charged, {}", &why[6..])), "{page}: {stats}");
+    }
+    // faulted twice: the second lap counts, no arrow names oxy
+    let again = run(&format!("{w}/k-shfault provider:auto fresh:true wait:30"));
+    let row = again.lines().find(|l| l.starts_with("u") && l.contains(" ! provider_error ")).unwrap_or_default();
+    assert!(row.contains(" · failed 2/2 here") && !again.contains("provider:oxy"), "{again}");
+    clean(&again);
+}
+
 /// Mastodon: no `js:true` site order (no follow-up `js:true` run ever validated one): `js:true` runs bd first
-/// every time, a shell on the site's last 2 runs moves nothing; what it bills stays within dry's `up to` (the arrow's `≤$X`, no second price).
+/// every time, a shell on the site's last 2 runs moves nothing; what it bills stays within dry's `up to` (the arrow's
+/// `≤$X`, no second price).
 #[test]
 fn js_true_keeps_the_table_order() {
     let _t = lock();
@@ -2128,7 +2611,7 @@ fn a_sites_own_language_is_no_geo_copy() {
     let geo = run("https://www.hotels.example/hotel/fr/example-hotel.html provider:bd fresh:true");
     assert!(own.starts_with("= j") && !own.contains("lang:es") && !own.contains("country:"), "{own}");
     assert!(geo.contains(" · ! lang:es\n") && geo.contains(" ! lang:es · served in es, sent none · "), "{geo}");
-    let stats = run("stats");
+    let stats = run("stats full");
     let row = |p: &str| stats.lines().find(|l| l.contains(p) && l.contains(" bd/60s✓")).map(|l| l.contains("✓own:es"));
     assert_eq!((row(" raw 1.0kB "), row(" raw 908B ")), (Some(true), Some(false)), "{stats}");
 }
@@ -2163,4 +2646,293 @@ fn a_limit_past_the_cap_buys_nothing_more() {
     let _l = lock();
     let over = run("preq limit limit:30 fetch:0");
     assert!(over.contains("\n! ignored limit · a search returns 20 at most\n"), "{over}");
+}
+
+/// Decodo, the third provider: its key alone serves a page (no-JS, then its render), a wrong key is `bad_key`
+/// naming the key, never the 401 it echoed; a site 5xx it relayed is billed `(assumed)`, its own 500 is not; with
+/// three keys `dry:true` prints the ladder (plain → no-JS rungs → renders by price, then table order); `setup`
+/// checks the key for $0 on the dead host (400 = good).
+#[test]
+fn decodo_is_a_third_tier() {
+    let _t = lock();
+    let mut env = Env::default();
+    let w = walled();
+    env.set("DECODO_AUTH_TOKEN", Some(DECODO));
+    let dry = run(&format!("{w}/k-three dry:true"));
+    let ladder = "fetch plain → oxy (after a captcha) → decodo (after a captcha) → bd ∥ oxyjs after 5s → decodojs";
+    assert!(dry.contains(ladder) && dry.contains(" · up to $0.0065"), "{dry}");
+    // oxy without JS cut at 10 s: the renders next, never decodo's no-JS rung (the same slow page)
+    let out = run(&format!("{w}/k-capslow fresh:true wait:60"));
+    let eq = out.lines().next().unwrap_or_default();
+    assert!(eq.contains("plain:captcha_wall✗ oxy:provider_timeout✗") && !eq.contains("decodo:"), "{out}");
+    // the key check: one $0 scrape of the dead host, a 400 = a good key (the other keys stay set: no key is
+    // looked up outside the test)
+    let (out, rc) = run_rc("setup");
+    assert!(rc == 0 && out.contains(" · decodo ok key ok · key dir "), "{out}");
+    assert!(out.contains("\ndecodo ok key ok · key from env · saved auth.json (600)\n"), "{out}");
+    // the saved keys would serve the one-key runs below
+    std::fs::remove_dir_all(dir().join("keys")).ok();
+    env.set("DECODO_AUTH_TOKEN", Some("wrongDecodoToken42"));
+    let (out, rc) = run_rc("setup");
+    assert!(rc == 1 && out.contains(" · decodo ! bad_key") && !out.contains("wrongDecodoToken42"), "{out}");
+    let auth = std::fs::read_to_string(dir().join("keys").join("auth.json")).unwrap_or_default();
+    assert!(!auth.contains("decodo"), "a refused key is not saved: {auth}");
+    clean(&out);
+    std::fs::remove_dir_all(dir().join("keys")).ok();
+    env.set("OXYLABS_WEB_API_KEY", None).set("BRIGHTDATA_API_KEY", None);
+    let out = run("https://ex.com/401 provider:decodo");
+    let row = format!(
+        "! bad_key decodo → {} setup · decodo https://dashboard.decodo.com/web-data/playground",
+        fats::lang::bin()
+    );
+    assert!(out.contains(&row) && !out.contains("wrongDecodoToken42"), "{out}");
+    clean(&out);
+    env.set("DECODO_AUTH_TOKEN", Some(DECODO));
+    let out = run(&format!("{w}/k-wall-decodo fresh:true wait:30"));
+    let path = "plain:blocked_403✗ decodo:cloudflare_wall✗$0.0010 decodojs✓";
+    assert!(out.lines().next().unwrap_or_default().contains(path) && out.contains("Decodo Page"), "{out}");
+    let out = run(&format!("{w}/k-plain-decodo fresh:true wait:30"));
+    assert!(out.lines().next().unwrap_or_default().contains("plain:blocked_403✗ decodo✓"), "{out}");
+    let out = run(&format!("{w}/d5xx fresh:true wait:30"));
+    let path = "decodo:http_502✗$0.0010 (assumed) decodojs:provider_error✗$0 (not charged)";
+    assert!(out.contains(path), "{out}");
+    clean(&out);
+    let stats = run("stats");
+    assert!(stats.contains(" · decodo@US ") && stats.contains(" · decodo-js@US "), "{stats}");
+    assert!(stats.contains(" spent $0.0045"), "the wall + render, a page, the relayed 502; the 500 free: {stats}");
+}
+
+/// One raw HTTP/1.1 request to the key form; "" = nothing listens there any more.
+fn http(host: &str, req: &str) -> String {
+    use std::io::{Read, Write};
+    let Ok(mut s) = std::net::TcpStream::connect(host) else { return String::new() };
+    s.write_all(req.as_bytes()).ok();
+    let mut out = String::new();
+    s.read_to_string(&mut out).ok();
+    out
+}
+
+/// `fats setup oxy` without a terminal (an agent): a one-shot form on 127.0.0.1 behind a 128-bit path token. Only
+/// `Host: 127.0.0.1:<port>` and no foreign `Origin` (else 400), then GET the page and POST its save on the token's
+/// path, nothing else (404); a short key = the page again with its `!` row; one good key is checked ($0), saved in
+/// auth.json, and the form is gone, so a second POST finds nothing. The key is never in argv (the run is
+/// `--continue setup-oxy`), the URL, the run file, the log or any printed line; `fats setup oxy` shows the waiting
+/// form again while it waits.
+#[test]
+fn setup_form_takes_one_key() {
+    let _l = lock();
+    let keys = dir().join("keys");
+    std::fs::remove_dir_all(&keys).ok();
+    let (out, rc) = run_rc("setup oxy");
+    let url = out.split_whitespace().find(|w| w.starts_with("http://127.0.0.1:")).unwrap_or_default().to_string();
+    assert!(
+        rc == 0 && out.starts_with(&format!("= setup oxy · waiting for the key at {url} · 10 min · $0\n")),
+        "{out}"
+    );
+    let (host, path) = url.trim_start_matches("http://").split_once('/').unwrap_or_default();
+    let token = path.split('/').nth(1).unwrap_or_default();
+    assert!(token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()), "{url}");
+    assert_eq!(run("setup oxy"), out, "one form a provider: the waiting one again");
+    let get = |p: &str, h: &str| http(host, &format!("GET /{p} HTTP/1.1\r\nHost: {h}\r\n\r\n"));
+    let post = |p: &str, body: &str| {
+        let head = format!("POST /{p} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n", body.len());
+        let head = if body.contains("evil") { format!("{head}Origin: http://evil.com\r\n") } else { head };
+        http(host, &format!("{head}Content-Type: application/x-www-form-urlencoded\r\n\r\n{body}"))
+    };
+    assert!(get(path, "localhost").starts_with("HTTP/1.1 400 "), "a rebinding name is refused");
+    assert!(get(&path.replace(token, &"0".repeat(32)), host).starts_with("HTTP/1.1 404 "));
+    assert!(get("", host).starts_with("HTTP/1.1 404 "));
+    assert!(get(&format!("{path}/save"), host).starts_with("HTTP/1.1 404 "), "the save route takes POST only");
+    assert!(post(path, "key=x").starts_with("HTTP/1.1 404 "), "the page takes GET only");
+    let page = get(path, host);
+    let csp = "\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'\r\n";
+    assert!(
+        page.starts_with("HTTP/1.1 200 ") && page.contains(csp) && page.contains("\r\nCache-Control: no-store\r\n")
+    );
+    assert!(!page.contains("Access-Control") && !page.contains("<script") && page.contains("type=password"), "{page}");
+    let key = "oxyF0rmK3y-9Qz2mWb5Lp8Tn";
+    assert!(post(&format!("{path}/save"), "key=evil-page-K3y-9Qz2").starts_with("HTTP/1.1 400 "), "a foreign Origin");
+    assert!(
+        post(&format!("{path}/save"), "key=short").contains("! too short for a key: copy the whole key · try again")
+    );
+    let done = post(&format!("{path}/save"), &format!("key={key}"));
+    assert!(done.contains("Oxylabs Web API works</b> · 351 scrapers") && done.contains("say <b>done</b>"), "{done}");
+    let auth: Value =
+        serde_json::from_str(&std::fs::read_to_string(keys.join("auth.json")).unwrap_or_default()).unwrap_or_default();
+    assert_eq!(auth["keys"]["oxy"], key);
+    let gone = std::time::Instant::now();
+    while !post(&format!("{path}/save"), &format!("key={key}")).is_empty() && gone.elapsed().as_secs() < 3 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(post(&format!("{path}/save"), "key=another-key-here").is_empty(), "single use: the form is gone");
+    let run_dir = dir().join("cache/t/run");
+    assert!(!run_dir.join("setup-oxy.json").exists(), "no form waits now");
+    for f in ["setup-oxy.json", "setup-oxy.log"] {
+        let text = std::fs::read_to_string(run_dir.join(f)).unwrap_or_default();
+        assert!(!text.contains(key), "{f}");
+    }
+    assert!(!out.contains(key) && !url.contains(key));
+    std::fs::remove_dir_all(&keys).ok();
+}
+
+/// `fats setup <name>` beside its switches: `free` needs no key (its off switch named), `dry:true` starts no
+/// form.
+#[test]
+fn setup_names_without_a_key_form() {
+    let _l = lock();
+    let (out, rc) = run_rc("setup free");
+    assert!(rc == 0 && out.starts_with("= setup free · built in, no key to set · $0 · off: "), "{out}");
+    let dry = run("setup oxy dry:true");
+    assert_eq!(dry, "= dry setup oxy · would start a one-shot key form on 127.0.0.1 · $0\n");
+    assert!(!dir().join("cache/t/run/setup-oxy.json").exists(), "dry starts nothing");
+}
+
+/// Bright Data's form saves the key with the configured zone when the account has it (`setup::landed`: else the
+/// only one, else the zones named and `fats setup bd zone:<name>`).
+#[test]
+fn setup_form_names_the_zones() {
+    let _l = lock();
+    let keys = dir().join("keys");
+    std::fs::remove_dir_all(&keys).ok();
+    let out = run("setup bd");
+    let url = out.split_whitespace().find(|w| w.starts_with("http://127.0.0.1:")).unwrap_or_default().to_string();
+    let (host, path) = url.trim_start_matches("http://").split_once('/').unwrap_or_default();
+    let body = "key=sunflower-bd-key";
+    let head = format!("POST /{path}/save HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n", body.len());
+    let done = http(host, &format!("{head}{body}"));
+    assert!(done.contains("Bright Data works</b> · zone my_unlocker · go back") && !done.contains("sunflower"));
+    let auth = std::fs::read_to_string(keys.join("auth.json")).unwrap_or_default();
+    assert!(auth.contains("sunflower-bd-key"), "{auth}");
+    std::fs::remove_dir_all(&keys).ok();
+}
+
+/// https refused at the host (here a listener that speaks only http: the TLS handshake fails) is no wall: every
+/// provider meets the same listener, so the same run asks the http URL on plain at once, $0, and serves it
+/// (`landed http://…`); when http fails too the paid ladder runs on the https URL and the row offers no http. The
+/// hop's why keeps the https cause first (`tls:wrong-version-number+http:200`); an http copy that is an error page
+/// after a TLS failure is the certificate's answer: `tls_failed`, $0, no paid call, the keyed no-JS tier the move.
+#[test]
+fn https_refused_moves_to_http_once() {
+    let _l = lock();
+    let page = format!("{}/500/doc/Plain-Only", walled());
+    let tls = page.replacen("http://", "https://", 1);
+    let (calls, t0) = (CALLS.load(Ordering::SeqCst), std::time::Instant::now());
+    let out = run(&format!("{tls} wait:30"));
+    let head = out.lines().next().unwrap_or_default();
+    assert!(
+        head.contains(" · landed http://127.0.0.1 · ") && head.contains(" plain ") && !out.contains(" ! "),
+        "{out}"
+    );
+    assert!(head.contains("spent $0.0000") && t0.elapsed().as_secs() < 2, "{out}");
+    assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no provider call");
+    assert!(written().contains("\"why\": \"tls:wrong-version-number+http:200\""), "the https cause first");
+    let oops = format!("{}/oops", walled());
+    let cert = run(&format!("{} wait:30", oops.replacen("http://", "https://", 1)));
+    let row = cert.lines().find(|l| l.starts_with("u") && l.contains(" ! tls_failed ")).unwrap_or_default();
+    let id = row.split(' ').next().unwrap_or_default();
+    let arrow = format!(
+        "wrong-version-number · $0 → check the certificate · {} {id} fresh:true provider:oxy ≤$",
+        fats::lang::bin()
+    );
+    assert!(row.contains(&arrow), "{cert}");
+    assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no paid call after the certificate's answer: {cert}");
+    clean(&cert);
+    // http refused as well (a 403 there): the ladder on the https URL as before, no http arrow
+    let both = run(&format!("{} wait:30", walled().replacen("http://", "https://", 1) + "/k-sh400"));
+    assert!(both.contains("plain:connect_failed✗") && both.contains("oxyjs:provider_error✗"), "{both}");
+    assert!(!both.contains("→ fats http:") && !both.contains(" http://127"), "the http move was tried: {both}");
+    assert!(written().contains("\"why\": \"tls:wrong-version-number+http:403\""), "what http answered: {both}");
+    clean(&out);
+}
+
+/// https refused for its certificate (verify failed: self-signed here, as expired, wrong-host or untrusted) is the
+/// site's answer whatever http says (here a 301 back to https): `plain:tls_failed✗`, $0, no paid call, the reason
+/// on the `!` row and in `stats full`, the move the keyed no-JS tier by name, priced as its dry (`provider:oxy` =
+/// oxy, then oxyjs: ≤$0.0025). A `provider:` or `js:true` ask runs as any ask.
+#[test]
+fn a_certificate_failure_ends_the_run_at_zero() {
+    let _l = lock();
+    let url = format!("{}/expired/page", bad_cert());
+    let (calls, t0) = (CALLS.load(Ordering::SeqCst), std::time::Instant::now());
+    let (out, rc) = run_rc(&format!("{url} wait:30"));
+    let head = out.lines().next().unwrap_or_default();
+    assert!(rc == 1 && head.contains("plain:tls_failed✗") && head.contains("spent $0.0000"), "{out}");
+    assert!(t0.elapsed().as_secs() < 5, "{out}");
+    assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no provider call: {out}");
+    let row = out.lines().find(|l| l.starts_with('u') && l.contains(" ! tls_failed ")).unwrap_or_default();
+    let id = row.split(' ').next().unwrap_or_default();
+    let want = format!(
+        " ! tls_failed certificate-verify-failed · $0 → check the certificate · {} {id} fresh:true provider:oxy ≤$0.0025",
+        fats::lang::bin()
+    );
+    assert!(row.contains(&want), "{out}");
+    let stats = run("stats full");
+    assert!(stats.contains("plain:tls_failed✗") && stats.contains("certificate-verify-failed"), "{stats}");
+    for ask in [format!("{id} fresh:true provider:oxy"), format!("{url} js:true")] {
+        let before = CALLS.load(Ordering::SeqCst);
+        let asked = run(&format!("{ask} wait:30"));
+        assert!(CALLS.load(Ordering::SeqCst) > before, "the agent's ask runs: {asked}");
+    }
+    clean(&out);
+}
+
+/// A bare page whose one move is a meta refresh to its own host is the site's redirect: plain follows it once, $0, and
+/// serves the page it lands on, with no `redirected` flag (`latest` names no page: `outline::lost_page`, under 8
+/// letters; the target keeps a longer asked id); one with a delay is no redirect: plain's copy is a shell, and the
+/// ladder walks on.
+#[test]
+fn a_meta_refresh_is_followed_on_plain() {
+    let _l = lock();
+    let out = run(&format!("{}/latest wait:30", walled()));
+    let head = out.lines().next().unwrap_or_default();
+    assert!(head.contains(" Announcing The Release · ") && head.contains(" plain ") && head.contains("$0"), "{out}");
+    // the target is judged as any landing: `latest` names no page, so no flag
+    assert!(!out.contains("redirected") && !out.contains("oxy") && !out.contains(" ! "), "{out}");
+    let meta = written();
+    let from = meta.split("\"refreshed_from\":").nth(1).unwrap_or_default().trim_start();
+    assert!(from.starts_with("\"http://127.0.0.1:") && from.contains("/w/latest\""), "the origin, on its own");
+    let row = out.lines().find(|l| l.contains("#0 info | refreshed from: ")).unwrap_or_default();
+    assert!(row.starts_with('u') && row.ends_with("/w/latest"), "the origin, printed: {out}");
+    // a target that keeps the asked id is the page, no flag
+    let kept = run(&format!("{}/moved/Release-Notes-20261020 wait:30", walled()));
+    assert!(kept.contains(" Release Notes 20261020 · ") && !kept.contains(" ! "), "{kept}");
+    let slow = run(&format!("{}/latest-5s wait:30", walled()));
+    assert!(slow.contains("plain:js_shell✗") && !slow.contains(" Announcing "), "{slow}");
+    // a target that answers no 2xx leaves the refreshing page the page: judged as it is, never connect_failed
+    let gone = run(&format!("{}/latest-gone wait:30", walled()));
+    assert!(gone.contains("plain:js_shell✗") && !gone.contains("connect_failed") && !gone.contains("403"), "{gone}");
+    clean(&out);
+}
+
+/// The weekly usage summary of a session with a search, a page, a filter, a part read and a failed fetch whose
+/// provider echoed the key: counts and codes only. No URL, host, query, filter word, path, id, key or provider
+/// answer is in it; what ran is counted.
+#[test]
+fn weekly_summary_holds_no_input() {
+    let _t = lock();
+    for cmd in [
+        "preq secretword provider:oxy fetch:0",
+        "https://ex.com/long/secretpath provider:oxy",
+        "u2 secretfilter",
+        "u2#1",
+        "https://ex.com/500/secretfail provider:oxy",
+    ] {
+        clean(&run(cmd));
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    let w = fats::stats::weekly_of(&dir().join("cache"), &fats::cache::week_of(now));
+    let text = w.to_string();
+    let root = dir().to_string_lossy().into_owned();
+    let leaks = [OXY, BD, GH, "preq", "secret", "ex.com", "127.0.0.1", "http", "Traceback", "exploded", "u1", "j1"];
+    for leak in leaks.iter().copied().chain([root.as_str(), "/w/"]) {
+        assert!(!text.contains(leak), "{leak} in {text}");
+    }
+    let runs: u64 = w["host"].as_object().map_or(0, |h| h.values().filter_map(|v| v.as_u64()).sum());
+    assert_eq!((runs, w["cmd"]["search"].as_u64(), w["cmd"]["filter"].as_u64()), (5, Some(1), Some(1)), "{text}");
+    assert_eq!(
+        (w["provider"]["oxy"]["search"].as_u64(), w["keys"].as_array().map(Vec::len)),
+        (Some(1), Some(2)),
+        "{text}"
+    );
+    assert!(w["codes"]["provider_error"].as_u64() >= Some(1) && w["tier"]["oxy"]["ok"].as_u64() >= Some(1), "{text}");
 }

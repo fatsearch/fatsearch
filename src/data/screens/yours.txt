@@ -1,0 +1,4 @@
+
+{bold}YOUR STUFF{/}
+  pages read: {pages} · last: {last} {dim}(fats {id}){/}
+  spent this month: {spent} {dim}· details: fats stats{/}

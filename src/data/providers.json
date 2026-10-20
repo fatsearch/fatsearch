@@ -1,9 +1,11 @@
 {
   "specs": [
-    {"name": "plain", "short": "plain", "env": "", "file": "", "timeout": {"secs": 10, "nanos": 0}, "price": 0.0, "can": ["page", "pdf", "gov"], "bills_site_5xx": false, "buys": "", "search_s": 0},
-    {"name": "brightdata", "short": "bd", "env": "BRIGHTDATA_API_KEY", "file": "brightdata.key", "timeout": {"secs": 60, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "search", "pdf"], "bills_site_5xx": false, "buys": "unblock+JS", "search_s": 10},
-    {"name": "oxylabs", "short": "oxy", "env": "OXYLABS_WEB_API_KEY", "file": "oxylabs.key", "timeout": {"secs": 10, "nanos": 0}, "price": 0.0010, "can": ["page", "search", "pdf", "gov"], "bills_site_5xx": true, "buys": "no-JS fetch", "search_s": 2},
-    {"name": "oxylabs-js", "short": "oxyjs", "env": "OXYLABS_WEB_API_KEY", "file": "oxylabs.key", "timeout": {"secs": 60, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "gov"], "bills_site_5xx": true, "buys": "JS render", "search_s": 0}
+    {"name": "plain", "short": "plain", "env": "", "timeout": {"secs": 10, "nanos": 0}, "price": 0.0, "can": ["page", "pdf", "gov"], "bills_site_5xx": false, "buys": "", "search_s": 0},
+    {"name": "brightdata", "short": "bd", "env": "BRIGHTDATA_API_KEY", "timeout": {"secs": 60, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "search", "pdf", "auto_geo"], "bills_site_5xx": false, "buys": "unblock+JS", "search_s": 10},
+    {"name": "oxylabs", "short": "oxy", "env": "OXYLABS_WEB_API_KEY", "timeout": {"secs": 10, "nanos": 0}, "price": 0.0010, "can": ["page", "search", "pdf", "gov"], "bills_site_5xx": true, "buys": "no-JS fetch", "search_s": 2},
+    {"name": "oxylabs-js", "short": "oxyjs", "env": "OXYLABS_WEB_API_KEY", "timeout": {"secs": 60, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "gov"], "bills_site_5xx": true, "buys": "JS render", "search_s": 0},
+    {"name": "decodo", "short": "decodo", "env": "DECODO_AUTH_TOKEN", "timeout": {"secs": 15, "nanos": 0}, "price": 0.0010, "can": ["page", "gov"], "bills_site_5xx": true, "buys": "no-JS fetch", "search_s": 0},
+    {"name": "decodo-js", "short": "decodojs", "env": "DECODO_AUTH_TOKEN", "timeout": {"secs": 60, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "gov"], "bills_site_5xx": true, "buys": "JS render", "search_s": 0}
   ],
   "apis": [
     {"api": "BdRequest", "method": "POST", "url": "https://api.brightdata.com/request", "what": ""},
@@ -16,12 +18,20 @@
     {"api": "BdZoneCost", "method": "GET", "url": "https://api.brightdata.com/zone/cost", "what": "requests of the zone this month"},
     {"api": "Doh", "method": "GET", "url": "https://1.1.1.1/dns-query", "what": "second resolver on NXDOMAIN, no key", "accept": "application/dns-json"},
     {"api": "GhRepos", "method": "GET", "url": "https://api.github.com/search/repositories", "what": "fats gh: repositories by stars, free", "accept": "application/vnd.github+json"},
-    {"api": "GhUser", "method": "GET", "url": "https://api.github.com/users/{q}/repos", "what": "fats gh <login>: that account's repositories, free", "accept": "application/vnd.github+json"}
+    {"api": "GhUser", "method": "GET", "url": "https://api.github.com/users/{q}/repos", "what": "fats gh <login>: that account's repositories, free", "accept": "application/vnd.github+json"},
+    {"api": "DecodoScrape", "method": "POST", "url": "https://data.decodo.com/v1/scrape", "what": ""},
+    {"api": "Telemetry", "method": "GET", "url": "https://fatsearch.com/v1/latest", "what": "fats telemetry: the daily update check, no key, no id"},
+    {"api": "TelemetryL2", "method": "POST", "url": "https://fatsearch.com/v1/l2", "what": "fats telemetry: the weekly usage counts, no key, no id"}
   ],
   "links": [
-    {"short": "oxy", "signup": "https://dashboard.oxylabs.io/en/registration", "keys": "https://dashboard.oxylabs.io (a Web API instance's key)", "billing": null, "usage": null},
-    {"short": "bd", "signup": "https://brightdata.com/cp/start", "keys": "https://brightdata.com/cp/setting/users", "billing": "https://brightdata.com/cp/billing", "usage": "https://brightdata.com/cp/billing/costs"},
-    {"short": "gh", "signup": "https://github.com/signup", "keys": "https://github.com/settings/tokens", "billing": null, "usage": null}
+    {"short": "oxy", "name": "Oxylabs Web API", "signup": "https://dashboard.oxylabs.io/en/registration", "mint": "https://dashboard.oxylabs.io/en/instances/new?type=SCRAPI_UNIFIED", "keys": "https://dashboard.oxylabs.io (a Web API instance's key)", "billing": null, "usage": null,
+     "rank": "#1 · 14/19 hard pages (median of 9 runs, 12–16, 2026-10-15)", "free": "$5 to start, once", "cost": "about $0.001 a page", "step": "Create the Web API instance and copy its API key"},
+    {"short": "decodo", "name": "Decodo", "signup": "https://dashboard.decodo.com/register", "mint": "https://dashboard.decodo.com/web-data/playground", "keys": "https://dashboard.decodo.com/web-data/playground", "billing": null, "usage": null,
+     "rank": "14/19 hard pages (1 run, 2026-10-19)", "free": "$5 to start (up to 10K pages)", "cost": "about $0.001 a page", "step": "Copy the API key shown on the Web Data playground"},
+    {"short": "bd", "name": "Bright Data", "signup": "https://brightdata.com/cp/start", "mint": "https://brightdata.com/cp/web_access/new?type_selected=1", "keys": "https://brightdata.com/cp/setting/users", "billing": "https://brightdata.com/cp/billing", "usage": "https://brightdata.com/cp/billing/costs",
+     "rank": "11/19 hard pages (median of 9 runs, 8–14, 2026-10-15)", "free": "5,000 requests a month, renews on the 1st", "cost": "about $0.0015 a page", "step": "The page makes a Web Unlocker zone (any name is fine); on the success page press Open API settings and copy the API key"},
+    {"short": "gh", "name": "GitHub", "signup": "https://github.com/signup", "mint": "https://github.com/settings/tokens", "keys": "https://github.com/settings/tokens", "billing": null, "usage": null,
+     "rank": "only for `fats gh` (repositories), not pages", "free": "free · any GitHub account", "cost": "$0", "step": "Signed in to the gh CLI? setup copies its token (gh auth token); else create a token (no scopes needed) and copy it"}
   ],
   "cctld": {
     "lt": "lt lt", "de": "de de", "fr": "fr fr", "pl": "pl pl", "lv": "lv lv", "ee": "ee et",

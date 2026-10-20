@@ -1,5 +1,5 @@
 //! HTML → node arena. html5ever (WHATWG tree construction) feeds a small `TreeSink`; the arena is what the
-//! renderer walks. Replaces the hand-ported `html.parser` tokenizer and its 2,231-row entity table.
+//! renderer walks.
 
 use crate::settings::limit;
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
@@ -342,7 +342,7 @@ pub fn py_strip(s: &str) -> &str {
 
 /// Character references decoded the way the parser decodes `<textarea>` text (WHATWG RCDATA, so `\r\n` → `\n` and
 /// `&#1;` stays a control, as in page text): for text outside the parser (JSON-LD values, feed titles, the raw HTML a
-/// wall rule reads). Replaces a hand port of CPython's `html.unescape`.
+/// wall rule reads).
 pub fn unescape(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
@@ -400,11 +400,19 @@ mod tests {
             stack.extend(t.nodes[i].kids.iter().filter_map(Kid::node).map(|c| (c, d + 1)));
         }
         assert!(max > max_depth / 2 && max <= max_depth + 1, "depth {max}");
-        let nest = format!("{}x", "<b>".repeat(200_000));
-        let t0 = Instant::now();
-        assert_eq!(parse(&nest).cut, 0);
-        // the quadratic spill took 8.8 s (7bf579b), one pass 0.43 s at load 2: 4 s still catches it on a loaded machine
-        assert!(t0.elapsed() < Duration::from_secs(4), "spill is one pass: {:?}", t0.elapsed());
+        // the spill is one pass: 4× the nesting costs ~4× the time (a quadratic spill took ~16×); a ratio, never a
+        // wall-clock limit (a loaded CI runner failed `< 4 s`); the fastest of 3 runs each damps a load spike
+        let fastest = |n: usize| {
+            let nest = format!("{}x", "<b>".repeat(n));
+            let run = |_| {
+                let t0 = Instant::now();
+                let cut = parse(&nest).cut;
+                (t0.elapsed(), cut)
+            };
+            (0..3).map(run).min().unwrap_or_default()
+        };
+        let (small, big) = (fastest(25_000), fastest(100_000));
+        assert!(small.1 == 0 && big.1 == 0 && big.0 < small.0 * 8, "spill is one pass: {small:?} → {big:?}");
         let hostile = format!("{}{}", "<div>".repeat(3999), "</q>".repeat(200_000));
         let t0 = Instant::now();
         let _ = parse(&hostile);

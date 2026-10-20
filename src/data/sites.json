@@ -1,8 +1,9 @@
 {
   "gov": ["gov", "mil", "gouv", "gob", "go", "govt", "gv"],
   "doc_ext": [
-    [".pdf", "pdf"], [".zip", "zip"], [".docx", "zip"], [".xlsx", "zip"], [".pptx", "zip"],
-    [".txt", "text"], [".csv", "text"], [".md", "text"], [".json", "json"], [".xml", "xml"]
+    [".html", "html"], [".htm", "html"], [".xhtml", "html"], [".pdf", "pdf"], [".zip", "zip"], [".docx", "zip"],
+    [".xlsx", "zip"], [".pptx", "zip"], [".txt", "text"], [".csv", "text"], [".md", "text"], [".json", "json"], [".xml", "xml"],
+    [".key", "secret"], [".pem", "secret"], [".crt", "secret"], [".p12", "secret"], [".pfx", "secret"]
   ],
   "pdf_path": ["/pdf/"],
   "sld": [
@@ -11,5 +12,10 @@
   ],
   "shared": [
     "github.io", "netlify.app", "vercel.app", "pages.dev", "blogspot.com"
+  ],
+  "fence": [
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
+    "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+    "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8", "2001:db8::/32"
   ]
 }

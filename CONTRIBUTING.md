@@ -11,6 +11,11 @@ size check. The toolchain is pinned in `rust-toolchain.toml`; any warning fails 
 The line budget is the maintainer's gate, not a bar for contributors: a pull request that goes over it gets a
 delete pass together with you, not a rejection.
 
+Faster first build: in a new git worktree, `./check.sh` clones the main worktree's `target/` (APFS clonefile or
+reflink: no copy, no extra disk) and touches every source file, so it skips a cold build of every dependency.
+Never share one `target/` between worktrees: cargo names a path crate's artifacts relative to its workspace, so
+every worktree would run another worktree's `fats` build.
+
 The parity test (`tests/parity.rs`) compares the output with a private reference and skips unless `FATS_PARITY`
 points at that reference's output. You do not need it to contribute.
 

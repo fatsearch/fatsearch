@@ -1,10 +1,10 @@
 //! FILTER inside a page: the match ladder's local rungs: exact phrase → all words (stemmed)
-//! → best partial. `near`/`topic` need a model and are not in v1 (a `!` row says so).
+//! → best partial. `near`/`topic` need a model and are not in this build (a ! row says so).
 
 use crate::cache::Cursor;
 use crate::clean::{CARD, collapse, fold, tok};
 use crate::lang::{Match, bin, cut};
-use crate::outline::{GREP_CAP, Page, Shown, cap_rows, info_line, is_thin, lead, span};
+use crate::outline::{Page, Shown, cap_rows, info_line, is_thin, lead, span};
 
 fn terms_of(words: &[String]) -> Vec<String> {
     let trim = |w: &String| fold(w).trim_matches(|c| ".,;:!?\"'()".contains(c)).to_string();
@@ -76,12 +76,17 @@ pub fn grep(
     let hits: Vec<String> = rows.iter().map(|&(i, pos)| hit_row(pid, &cands[i], pos)).collect();
     let head = format!("= {eq} filter \"{q}\" · {} hit · {label}", rows.len());
     let (used, mut lines) = (tok(&head), vec![head]);
-    let shown = cap_rows(&mut lines, &hits, used, (GREP_CAP, 0, limit));
+    let shown = cap_rows(&mut lines, &hits, used, (crate::settings::limit::<usize>("grep_cap"), 0, limit));
     if shown < rows.len() {
         lines.push(format!("… +{} hits · narrow: {b} {id} {q} <more words>", rows.len() - shown));
     }
     lines.push(format!("read: {b} {pid}#{}", cands[rows[0].0].0));
     Ok((lines, cursor))
+}
+
+/// THE list filter (`links`, `cards`, `stats`): every word is in the text, case and accents folded (`fold`).
+pub fn holds(text: &str, words: &[String]) -> bool {
+    words.iter().all(|w| fold(text).contains(&fold(w)))
 }
 
 /// The lines a filter searches, with their section: the info line (#0), then every title and line in scope. A
@@ -103,15 +108,13 @@ fn candidates(p: &Page, sec: Option<usize>) -> Vec<(usize, String, usize)> {
         raw.push((k, &s.title));
         raw.extend(s.lines.iter().map(|l| (k, l.as_str())));
     }
-    raw.iter()
-        .enumerate()
-        .map(|(i, &(k, ln))| match raw.get(i + 1) {
-            Some(&(k2, nx)) if ln.chars().count() < 60 && k2 == k => {
-                (k, format!("{ln} → {}", cut(nx, 120)), fold(ln).chars().count())
-            }
-            _ => (k, ln.to_string(), usize::MAX),
-        })
-        .collect()
+    let joined = |(i, &(k, ln)): (usize, &(usize, &str))| match raw.get(i + 1) {
+        Some(&(k2, nx)) if ln.chars().count() < 60 && k2 == k => {
+            (k, format!("{ln} → {}", cut(nx, 120)), fold(ln).chars().count())
+        }
+        _ => (k, ln.to_string(), usize::MAX),
+    };
+    raw.iter().enumerate().map(joined).collect()
 }
 
 /// THE match ladder over folded lines: exact phrase (pinned `match:exact`, or first when unpinned, the all-words
@@ -129,14 +132,11 @@ fn ladder(folded: &[String], words: &[String], rung: Match, pinned: bool) -> Run
     let terms = terms_of(words);
     let auto = if pinned { "" } else { " auto" };
     // (terms found, candidate index, first position)
-    let scored: Vec<(usize, usize, usize)> = folded
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f)| {
-            let pos: Vec<usize> = terms.iter().filter_map(|t| cfind(f, t).or_else(|| cfind(f, stem(t)))).collect();
-            (!pos.is_empty()).then(|| (pos.len(), i, pos.into_iter().min().unwrap_or(0)))
-        })
-        .collect();
+    let score = |(i, f): (usize, &String)| {
+        let pos: Vec<usize> = terms.iter().filter_map(|t| cfind(f, t).or_else(|| cfind(f, stem(t)))).collect();
+        (!pos.is_empty()).then(|| (pos.len(), i, pos.into_iter().min().unwrap_or(0)))
+    };
+    let scored: Vec<(usize, usize, usize)> = folded.iter().enumerate().filter_map(score).collect();
     let all = |x: &&(usize, usize, usize)| x.0 == terms.len() && !exact.iter().any(|e| e.0 == x.1);
     let full: Vec<(usize, usize)> = scored.iter().filter(all).map(|x| (x.1, x.2)).collect();
     if !exact.is_empty() || !full.is_empty() {

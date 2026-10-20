@@ -1,6 +1,6 @@
 //! Text documents (`clean::Lists::text`: plain text, CSV, Markdown, JSON, XML incl. RSS/Atom/sitemaps) → Doc, served as
-//! they are: one `lN` row per line, 300 lines per section (`u1#2` = lines 301-600). Replaces the page path for
-//! these bodies, which judged them as JavaScript shells and sent them to every provider.
+//! they are: one `lN` row per line, 300 lines per section (`u1#2` = lines 301-600). Never the page path: a text body
+//! judged as a page reads as a JS shell and goes to every provider.
 
 use crate::clean::{Doc, Section, collapse};
 use serde_json::Value;
@@ -15,15 +15,12 @@ const LIST: usize = 20;
 pub fn build(raw: &[u8], kind: &str, url: &str, fin: &str) -> Doc {
     let text = String::from_utf8_lossy(raw);
     let all: Vec<&str> = text.lines().collect();
-    let sections: Vec<Section> = all
-        .chunks(LINES)
-        .enumerate()
-        .map(|(i, c)| Section {
-            level: 1,
-            title: format!("lines {}-{}", i * LINES + 1, i * LINES + c.len()),
-            lines: c.iter().enumerate().map(|(j, l)| format!("l{} {l}", i * LINES + j + 1).trim_end().into()).collect(),
-        })
-        .collect();
+    let chunk = |(i, c): (usize, &[&str])| Section {
+        level: 1,
+        title: format!("lines {}-{}", i * LINES + 1, i * LINES + c.len()),
+        lines: c.iter().enumerate().map(|(j, l)| format!("l{} {l}", i * LINES + j + 1).trim_end().into()).collect(),
+    };
+    let sections: Vec<Section> = all.chunks(LINES).enumerate().map(chunk).collect();
     let outline = match kind {
         "json" => serde_json::from_slice(raw).map(|v| json_outline(&v)).unwrap_or_default(),
         "xml" => xml_outline(&text),

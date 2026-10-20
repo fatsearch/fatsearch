@@ -1,6 +1,7 @@
 //! LANG: argv → command (parse + repair) and the ONLY place that writes to stdout.
 
 use chrono::Datelike;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::{LazyLock, OnceLock};
 
@@ -25,23 +26,28 @@ pub struct Words {
     /// A leading verb is dropped (`read u2#3`); it also says the rest are words (`search stat`).
     verbs: Vec<&'static str>,
     /// Known mod keys (aliases resolve to these first), and those that take a boolean.
-    keys: Vec<&'static str>,
+    pub keys: Vec<&'static str>,
     bools: Vec<&'static str>,
     /// The commands a lone word may be a typo of. The reading words (`more`, `full`, `json`, `links`, `help`)
     /// are left out: their neighbours are real searches (`mode`, `fuel`, `jason`, `yelp`).
     pub commands: Vec<&'static str>,
     /// More commands a first word led into a URL or id may be a typo of (`fetchh https://x`, `hlep u1`).
     led: Vec<&'static str>,
-    /// Extensions that make a token a path (`page.html`, `a.pdf`), whether or not the file exists.
-    doc_ext: Vec<&'static str>,
+    /// Search-engine operators: an unknown key among them is a search word as typed (`filetype:pdf`), never `?`.
+    operators: Vec<&'static str>,
     /// The IANA root zone (`tlds-alpha-by-domain.txt`, version 2026101900): a bare name is a host only when its
     /// last label is one (`bare_tld`): `opencode.json`, `main.go` are words.
     tlds: Vec<&'static str>,
-    /// The TLDs that are also file extensions (`main.rs`, `notes.md`): a bare one is a host only leading the
-    /// command (`fats docs.rs tokio`), else a word (`bare_tld`). Pinned by `tests::file_tlds_are_derived`.
+    /// The TLDs that are a file's extension too: a lone one-dot name ending in one (`main.rs`) is a file when it
+    /// exists, else it asks file or site (`parse`), never a guessed site.
     file_tlds: Vec<&'static str>,
+    /// Key and credential file names (`.env.*` = a prefix), matched on the bare name: `cli::secret`.
+    pub secret_names: Vec<&'static str>,
     /// A filter for only these words that finds nothing points to the page's media list (`search::grep`).
     pub media: Vec<&'static str>,
+    /// Agent hosts by the env marker each sets for the commands it runs (`stats::host_of`): `CLAUDECODE` (Claude
+    /// Code's shell), `CODEX_THREAD_ID` (Codex's exec env), `PI_CODING_AGENT` (pi); the first set one wins.
+    pub hosts: Vec<(&'static str, &'static str)>,
     /// Words a filter never looks for (`search::terms_of`, the title query).
     pub stop: Vec<&'static str>,
 }
@@ -51,19 +57,85 @@ pub static WORDS: LazyLock<Words> = LazyLock::new(|| crate::settings::table("wor
 pub const CARD: &str = "\
 fats <url|file.pdf>     fetch, outline           fats u3  u3#2  u3#2 l4  page  section  link
 fats u3#2 <words>       filter inside            fats <words>  web search → ids  site:ex.com  since:7d
-mods key:value   limit:20  match:exact|words  country:de  js:true  cost:0.5  wait:30 (s, then pending)  provider:plain|bd|oxy|auto (auto = table order)  device:mobile
-more  up  all  full  json     fats = status  fats setup = keys  fats account = balance, usage     j8.u3 = id from another session";
+mods key:value  limit:20  match:exact|words  country:de  js:true  cost:0.5  wait:30 (then pending)  provider:plain|bd|oxy|decodo  device:mobile
+more  up  all  full  json  fats = status  fats setup = keys  fats account = balance  j8.u3 = another session's id";
+
+/// `fats guide`: how to use fats well, the body the installed skill points at (`skills/fatsearch/SKILL.md`), so
+/// the guide always matches this binary.
+pub const GUIDE: &str = include_str!("data/guide.md");
+
+/// The line every first door ends with (`help`, `version`, the status, `setup`, a word that is no command): where
+/// the guide is and what reading it costs.
+pub fn to_guide() -> String {
+    format!("agents: {} guide = the skill (~{} tok)", bin(), ksize(crate::clean::tok(GUIDE)))
+}
+
+/// `--help` anywhere (an en or em dash for `--`: smart punctuation), or `-h`.
+const HELP_FLAGS: [&str; 4] = ["--help", "-h", "—help", "–help"];
+
+/// The human screens (`src/data/screens/`: text a human edits without Rust; `paint` fills the `{hole}`s).
+/// A `help-<topic>` row is `fats help <topic>`.
+pub const SCREENS: [(&str, &str); 11] = crate::settings::embed!("screens/", ".txt": "home", "ready", "yours",
+    "help", "help-mcp", "help-setup", "help-search", "tip-page", "tip-search", "setup", "telemetry");
+
+/// The styles a screen names (`{bold}` … `{/}`) and their ANSI SGR codes; none under `NO_COLOR` (no-color.org:
+/// set and not empty).
+const STYLES: [(&str, u8); 6] = [("bold", 1), ("dim", 2), ("green", 32), ("red", 31), ("cyan", 36), ("/", 0)];
+
+/// A screen with styles only.
+const NO_HOLES: [(&str, &str); 0] = [];
+
+pub fn screen(name: &str) -> &'static str {
+    SCREENS.iter().find(|s| s.0 == name).map_or("", |s| s.1)
+}
+
+/// THE hole filler (screens, `errors.json` fixes, table rows): each `{name}` of `holes`, in their order, becomes
+/// its value; any other `{` stays (JSON, a stray brace).
+pub fn draw(text: &str, holes: &[(&str, impl AsRef<str>)]) -> String {
+    holes.iter().fold(text.to_string(), |t, (name, value)| t.replace(&format!("{{{name}}}"), value.as_ref()))
+}
+
+/// A human screen: `text`'s holes, then its styles.
+pub fn paint(text: &str, holes: &[(&str, impl AsRef<str>)]) -> String {
+    let plain = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    draw(&draw(text, holes), &STYLES.map(|(k, n)| (k, if plain { String::new() } else { format!("\x1b[{n}m") })))
+}
+
+/// A human reads the answer: stdout is a terminal, or `FATS_HUMAN=1` (`0` = never); never `json`, MCP, a unit test.
+pub fn human(json: bool) -> bool {
+    let forced = std::env::var("FATS_HUMAN").ok().and_then(|v| crate::settings::boolean(&v));
+    let agent = json || cfg!(test) || crate::cli::FENCE.get().is_some();
+    !agent && forced.unwrap_or_else(|| std::io::stdout().is_terminal())
+}
+
+/// The help a human gets: `help` first (`fats help mcp` = its `help-<topic>` screen) or a help flag anywhere;
+/// None = no help asked (the agent's `--help` is the card, `parse`).
+pub fn help_screen(argv: &[String]) -> Option<String> {
+    let first = argv.first().is_some_and(|a| a.eq_ignore_ascii_case("help"));
+    let topic = argv.get(1).filter(|_| first).map(|t| screen(&format!("help-{}", t.to_lowercase())));
+    let text = topic.filter(|t| !t.is_empty()).unwrap_or(screen("help"));
+    (first || argv.iter().any(|a| HELP_FLAGS.contains(&a.as_str()))).then(|| paint(text, &NO_HOLES))
+}
+
+/// A human's keyless failure: a page the free fetch could not read, or a search, while no paid provider is keyed
+/// (and on) → the tip to add one (`tip-page`, `tip-search`) instead of the `! no_key` rows; None for anything else.
+pub fn tip(cmd: &Cmd, out: &Out, search: bool) -> Option<String> {
+    let paid = crate::fetch::keyed().iter().any(|t| t.spec().price > 0.0);
+    let keyless = !paid && out.rc != 0 && out.parts.is_empty() && out.lines.iter().any(|l| l.contains("! no_key "));
+    let page = |u: &String| paint(screen("tip-page"), &[("site", crate::fetch::site(u))]);
+    let tip = if search { Some(paint(screen("tip-search"), &NO_HOLES)) } else { cmd.urls.first().map(page) };
+    tip.filter(|_| keyless && cmd.urls.len() < 2 && cmd.verb.is_none() && !cmd.flag("dry"))
+}
 
 static BIN: OnceLock<String> = OnceLock::new();
 
-/// Hints echo argv[0]'s file name, so they run as printed.
+/// Hints echo argv[0]'s file name, so they run as printed; an `.exe` is dropped (on Windows argv[0] is often the
+/// file a launcher found, `fats.exe`, while `fats` is what a user types there too).
 pub fn bin() -> &'static str {
     BIN.get_or_init(|| {
-        std::env::args()
-            .next()
-            .and_then(|a| Path::new(&a).file_name().map(|f| f.to_string_lossy().into_owned()))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "fats".into())
+        let p = std::path::PathBuf::from(std::env::args().next().unwrap_or_default());
+        let name = p.extension().filter(|e| e.eq_ignore_ascii_case("exe")).map_or(p.file_name(), |_| p.file_stem());
+        name.map(|f| f.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "fats".into())
     })
 }
 
@@ -93,8 +165,10 @@ pub struct At<'a> {
 pub fn fix(code: &str, at: &At) -> String {
     let hit = |k: &str| k.strip_suffix('*').map_or(k == code, |p| code.starts_with(p));
     let t = FIX.iter().find(|r| hit(r.0)).map_or(RETRY, |r| r.1);
-    let f = t.replace("{b}", bin()).replace("{id}", at.id).replace("{url}", at.url).replace("{arg}", at.arg);
-    let js = f.split(' ').any(|w| w == "js:true").then_some("oxyjs");
+    let f = draw(t, &[("b", bin()), ("id", at.id), ("url", at.url), ("arg", at.arg)]);
+    // `js:true` = the table's first render rung (`Tier::renders`: oxyjs), the render it adds to bd's
+    let js = f.split(' ').any(|w| w == "js:true");
+    let js = js.then(|| crate::provider::Tier::ALL.into_iter().find(|t| t.renders())).flatten().map(|t| t.spec().short);
     // the last `provider:` wins, as in `Cmd::get` (a search's `{id}` is its command, mods included)
     let tier = js.or(f.split(' ').filter_map(|w| w.strip_prefix("provider:")).next_back());
     // a mod already in force (`max_bytes:64m` at the ceiling) is the same failing call too
@@ -103,10 +177,11 @@ pub fn fix(code: &str, at: &At) -> String {
     // After a render that ran, a keyed paid tier this run did not call (one the site's wear skipped) is the
     // move, never "nothing left"; after a provider's refusal too (it said nothing of the page: bd
     // refused after oxy → oxyjs), never after a page's no-JS failure (`not_pdf`: a render brings no PDF)
-    let left =
-        crate::provider::Tier::ALL.into_iter().find(|t| t.spec().price > 0.0 && !at.done.contains(&t.spec().short));
-    if let Some(t) = left.filter(|_| sent && (js.is_some() || crate::provider::REFUSED.contains(&code))) {
-        return priced(&format!("{} {} fresh:true {}", bin(), at.id, t.ask()), at.url);
+    if sent
+        && (js.is_some() || crate::provider::REFUSED.contains(&code))
+        && let Some((_, arrow)) = crate::fetch::left_ask(at.id, at.url, at.done, |_| true)
+    {
+        return arrow;
     }
     if barred {
         let open = if at.url.is_empty() { String::new() } else { format!(" · open {} in a browser", at.url) };
@@ -122,14 +197,18 @@ pub fn fix(code: &str, at: &At) -> String {
     // the command is quoted (`priced`); a retry after a provider's unbilled error says so
     let (cmd, rest) = f.split_once(", ").map_or((f.as_str(), ""), |(c, _)| (c, &f[c.len()..]));
     let quoted = priced(cmd, at.url);
+    // a raised `cost:` that can buy nothing here (no paid tier keyed: `≤$0`) is a key's move, never a free retry
+    if code == "budget_hit" && quoted == cmd {
+        return fix("no_key", &At::default());
+    }
     let free = quoted != cmd && crate::provider::REFUSED.contains(&code);
-    format!("{quoted}{}{rest}", if free { " (last try not charged)" } else { "" })
+    format!("{quoted}{}{rest}", if free { " · last try not charged" } else { "" })
 }
 
 /// THE price glyph. An arrow whose command can spend (`fresh:`, `js:`, `provider:`,
 /// `timeout:`) ends with the most it can, `≤$0.0030` = `dry:true`'s `up to` for it (`fetch::worst`).
 pub fn priced(cmd: &str, url: &str) -> String {
-    let c = crate::fetch::worst(cmd, url);
+    let c = crate::fetch::worst(cmd, url).map_or(0.0, |r| r.1);
     if c > 0.0 { format!("{cmd} ≤${c:.4}") } else { cmd.into() }
 }
 
@@ -161,7 +240,12 @@ impl Flag {
 /// `fats-xyz setup`); the accounts' pages after it kept.
 pub fn restamp(row: &str, id: &str, url: &str) -> String {
     let ((head, f), code) = (row.split_once(" → ").unwrap_or((row, "")), row.split(' ').nth(1).unwrap_or_default());
-    let arg = f.split(' ').find_map(|w| w.strip_prefix("cost:")).unwrap_or_default();
+    // `{arg}` read back from the stored arrow: a `cost:`/`zone:` value, else its place in a fix naming no page
+    let t = FIX.iter().find(|r| r.0 == code).map_or("", |r| r.1);
+    let place =
+        t.split(' ').position(|w| w == "{arg}").filter(|_| !t.contains("{id}")).and_then(|i| f.split(' ').nth(i));
+    let arg =
+        f.split(' ').find_map(|w| w.strip_prefix("cost:").or(w.strip_prefix("zone:"))).or(place).unwrap_or_default();
     format!("{head} → {}{}", fix(code, &At { id, url, arg, done: &[] }), f.find(" · ").map_or("", |i| &f[i..]))
 }
 
@@ -337,6 +421,8 @@ pub struct Cmd {
     pub reserved: Vec<&'static str>,
     pub words: Vec<String>,
     pub mods: Vec<(String, String)>,
+    /// A settings change's words (`setup free off`, `config set batch_parallel 8`): never a search (`stats::change`).
+    pub sub: Vec<String>,
     /// The verb as typed (`search`), first among the non-mod tokens: printed first again, so a replay reads the
     /// same (`search login` stays a search).
     pub verb: Option<String>,
@@ -408,27 +494,96 @@ fn is_url(t: &str) -> bool {
 }
 
 /// The last label of a bare name (no scheme, no `/`): it names a host only when it is a real TLD (`Words::tlds`:
-/// `opencode.json`, `main.go` are words), and one that is also a file extension (`Words::file_tlds`: `main.rs`)
-/// only leading the command (`fats docs.rs tokio spawn`; `cargo build main.rs` = words). A scheme, a `/` or
-/// `site:` makes a host by its shape alone (`is_url`).
+/// `opencode.json`, `main.go` are words) and the name stands where an address is typed (`as_words`). A scheme, a
+/// `/` or `site:` makes a host by its shape alone (`is_url`).
 fn bare_tld(low: &str) -> Option<&str> {
     low.rsplit_once('.').filter(|_| !low.contains('/')).map(|(_, tld)| tld)
 }
 
-/// A path is a path only when it says so: `-`, `./ ../ / ~/`, a document extension (`page.html`, `a.pdf`), or a
-/// dotted name that exists here (`notes.md`). A bare word is text even if a file has that name (`price`,
-/// `README`), and with an id in the command only explicit paths count (free text wins).
-fn is_file(t: &str, any_id: bool) -> bool {
-    if t == "-" || ["./", "../", "/", "~/"].iter().any(|p| t.starts_with(p)) {
-        return true;
+/// A URL's host by its name alone, no lookup (`dry:true` spends nothing, the network included): an IP address, or
+/// a name whose last label is a real TLD (`Words::tlds`) a resolver can ask for (`askable`). False = `no_host`:
+/// `dead.invalid`, `intranet`, `a..com`, `-a.com`, a 64-char label, none.
+pub fn real_host(url: &str) -> bool {
+    let host = crate::clean::host_of(url);
+    let tld = host.strip_suffix('.').unwrap_or(&host).rsplit('.').next().unwrap_or_default();
+    host.parse::<std::net::IpAddr>().is_ok() || (WORDS.tlds.contains(&tld) && askable(&host))
+}
+
+/// A name a resolver can ask for, by its shape alone (never its TLD: a test's `*.invalid` is one): every label
+/// 1–63 chars, no hyphen at either end (RFC 1035 §2.3.1, §2.3.4; one root dot may end the name). The real run's
+/// rule too: `provider::host_check` never looks the rest up.
+pub fn askable(host: &str) -> bool {
+    let label_ok = |l: &str| (1..=63).contains(&l.len()) && !l.starts_with('-') && !l.ends_with('-');
+    host.strip_suffix('.').unwrap_or(host).split('.').all(label_ok)
+}
+
+/// A path is a path only when it says so: `-`, a leading `/`, a `shaped` token (`class_of`), a document or secret
+/// extension or name (`page.html`, `a.pdf`, `id.pem`, `id_rsa`: `fetch::doc_kind`, `cli::secret`; alone, missing:
+/// `no_file`), or any name that is a file here (`README`; the fence first, then one stat). With an id in the command
+/// only explicit paths count (free text wins: `u1 price`). Beside search words only a `shaped` or extended path stays
+/// one whether it exists or not, and `-` must be the whole command (`as_words`). A missing one-dot name whose extension
+/// is a document's AND a real TLD (`notes.md`) is a file or a site: Err = the `?` that asks which (`file_or_site`), $0.
+fn is_file(t: &str, any_id: bool) -> Result<bool, String> {
+    if t == "-" || t.starts_with('/') {
+        return Ok(true);
     }
     let ext = Path::new(t).extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
-    !any_id && !t.contains("://") && ext.is_some_and(|e| WORDS.doc_ext.contains(&e.as_str()) || Path::new(t).is_file())
+    let doc = ext.as_ref().is_some_and(|e| crate::fetch::doc_kind(&format!(".{e}")).is_some());
+    let file = !any_id && !t.contains("://") && (doc || filed(Path::new(t)) || crate::cli::secret(Path::new(t)));
+    match file_or_site(t, &WORDS.tlds).filter(|_| file && doc) {
+        Some(q) => Err(q),
+        None => Ok(file),
+    }
+}
+
+/// A one-dot name (no `/`; a `\` is `shaped`) whose TLD is in `tlds` and that is no file here: the `?` that asks
+/// file or site, $0 (`is_file`; a lone `main.rs`, `parse`).
+fn file_or_site(t: &str, tlds: &[&str]) -> Option<String> {
+    let tld = bare_tld(&t.to_lowercase()).filter(|d| tlds.contains(d) && t.matches('.').count() == 1).is_some();
+    (tld && !filed(Path::new(t))).then(|| format!("? {t}: a missing file or a site · type ./{t} or https://{t}"))
+}
+
+/// A token shaped as a path whatever stands beside it: a `./ ../ file:` prefix, a dot-led name (`.env`, `.ssh`;
+/// `.NET`, `.io` lead a TLD: words; `.5` and `...` no name), a home (`~/`, `~name/`) or a
+/// variable (`$HOME/`, `${HOME}/`) leading a `/`, any `\` (`.\x`, `..\x`, `~\x`, `\\server\share`, `C:\x`), a drive
+/// (`C:/x`), a `/` path of ≥ 2 non-empty segments (`/etc/hosts`; `/DE/` is one: beside words a search word,
+/// `as_words`), or a bare one of ≥ 3 that no host leads (`internal/hr/salaries`; `TCP/IP` is a word, `docs.rs/a/b`
+/// a URL). A name of digits leads no home or variable: `~5/10`, `$5/mo` are words.
+fn shaped(t: &str) -> bool {
+    let (b, low) = (t.as_bytes(), t.to_ascii_lowercase());
+    let drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/';
+    let segments = t.split('/').filter(|s| !s.is_empty()).count();
+    let deep = if t.starts_with('/') { segments >= 2 } else { segments >= 3 && !is_url(t) && !t.contains(':') };
+    // the name after `~` `$` `.` up to a `/`: a letter, `_` or `{` first; after `.` no TLD (`.NET`, `.io`)
+    let name = |r: &str, dot: bool| {
+        let n = r.split('/').next().unwrap_or_default();
+        n.starts_with(|c: char| c.is_ascii_alphabetic() || "_{".contains(c)) && !(dot && WORDS.tlds.contains(&n))
+    };
+    let home = |s: char| low.strip_prefix(s).is_some_and(|r| r.contains('/') && name(r, false));
+    let dot = low.strip_prefix('.').is_some_and(|r| name(r, true));
+    let lead = ["./", "../", "~/", "file:"].iter().any(|p| low.starts_with(p));
+    drive || deep || home('~') || home('$') || dot || lead || t.contains('\\')
+}
+
+/// A local path as the shell would read it: `~/` is the home directory.
+pub fn local_path(f: &str) -> std::path::PathBuf {
+    f.strip_prefix("~/").map_or_else(|| f.into(), |r| dirs::home_dir().unwrap_or_default().join(r))
+}
+
+/// A file here, or a path the `fats mcp` fence refuses by its name alone (`cli::outside`): out there the disk is
+/// never looked at, and the path stays a path (`not_allowed`). A bare name never stands outside.
+fn filed(p: &Path) -> bool {
+    crate::cli::outside(p) || p.is_file()
 }
 
 /// Normalise one `key:value` (aliases, liberal booleans). Err = the `?` line.
 fn modifier(k: &str, v: &str) -> Result<(String, String), String> {
     let (k, v) = alias(&k.to_ascii_lowercase(), v)?;
+    // a threshold for this command (`batch_parallel:8`, `settings::limit_of`)
+    if let Some(built) = crate::settings::LIMITS.get(k.as_str()) {
+        let fit = crate::settings::fits(&k, &v).map(|_| (k.clone(), v.clone()));
+        return fit.ok_or(format!("? {k}:{v} · a number like {k}:{built}"));
+    }
     if !WORDS.keys.contains(&k.as_str()) {
         return Err(format!("? {k}: unknown · keys {}", WORDS.keys.join(" ")));
     }
@@ -441,24 +596,16 @@ fn alias(k: &str, v: &str) -> Result<(String, String), String> {
         "n" => ("limit", v.to_string()),
         "geo" | "loc" | "gl" | "country" => ("country", v.to_ascii_lowercase()),
         "budget" => ("cost", v.to_string()),
-        "device" | "ua" => {
-            let d = match v.to_ascii_lowercase().as_str() {
-                "mobile" | "phone" => "mobile",
-                "desktop" | "pc" => "desktop",
-                _ => return Err(format!("? device:{v} · use device:mobile|desktop (Oxylabs only)")),
-            };
-            ("device", d.into())
-        }
+        "device" | "ua" => match v.to_ascii_lowercase().as_str() {
+            "mobile" | "phone" => ("device", "mobile".into()),
+            "desktop" | "pc" => ("device", "desktop".into()),
+            _ => return Err(format!("? device:{v} · use device:mobile|desktop (Oxylabs only)")),
+        },
         "loose" => {
             let n: u32 =
                 v.parse().map_err(|_| format!("? loose:{v} · loose takes 0..100 · or match:exact|words|near|topic"))?;
-            let m = match n {
-                0 => "exact",
-                1..=49 => "words",
-                50..=79 => "near",
-                _ => "topic",
-            };
-            ("match", m.into())
+            // 0 exact · 1-49 words · 50-79 near · 80+ topic (`MATCH` order)
+            ("match", MATCH[[1, 50, 80].iter().filter(|&&lo| n >= lo).count()].into())
         }
         _ => (k, v.to_string()),
     };
@@ -482,7 +629,7 @@ fn value(k: &str, v: String) -> Result<String, String> {
         "limit" | "max" | "from" => count(&v).map(|n| n as u64).ok_or("{k}:{v} · {k} takes a count: {k}:20 · {k}:1k"),
         _ => return text_value(k, v),
     };
-    n.map(|n| n.to_string()).map_err(|q| format!("? {}", q.replace("{k}", k).replace("{v}", &v)))
+    n.map(|n| n.to_string()).map_err(|q| format!("? {}", draw(q, &[("k", k), ("v", &v)])))
 }
 
 /// `value` for the keys whose value is a word: `match` `provider` `country` `since` `site` `cost`.
@@ -501,18 +648,18 @@ fn text_value(k: &str, v: String) -> Result<String, String> {
             (v.parse::<f64>().is_ok_and(|x| x.is_finite() && x >= 0.0), "cost takes US dollars per call: cost:0.5")
         }
         "provider" => {
-            // the JS tier is `provider:oxy js:true`, not a provider of its own
-            let t =
-                crate::provider::Tier::parse(&v.to_ascii_lowercase()).filter(|t| *t != crate::provider::Tier::OxyJs);
+            // a JS rung is `provider:oxy js:true`, not a provider of its own (`Tier::renders`)
+            use crate::provider::Tier;
+            let t = Tier::parse(&v.to_ascii_lowercase()).filter(|t| !t.renders());
             let p = t.map(|t| t.spec().short).or((v.eq_ignore_ascii_case("auto")).then_some("auto"));
-            return p.map(String::from).ok_or(format!("? provider:{v} · use provider:auto|plain|bd|oxy"));
+            let all: Vec<&str> = Tier::ALL.iter().filter(|t| !t.renders()).map(|t| t.spec().short).collect();
+            return p.map(String::from).ok_or(format!("? provider:{v} · use provider:auto|{}", all.join("|")));
         }
         "site" => {
             let s = v.to_ascii_lowercase();
             let s = s.strip_prefix("https://").or(s.strip_prefix("http://")).unwrap_or(&s).trim_end_matches('/');
-            return is_url(s)
-                .then(|| s.to_string())
-                .ok_or(format!("? site:{v} · a host: site:example.com · site:docs.rs/serde"));
+            let host = is_url(s).then(|| s.to_string());
+            return host.ok_or(format!("? site:{v} · a host: site:example.com · site:docs.rs/serde"));
         }
         _ => (true, ""),
     };
@@ -536,22 +683,17 @@ fn repair(argv: &[String]) -> Vec<String> {
         if t.starts_with(['U', 'J']) && t[1..].starts_with(|c: char| c.is_ascii_digit()) {
             t = t.to_lowercase();
         }
-        if let Some((a, b)) = t.split_once(['/', ':'])
-            && a.starts_with('j')
-            && num(&a[1..]).is_some()
-            && b.starts_with('u')
-        {
+        let job =
+            t.split_once(['/', ':']).filter(|(a, b)| a.strip_prefix('j').and_then(num).is_some() && b.starts_with('u'));
+        if let Some((a, b)) = job {
             t = format!("{a}.{b}");
         }
-        if let Some(r) = t.strip_prefix('u')
-            && let Some((a, b)) = r.split_once('.')
-            && num(a).is_some()
-            && num(b).is_some()
-        {
+        let sec = t.strip_prefix('u').and_then(|r| r.split_once('.')).filter(|(a, b)| num(a).and(num(b)).is_some());
+        if let Some((a, b)) = sec {
             t = format!("u{a}#{b}");
         }
-        // --full → full · -v → verbose:true · -n 20 / n=20 → limit:20 · key=value → key:value
-        if let Some(r) = t.strip_prefix("--").filter(|r| WORDS.reserved.contains(r)) {
+        // --full → full · -v → verbose:true · -n 20 / n=20 → limit:20 · key=value → key:value; `--help` stays a flag
+        if let Some(r) = t.strip_prefix("--").filter(|r| *r != "help" && WORDS.reserved.contains(r)) {
             t = r.to_string();
         } else if t == "-v" {
             t = "verbose:true".into();
@@ -577,7 +719,39 @@ fn repair(argv: &[String]) -> Vec<String> {
         }
         out.push(t);
     }
-    out
+    undecorate(out)
+}
+
+/// A pasted arrow's decorations are no words (`fats u1 js:true · bd, then oxyjs ≤$0.0030 ≈25s`, `u1#3 · 1.5k tok · $0`,
+/// `u2 · rendered`, `config · FATS_CACHE`): on a command led by an id, a job, a URL with its scheme or
+/// `setup`/`stats`/`config`, a `(…)` group (an older build's), a `≤$X` price (`$0` shell-expanded too), a `≈Ns` or
+/// `~Ns` time, and a `·` with the words after it up to the next `key:value` are dropped, wherever they stand. Any other
+/// command keeps them: `rust (programming language)` is a query.
+fn undecorate(toks: Vec<String>) -> Vec<String> {
+    let first = toks.first().map(|t| t.to_ascii_lowercase()).unwrap_or_default();
+    let job = first.strip_prefix('j').and_then(num).is_some();
+    let url = ["http://", "https://"].iter().any(|s| first.starts_with(s));
+    if !(Id::parse(&first).is_some() || job || url || ["setup", "stats", "config"].contains(&first.as_str())) {
+        return toks;
+    }
+    let (mut group, mut dot) = (false, false);
+    let mut keep = |t: &String| {
+        let inside = group || t.starts_with('(');
+        group = inside && !t.ends_with(')');
+        dot = (dot || t == "·") && key_value(t).is_none();
+        let time = t.strip_prefix(['~', '≈']).and_then(|r| r.strip_suffix('s')).is_some_and(|n| num(n).is_some());
+        // `≤` alone: an unquoted shell expands `$0` (`≤zsh.0030`)
+        !(inside || dot || t.starts_with('≤') || time)
+    };
+    toks.into_iter().filter(|t| keep(t)).collect()
+}
+
+/// A `key:value` by its shape (`limit:5`, `filetype:pdf`); a URL's scheme and a path are none.
+fn key_value(t: &str) -> Option<(&str, &str)> {
+    let (k, v) = t.split_once(':')?;
+    let key = !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_');
+    let scheme = ["http", "https"].contains(&k.to_ascii_lowercase().as_str());
+    (key && !scheme && !v.is_empty() && !v.starts_with('/')).then_some((k, v))
 }
 
 /// The command a word is a typo of (edits = optimal string alignment: a letter changed, added, dropped, or two
@@ -613,21 +787,23 @@ pub fn parse(argv: &[String]) -> Cmd {
     // a verb is the first token, mods aside (`limit:5 search login`): the words after it are meant as words
     let lead = toks.iter().position(|t| !matches!(class_of(t, false, false, true), Ok(Class::Mod(..))));
     cmd.verb = lead.filter(|&i| WORDS.verbs.contains(&toks[i].to_lowercase().as_str())).map(|i| toks.remove(i));
+    if let Some(i) = lead.filter(|_| cmd.verb.is_none()) {
+        own_words(&mut cmd, &mut toks, i);
+    }
     // `--help` or `-h` anywhere (an en or em dash for `--`: smart punctuation), or `help` first, is the card: never
     // a paid search for the other words
     let first_help = cmd.verb.is_none() && lead.is_some_and(|i| toks[i].eq_ignore_ascii_case("help"));
-    if first_help || toks.iter().any(|t| ["--help", "-h", "—help", "–help"].contains(&t.as_str())) {
-        toks = vec!["guide".into()];
+    if first_help || toks.iter().any(|t| HELP_FLAGS.contains(&t.as_str())) {
+        toks = vec!["help".into()];
     }
     let has_id = toks.iter().any(|t| Id::parse(t).is_some());
-    let (mut cls, mut any_id, first) = (Vec::new(), false, lead.filter(|_| cmd.verb.is_none()));
-    for (i, t) in toks.iter().enumerate() {
+    let (mut cls, mut any_id) = (Vec::new(), false);
+    for t in &toks {
         match class_of(t, has_id, any_id, cmd.verb.is_some()) {
-            // a TLD that is a file extension too names a host only leading the command (`cargo build main.rs`)
-            Ok(Class::Url(_))
-                if Some(i) != first && bare_tld(&t.to_lowercase()).is_some_and(|x| WORDS.file_tlds.contains(&x)) =>
-            {
-                cls.push((t.clone(), Class::Word));
+            // a directory here is no file and no search word (`/etc`, `./src`); outside the `fats mcp` fence the
+            // disk is never looked at: the run says `not_allowed`
+            Ok(Class::File(f)) if !crate::cli::outside(&local_path(&f)) && local_path(&f).is_dir() => {
+                cmd.ask.get_or_insert(format!("? {f} is a directory · name a file in it"));
             }
             Ok(c) => {
                 any_id |= matches!(c, Class::Id(_));
@@ -638,6 +814,7 @@ pub fn parse(argv: &[String]) -> Cmd {
             }
         }
     }
+    as_words(&mut cls);
     // free words that are all flags (`--login`, `-x`, `limit:5 -x`; an en or em dash for `--`, `–x`) are an option
     // fats lacks, never a search; any other free word makes every word text, wherever the dash is (doctrine §1:
     // `git rebase --onto`, `rust -tokio` excludes, `-5 degrees`), as does a verb, an id or a file: beside a page
@@ -645,7 +822,7 @@ pub fn parse(argv: &[String]) -> Cmd {
     // keeps a dash as typed.
     let search = cmd.verb.is_none() && !cls.iter().any(|p| matches!(p.1, Class::Id(_) | Class::File(_)));
     let words: Vec<&String> = cls.iter().filter(|p| search && matches!(p.1, Class::Word)).map(|p| &p.0).collect();
-    if let Some(t) = words.first().filter(|_| words.iter().all(|t| t.len() > 1 && t.starts_with(['-', '–', '—']))) {
+    if let Some(t) = words.first().filter(|_| words.iter().all(|t| is_flag(t))) {
         let name = t.trim_start_matches(['-', '–', '—']);
         let fix =
             if WORDS.bools.contains(&name) { format!("mod: {name}:true") } else { format!("keys: {} setup", bin()) };
@@ -653,10 +830,16 @@ pub fn parse(argv: &[String]) -> Cmd {
     }
     // mods and the output mod aside (one `alone` for both): a lone word, or a first word led into a URL or id,
     // may be a command's typo or a word that names no command
-    let kinds: Vec<&Class> =
-        cls.iter().map(|p| &p.1).filter(|c| !matches!(c, Class::Mod(..) | Class::Res("json"))).collect();
-    let led = matches!(kinds[..], [Class::Word, Class::Url(_) | Class::Id(_), ..]);
-    let (lone, none) = (matches!(kinds[..], [Class::Word]), kinds.is_empty());
+    let kinds: Vec<&(String, Class)> =
+        cls.iter().filter(|p| !matches!(p.1, Class::Mod(..) | Class::Res("json"))).collect();
+    let led = matches!(kinds[..], [(_, Class::Word), (_, Class::Url(_) | Class::Id(_)), ..]);
+    let (lone, none) = (matches!(kinds[..], [(_, Class::Word)]), kinds.is_empty());
+    // a lone one-dot name ending in a file's extension (`main.rs`) that is no file here is a file or a site: ask, $0
+    if let [(t, Class::Url(_))] = kinds[..]
+        && let Some(q) = file_or_site(t, &WORDS.file_tlds)
+    {
+        cmd.ask.get_or_insert(q);
+    }
     sort_into(&mut cmd, kinds.len() == 1, cls, any_id);
     cmd.idle = none && cmd.get("site").is_none() || cmd.ask.is_some();
     if cmd.verb.is_none() && (led || lone) {
@@ -700,6 +883,10 @@ fn class_of(t: &str, has_id: bool, any_id: bool, verb: bool) -> Result<Class, St
     if let Some(r) = WORDS.reserved.iter().copied().find(|r| *r == low).or(alias) {
         return Ok(Class::Res(r));
     }
+    if shaped(t) && !low.starts_with("file:") {
+        // a drive (`C:\x`) before any `key:value` reading: a path, never `? c: unknown`
+        return Ok(Class::File(t.to_string()));
+    }
     if low.starts_with("file:") {
         // a local file (`file:///a/b.pdf` → `/a/b.pdf`, percent-decoded), read like a path (and fenced the same
         // way under `fats mcp`), never a search
@@ -707,16 +894,14 @@ fn class_of(t: &str, has_id: bool, any_id: bool, verb: bool) -> Result<Class, St
         let path = path.map(|p| Class::File(p.to_string_lossy().into_owned()));
         return path.ok_or(format!("? {t}: a file URL names a local path: {} /path/to/file", bin()));
     }
-    if let Some((k, v)) = t.split_once(':')
-        && !k.is_empty()
-        && k.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')
-        && !v.starts_with('/')
-        && !v.is_empty()
-        && !["http", "https"].contains(&low.split(':').next().unwrap_or(""))
-    {
+    if let Some((k, v)) = key_value(t) {
+        // a search engine's own query key (`filetype:pdf`) goes to the search as typed
+        if WORDS.operators.contains(&k.to_ascii_lowercase().as_str()) {
+            return Ok(Class::Word);
+        }
         return modifier(k, v).map(|(k, v)| Class::Mod(k, v));
     }
-    if is_file(t, has_id) {
+    if is_file(t, has_id)? {
         return Ok(Class::File(t.to_string()));
     }
     if !any_id && is_url(t) && bare_tld(&low).is_none_or(|tld| WORDS.tlds.contains(&tld)) {
@@ -735,6 +920,40 @@ fn class_of(t: &str, has_id: bool, any_id: bool, verb: bool) -> Result<Class, St
     Ok(Class::Word)
 }
 
+/// A token that only looks like a place is a search word: a bare name (no scheme, no `/`, `bare_tld`) names a
+/// host unless the command holds a free word (not a host, not a URL: `example.com example.org` = two pages), and
+/// then still when it leads the way an address is typed, in lower case (`docs.rs tokio spawn`, mods and a verb
+/// aside); mid-query (`contact at acme.com phone`) or written as a name (`Booking.com hotels Lisbon`) it is a
+/// word, so no one-site search the agent never asked for.
+fn as_words(cls: &mut [(String, Class)]) {
+    let free = cls.iter().any(|(t, c)| matches!(c, Class::Word | Class::Num(_)) && !is_flag(t));
+    let lead = cls.iter().position(|(t, c)| !matches!(c, Class::Mod(..)) && !is_flag(t));
+    for (i, (t, c)) in cls.iter_mut().enumerate() {
+        let typed = Some(i) == lead && !t.bytes().any(|b| b.is_ascii_uppercase());
+        if matches!(c, Class::Url(_)) && bare_tld(&t.to_lowercase()).is_some() && free && !typed {
+            *c = Class::Word;
+        }
+    }
+    // a local path never reaches a search: a `shaped` one or one with an extension is a file wherever it stands
+    // (`no_file`, `not_allowed`); beside search words only a bare shape that is no file here is text (`CORP /DE/
+    // company`, `TCP/IP tuning` search), unless the `fats mcp` fence refuses it by name (`not_allowed`, the disk
+    // never looked at), and `-` (stdin) is the whole command
+    if cls.iter().any(|p| matches!(p.1, Class::Word)) {
+        for (t, c) in cls.iter_mut() {
+            if let Class::File(p) = c
+                && (p == "-" || !shaped(t) && Path::new(p).extension().is_none() && !filed(&local_path(p)))
+            {
+                *c = Class::Word;
+            }
+        }
+    }
+}
+
+/// A flag as typed: a dash (an en or em dash for `--`: smart punctuation) and a name.
+fn is_flag(t: &str) -> bool {
+    t.len() > 1 && t.starts_with(['-', '–', '—'])
+}
+
 /// The classified tokens into `cmd`. Reserved words are reserved only when there is no free text, a list word
 /// leading the words after a page id aside (`Words::lists`); a bare number with a page id has several readings, so it
 /// asks. `alone` = one token, mods and `json` aside (`parse`); an alone-only word (`setup`) beside a page (an id, URL
@@ -746,12 +965,14 @@ fn sort_into(cmd: &mut Cmd, alone: bool, cls: Vec<(String, Class)>, any_id: bool
     let pinned = cls.iter().any(|(_, c)| matches!(c, Class::Mod(k, _) if k == "match"));
     let free = words > 0 || nums > 1 || (nums > 0 && (!any_id || pinned));
     let page = cls.iter().any(|(_, c)| matches!(c, Class::Id(_) | Class::Url(_) | Class::File(_)));
+    let lead = cls.iter().position(|(_, c)| matches!(c, Class::Res(_) | Class::Word | Class::Num(_)));
+    // `stats` leading free words filters its rows (`fats stats rust all`: every reserved word a mod), never a search
+    let index = lead.is_some_and(|i| matches!(cls[i].1, Class::Res("stats")));
     // `json` closing the words beside a page id or file is the output mod (`u1 price json`); on a search it is a
     // word like every reserved word there (`vite config json`, `example.com rust json`): JSON is `json:true`
-    let read = cls.iter().any(|(_, c)| matches!(c, Class::Id(_) | Class::File(_)));
+    let read = index || cls.iter().any(|(_, c)| matches!(c, Class::Id(_) | Class::File(_)));
     let last = cls.iter().rposition(|(_, c)| !matches!(c, Class::Mod(..)));
-    let lead = cls.iter().position(|(_, c)| matches!(c, Class::Res(_) | Class::Word | Class::Num(_)));
-    let list = |i, r: &str| any_id && Some(i) == lead && WORDS.lists.contains(&r);
+    let list = |i, r: &str| index || Some(i) == lead && any_id && WORDS.lists.contains(&r);
     for (i, (t, c)) in cls.into_iter().enumerate() {
         match c {
             Class::Res(r) if r == "json" && Some(i) == last && read => cmd.reserved.push(r),
@@ -780,14 +1001,50 @@ fn number_ask(cmd: &Cmd, n: &str) -> String {
     let b = bin();
     match cmd.ids.last() {
         Some(i) => {
-            let full = cmd.canon();
-            format!(
-                "? {n}: link → {b} {full} l{n} · section → {b} {}#{n} · text → {b} {full} {n} match:words",
-                i.page()
-            )
+            let (full, page) = (cmd.canon(), i.page());
+            format!("? {n}: link → {b} {full} l{n} · section → {b} {page}#{n} · text → {b} {full} {n} match:words")
         }
         None => format!("? {n}: link → {b} l{n} · text → {b} {n} match:words"),
     }
+}
+
+/// `setup <name> [on|off]`, `config set <name> <value>`, `config unset <name>`: the command's own words, from
+/// `toks[i]` (`plain` = the free switch's other name). Nothing else follows `setup` but mods and command words: a
+/// word there is a `?` (`? setup oxi → fats setup oxy`, a switch or on/off one edit away), never a paid search.
+fn own_words(cmd: &mut Cmd, toks: &mut Vec<String>, i: usize) {
+    let at = |k: usize| toks.get(i + k).map(|t| t.to_lowercase()).unwrap_or_default();
+    let (verb, on, switches) = (toks[i].to_lowercase(), at(2) == "on" || at(2) == "off", crate::settings::SWITCHES);
+    let own = |t: &String| {
+        !HELP_FLAGS.contains(&t.as_str())
+            && t != "json"
+            && !matches!(class_of(t, false, false, true), Ok(Class::Mod(..)))
+    };
+    let n = match (verb.as_str(), at(1).as_str()) {
+        ("setup", w) if switches.contains(&w) || w == "plain" => 1 + usize::from(on),
+        // the level is checked by `settings::set`, which names the levels
+        ("setup", "telemetry") => 1 + usize::from(toks.get(i + 2).is_some_and(own)),
+        ("telemetry", "show") => 1,
+        // the value is every word up to the mods, whole (`~/Library/Application Support/x` is a cache dir)
+        ("config", "set") => 3 + toks.iter().skip(i + 4).take_while(|t| own(t)).count(),
+        ("config", "unset") => 2,
+        _ => 0,
+    };
+    let sub = toks.drain(i + 1..(i + 1 + n).min(toks.len())).enumerate();
+    let low =
+        |(k, t): (usize, String)| if k > 1 { t } else { t.to_lowercase().replacen("plain", "free", (k == 0).into()) };
+    cmd.sub = sub.map(low).collect();
+    if cmd.sub.len() > 3 {
+        let v = cmd.sub.split_off(2).join(" ");
+        cmd.sub.push(v);
+    }
+    let word = |t: &&String| own(t) && matches!(class_of(t, false, false, true), Ok(Class::Word));
+    let Some(w) = toks[i + 1..].iter().find(word).filter(|_| verb == "setup") else { return };
+    let near = switches.into_iter().chain(["on", "off"]).find(|n| strsim::osa_distance(&w.to_lowercase(), n) == 1);
+    let (raw, b, all) = (&cmd.raw, bin(), switches.join("|"));
+    let fix = near.map_or(format!(" · {b} setup <{all}|plain> [on|off] · zone:<name>"), |n| {
+        format!(" → {b} {}", raw.replace(w.as_str(), n))
+    });
+    cmd.ask = Some(format!("? {raw}{fix}"));
 }
 
 /// A command's typo asks (it is a paid search otherwise; a verb before it says "words"): `led` = a first word
@@ -795,7 +1052,7 @@ fn number_ask(cmd: &Cmd, n: &str) -> String {
 fn ask_typo(cmd: &mut Cmd, led: bool) {
     let (Some(w), b) = (cmd.words.first().cloned(), bin()) else { return };
     if let Some((_, why)) = WORDS.elsewhere.iter().find(|e| !led && e.0.split(' ').any(|o| w.eq_ignore_ascii_case(o))) {
-        cmd.ask.get_or_insert(format!("! {w}{}", why.replace("{b}", b)));
+        cmd.ask.get_or_insert(format!("! {w}{} · {}", draw(why, &[("b", b)]), to_guide()));
     }
     if let Some(r) = typo(&w, led) {
         let fixed: Vec<&str> = cmd.raw.split(' ').map(|t| if t == w { r } else { t }).collect();
@@ -851,10 +1108,7 @@ impl Out {
         let bang = |l: &String| l.split(' ').nth(1) == Some("!");
         let at = self.lines.len().min(1) + self.lines.iter().skip(1).take_while(|l| bang(l)).count();
         self.lines.splice(at..at, rows.iter().cloned());
-        let mut all = match self.rec.remove("warnings") {
-            Some(serde_json::Value::Array(old)) => old,
-            _ => Vec::new(),
-        };
+        let mut all = self.rec.remove("warnings").and_then(|w| w.as_array().cloned()).unwrap_or_default();
         all.extend(rows.into_iter().map(Into::into));
         self.set("warnings", all);
     }
@@ -895,10 +1149,11 @@ const SECRET_RUN: usize = 12;
 /// Shorter secrets are masked only whole; under this length a value is not a key and is left alone.
 const SECRET_MIN: usize = 8;
 
-/// `text` with every `SECRET_RUN`-char run of a secret (a whole secret of `SECRET_MIN`.. chars) as `MASK`.
+/// `text` with every `SECRET_RUN`-char run of a secret (a whole secret of `SECRET_MIN`.. chars) as `MASK`, matched
+/// ASCII case-folded (a provider may echo a key upper-cased; folding keeps every byte offset).
 pub fn redact(text: &str, secrets: &[String]) -> String {
-    let mut hide = vec![false; text.len()];
-    for s in secrets {
+    let (mut hide, low) = (vec![false; text.len()], text.to_ascii_lowercase());
+    for s in secrets.iter().map(|s| s.to_ascii_lowercase()) {
         let at: Vec<usize> = s.char_indices().map(|c| c.0).chain([s.len()]).collect();
         let n = at.len() - 1;
         if n < SECRET_MIN {
@@ -907,7 +1162,7 @@ pub fn redact(text: &str, secrets: &[String]) -> String {
         let w = n.min(SECRET_RUN);
         for i in 0..=n - w {
             let run = &s[at[i]..at[i + w]];
-            for (j, _) in text.match_indices(run) {
+            for (j, _) in low.match_indices(run) {
                 hide[j..j + run.len()].fill(true);
             }
         }
@@ -963,6 +1218,32 @@ mod tests {
         parse(&s.split(' ').map(String::from).collect::<Vec<_>>())
     }
 
+    /// One filler: a named hole becomes its value, any other brace stays; styles are only `paint`'s.
+    #[test]
+    fn draw_fills_named_holes_only() {
+        assert_eq!(draw("{a}+{a} {c} {\"k\": 1} {", &[("a", "1"), ("b", "2")]), "1+1 {c} {\"k\": 1} {");
+        assert_eq!(draw("{bold}x{/}", &NO_HOLES), "{bold}x{/}");
+    }
+
+    /// Every screen, filled with the holes its owner fills (`stats::home`, `ready`, `tip`), leaves no hole: a
+    /// typo in a data file (`{bodl}`) fails here, never on a user's terminal. Braces in a JSON line stay.
+    #[test]
+    fn every_screen_fills_every_hole() {
+        let mut fills = vec!["ready", "yours", "pages", "id", "last", "spent", "site", "label", "text", "from"];
+        fills.extend([
+            "status", "name", "short", "mint", "signup", "step", "rank", "free", "cost", "b", "url", "env", "level",
+        ]);
+        let holes: Vec<(&str, &str)> = fills.iter().map(|h| (*h, "X")).collect();
+        for (name, text) in SCREENS {
+            let out = paint(text, &holes);
+            let left = out.split('{').skip(1).find(|r| r.split_once('}').is_some_and(|(h, _)| !h.contains(' ')));
+            assert!(!text.is_empty() && left.is_none(), "{name}: {left:?}");
+        }
+        assert_eq!(screen("help-nope"), "");
+        assert_eq!(help_screen(&["help".into(), "nope".into()]), Some(paint(screen("help"), &NO_HOLES)));
+        assert_eq!(help_screen(&["rust".into(), "help".into()]), None, "a search for help");
+    }
+
     /// The repair table, one row per case: input → canonical command.
     const REPAIRS: &[(&str, &str)] = &[
         // a typed verb stays first in the canonical form (it replays the same reading)
@@ -993,21 +1274,30 @@ mod tests {
         ("u1 -n", "u1 -n"),
         ("u1 -x -y", "u1 -x -y"),
         ("example.com", "https://example.com"),
-        // a host needs a real TLD; one that is also a file extension (`.rs`) is a host only leading the command;
-        // a scheme or a `/` makes a host anywhere
-        ("opencode mcp config opencode.json", "opencode mcp config opencode.json"),
+        // a bare host needs a real TLD and stands alone or leads the command in lower case; mid-query or written
+        // as a name it is a word; a scheme or a `/` makes a host anywhere
+        ("opencode mcp config opencode.yaml", "opencode mcp config opencode.yaml"),
         ("pyproject.toml build backend options", "pyproject.toml build backend options"),
         ("nextjs next.config.mjs", "nextjs next.config.mjs"),
         ("main.go error", "main.go error"),
         ("logo.png size", "logo.png size"),
         ("cargo build main.rs", "cargo build main.rs"),
         ("build lib.so", "build lib.so"),
-        ("rust x.ai", "https://x.ai rust"),
+        ("rust x.ai", "rust x.ai"),
+        ("contact at acme.com phone", "contact at acme.com phone"),
+        ("Purchasing.NYC Lakewood New Jersey", "Purchasing.NYC Lakewood New Jersey"),
+        ("Booking.com hotels Lisbon", "Booking.com hotels Lisbon"),
+        ("Booking.com", "https://Booking.com"),
+        ("fetch docs.rs tokio", "fetch https://docs.rs tokio"),
         ("docs.rs tokio spawn", "https://docs.rs tokio spawn"),
         ("limit:5 docs.rs tokio", "https://docs.rs tokio limit:5"),
-        ("docs.rs", "https://docs.rs"),
+        // bare hosts with no free word beside them are pages, a batch
+        ("example.com example.org", "https://example.com https://example.org"),
+        ("Example.com Example.org limit:5", "https://Example.com https://Example.org limit:5"),
+        ("example.com example.org rust", "https://example.com example.org rust"),
         ("main.rs error handling", "https://main.rs error handling"),
-        ("rust example.com", "https://example.com rust"),
+        ("rust example.com", "rust example.com"),
+        ("example.com rust", "https://example.com rust"),
         ("x.co", "https://x.co"),
         ("a.io", "https://a.io"),
         ("blog.rust-lang.org", "https://blog.rust-lang.org"),
@@ -1017,10 +1307,10 @@ mod tests {
         ("u1 v2.0", "u1 v2.0"),
         ("dry:yes u1#2", "u1#2 dry:true"),
         ("l4", "l4"),
-        ("help", "guide"),
+        ("help", "help"),
         ("u1 max_bytes:32MiB", "u1 max_bytes:33554432"),
-        ("-h", "guide"),
-        ("--help", "guide"),
+        ("-h", "help"),
+        ("--help", "help"),
         ("how to get help", "how to get help"),
         ("u1 hedge:0", "u1 hedge:0"),
         ("u1 hedge:5s", "u1 hedge:5"),
@@ -1052,7 +1342,11 @@ mod tests {
         ("rust u1", "u1 rust"),
         ("search fetchh https://x.com", "search https://x.com fetchh"),
         ("fetchh rust", "fetchh rust"),
+        // a file URL decodes to this OS's path: Windows has no rootless `/tmp`, its paths start at a drive
+        #[cfg(unix)]
         ("file:///tmp/a%20b.html", "/tmp/a b.html"),
+        #[cfg(windows)]
+        ("file:///C:/tmp/a%20b.html", "C:\\tmp\\a b.html"),
         // a word people type for a command is that command, mods and `json` aside; with another word it is text
         ("login", "setup"),
         ("Sign-In", "setup"),
@@ -1065,27 +1359,58 @@ mod tests {
         ("u1 key", "u1 key"),
         ("u1 install", "u1 install"),
         // `--help` / `-h` anywhere, `help` first: the card
-        ("rust --help", "guide"),
-        ("rust —help", "guide"),
-        ("–help", "guide"),
+        ("rust --help", "help"),
+        ("rust —help", "help"),
+        ("–help", "help"),
         ("-- rust", "rust"),
         // a dash in the text is the text: only a flag reads it as `--`
         ("u1 Rust — the book", "u1 Rust — the book"),
         ("rust — tokio", "rust — tokio"),
         ("tokio —the runtime", "tokio —the runtime"),
         ("1990 – 2000 census", "1990 – 2000 census"),
-        ("help login", "guide"),
+        ("help login", "help"),
         // a flag beside two words, or after the verb, is text
         ("git rebase --onto", "git rebase --onto"),
         ("search -tokio rust", "search -tokio rust"),
         // a `-word` after a word is the engine's exclusion, not a flag
         ("rust -tokio", "rust -tokio"),
+        // a search engine's query key is a search word as typed; a path beside words must exist, `-` be alone
+        ("rust filetype:pdf before:2026-01", "rust filetype:pdf before:2026-01"),
+        ("NORTHROP GRUMMAN CORP /DE/ company", "NORTHROP GRUMMAN CORP /DE/ company"),
+        ("irs liaison committee - tei", "irs liaison committee - tei"),
+        ("./nope.md summary", "./nope.md summary"),
+        // a `/` path of 2+ segments or a drive is a path beside words too; `.rs` is no document: a host
+        ("acme /etc/hosts", "/etc/hosts acme"),
+        ("C:\\x acme", "C:\\x acme"),
+        ("C:/x", "C:/x"),
+        ("docs.rs tokio", "https://docs.rs tokio"),
+        // a home, a variable, a `\` or a bare path of 3+ segments that no host leads is a path beside words too;
+        // 2 segments are words unless they exist here, a host-led path is a URL, a name of digits leads nothing
+        ("acme .\\secret\\plan", ".\\secret\\plan acme"),
+        ("acme ~alice/secret", "~alice/secret acme"),
+        ("acme ${HOME}/secret", "${HOME}/secret acme"),
+        ("acme internal/hr/salaries", "internal/hr/salaries acme"),
+        ("acme Documents/plan.key", "Documents/plan.key acme"),
+        ("TCP/IP and/or AC/DC", "TCP/IP and/or AC/DC"),
+        ("~5/10 $5/mo plan", "~5/10 $5/mo plan"),
+        ("docs.rs/tokio/latest/tokio spawn", "https://docs.rs/tokio/latest/tokio spawn"),
+        // a dot-led name is a path wherever it stands; one leading a TLD, a digit or no name is a word
+        ("summary .env", ".env summary"),
+        (".ssh/config", ".ssh/config"),
+        ("learn .NET core .io ... .5mm", "learn .NET core .io ... .5mm"),
     ];
 
     /// Inputs that ask: input → the start of the `?` line.
     const ASKS: &[(&str, &str)] = &[
         ("u2#3 4", "? 4: link → "),
         ("x foo:1", "? foo: unknown · keys limit match"),
+        ("rust countr:lt", "? countr: unknown · keys"),
+        ("notes.md hello", "? notes.md: a missing file or a site · type ./notes.md or https://notes.md"),
+        // a lone name ending in a file's extension that is no file here asks; beside words it leads a site search
+        ("main.rs", "? main.rs: a missing file or a site · type ./main.rs or https://main.rs"),
+        ("docs.rs limit:5", "? docs.rs: a missing file or a site"),
+        // a directory is no file and no search word
+        ("acme phone /etc", "? /etc is a directory · name a file in it"),
         ("u1 js:maybe", "? js:maybe · use js:true"),
         ("u1 match:fuzzy", "? match:fuzzy"),
         ("u1 max_bytes:65m", "? max_bytes:65m · 1k to 64m"),
@@ -1095,7 +1420,7 @@ mod tests {
         ("u1 hedge:soon", "? hedge:soon"),
         ("u1 timeout:301", "? timeout:301 · seconds for bd and oxyjs, 1 to 300"),
         ("u1 timeout:99999999", "? timeout:99999999"),
-        ("ex.com provider:oxyjs", "? provider:oxyjs · use provider:auto|plain|bd|oxy"),
+        ("ex.com provider:oxyjs", "? provider:oxyjs · use provider:auto|plain|bd|oxy|decodo"),
         ("rust since:lately", "? since:lately · an age or a date"),
         ("rust since:2026-13", "? since:2026-13"),
         ("rust site:not_a_host", "? site:not_a_host · a host"),
@@ -1129,22 +1454,37 @@ mod tests {
         ("stts json", "? stts: a command? "),
     ];
 
-    /// `file_tlds` = the TLDs that are also extensions of files people name in a search (`lib.so`, `main.cc`); the
-    /// two other collisions, `.ai` and `.app`, are common product domains (`x.ai`), so they stay hosts anywhere.
+    /// The root zone list is whole; `site:` and a `/` name a host by shape alone.
     #[test]
-    fn file_tlds_are_derived() {
-        let files = "md rs py sh zip mov java tf pl ml json toml yaml yml txt lock js ts jsx tsx mjs go c h cpp rb php \
-            css html xml csv sql ini cfg conf log env png jpg gif svg mp4 pdf docx tar gz exe dmg deb wasm dll so cc pm cr mk ps";
-        let derived: Vec<&str> = files.split_whitespace().filter(|e| WORDS.tlds.contains(e)).collect();
-        assert_eq!(derived, WORDS.file_tlds);
-        // the two collisions kept hosts anywhere (`x.ai`, `foo.app`)
-        assert!(["ai", "app"].iter().all(|t| WORDS.tlds.contains(t) && !WORDS.file_tlds.contains(t)));
+    fn tlds_and_host_shapes() {
         assert_eq!((WORDS.tlds.len(), WORDS.tlds[0], WORDS.tlds.last().copied()), (1437, "aaa", Some("zw")));
         // `site:` and a `/` name a host by shape alone, a TLD or not
         assert_eq!(
             (c("rust site:wiki.corp").get("site"), c("wiki.corp/a b").urls[0].as_str()),
             (Some("wiki.corp"), "https://wiki.corp/a")
         );
+        // an engine's query key is never one of our keys or thresholds: it would stop being a search word
+        let ours = |o: &&&str| WORDS.keys.contains(o) || crate::settings::LIMITS.contains_key(**o);
+        assert_eq!(WORDS.operators.iter().find(ours), None);
+    }
+
+    /// A name no resolver can ask for is `no_host` by its shape: a label over 63 chars, an empty label, a hyphen
+    /// at a label's end (a 64-char label was looked up and blamed on the network).
+    #[test]
+    fn real_host_needs_askable_labels() {
+        let (l63, l64) = ("a".repeat(63), "a".repeat(64));
+        let good = [format!("https://{l63}.com/"), "https://a-b.example.com./x".into(), "http://[::1]/".into()];
+        let good = good.into_iter().chain(["https://xn--bcher-kva.de/".into(), "https://93.184.215.14/a".into()]);
+        for u in good {
+            assert!(real_host(&u), "{u}");
+        }
+        let bad = [format!("https://{l64}.com/"), format!("https://x.{l64}.com/"), "https://a..com/".into()];
+        let bad = bad
+            .into_iter()
+            .chain(["https://-a.com/", "https://a-.com/", "https://a.-com.com/", "https://.a.com/"].map(String::from));
+        for u in bad.chain(["https://dead.invalid/a".into(), "https://a.com../".into()]) {
+            assert!(!real_host(&u), "{u}");
+        }
     }
 
     #[test]
@@ -1194,6 +1534,10 @@ mod tests {
             assert!(c(asked).has("json") && !c(asked).words.contains(&"json".to_string()), "{asked}");
         }
         assert!(c("u1 price json").has("json") && c("u1 price json").words == ["price"]);
+        // `stats` leading words filters its index, never a search; a closing `json` and `all` stay mods
+        let st = c("stats rust http all json");
+        assert!(st.has("stats") && st.has("all") && st.has("json") && st.words == ["rust", "http"], "{:?}", st.words);
+        assert!(c("rust stats").words == ["rust", "stats"], "a search that names stats stays one");
         // two command words and no page are the command (`guide all` = the card), never a search for one of them;
         // beside a page, an alone-only word is text (`u1 setup` filters)
         for i in ["guide all", "setup full", "account more", "login all", "keys links"] {
@@ -1286,11 +1630,13 @@ mod tests {
     /// (in 0.1.7 its own worst case was the arrow checked against itself; a URL's arrow runs dry on the URL).
     #[test]
     fn every_paid_arrow_is_priced() {
-        let args = ["", "js:true", "timeout:150", "provider:bd timeout:150", "provider:oxy js:true timeout:150"];
-        let args = args.into_iter().chain(["wait:30", "timeout:30", "0.0025"]);
+        let args = ["", "js:true", "provider:bd", "provider:oxy js:true", "wait:30", "timeout:30", "0.0025"];
         let dones: [&[&str]; 4] = [&[], &["plain", "bd"], &["plain", "oxyjs"], &["plain", "oxy", "oxyjs"]];
-        // a public IP: `dry:true` resolves a host name (`host_hop`), an IP never; nothing is sent
-        let cases = args.flat_map(|a| dones.map(|d| (a, d))).flat_map(|c| [("https://93.184.215.14/a", c), ("", c)]);
+        // a public IP: `dry:true` judges a host by its name alone (`real_host`), never a lookup; nothing is sent
+        let cases = args
+            .into_iter()
+            .flat_map(|a| dones.map(|d| (a, d)))
+            .flat_map(|c| [("https://93.184.215.14/a", c), ("", c)]);
         let (mut paid, b) = (0, bin());
         for (url, (arg, done)) in cases.collect::<Vec<_>>() {
             // `{arg}`: a timeout's mods (`fix_arg`), `budget_hit`'s cap in dollars, another code's its own word
@@ -1324,6 +1670,13 @@ mod tests {
         assert!(paid > 500, "{paid}");
     }
 
+    /// Every keyed paid tier has its turn: with two providers spent, a third key's untried tier is the move
+    #[test]
+    fn a_third_key_is_the_move() {
+        let at = At { id: "u3", done: &["plain", "oxy", "bd", "oxyjs"], ..Default::default() };
+        assert_eq!(fix("captcha_wall", &at), format!("{} u3 fresh:true provider:decodo", bin()));
+    }
+
     /// One fix per code; every code a provider or the content check can return has a row (a new code without
     /// one fails here, not in front of an agent); the fix for a timeout is never the same failing retry.
     #[test]
@@ -1343,8 +1696,8 @@ mod tests {
         codes.extend(crate::fetch::CHECK.rules.iter().map(|w| w.code).filter(|c| !c.is_empty()));
         codes.extend(["blocked_403", "http_502", "fetch_failed", "no_file", "not_allowed", "too_big", "offline"]);
         // literals in those files that are HTML or JSON names, not codes
-        let names =
-            ["b_algo", "result__a", "cf_chl_opt", "search_query", "status_code", "run_js", "max_results", "brd_json"];
+        let names = ["b_algo", "result__a", "cf_chl_opt", "search_query", "status_code", "run_js", "max_results"];
+        let names = [&names[..], &["brd_json", "dns_wait", "dns_fast_ms"]].concat();
         for c in codes.iter().filter(|c| !names.contains(c)) {
             let hit = keys.iter().any(|k| k.strip_suffix('*').map_or(k == c, |p| c.starts_with(p)));
             assert!(hit, "code {c} has no fix in FIX");
@@ -1366,7 +1719,7 @@ mod tests {
         let search = At { id: "provider:bd rules", url: "", ..at };
         assert_eq!(
             fix("provider_refused", &search),
-            format!("{b} rules fresh:true provider:oxy ≤$0.0010 (last try not charged)"),
+            format!("{b} rules fresh:true provider:oxy ≤$0.0010 · last try not charged"),
             "one provider:, and bd's refusal is one of `provider::REFUSED`, unbilled"
         );
         let ceil = At { url: "big.html", done: &["max_bytes:64m"], ..at };
@@ -1374,7 +1727,7 @@ mod tests {
         assert_eq!(fix("blocked_451", &at), format!("{b} u3 fresh:true provider:oxy js:true ≤$0.0015"));
         assert_eq!(fix("brightdata_refused", &at), format!("{b} u3 fresh:true ≤$0.0040"), "an old code: the retry");
         assert_eq!(bang("u3", "no_key", "bd", &at), format!("u3 ! no_key bd → {b} setup"));
-        // the fence's bypass is the operator's call: a hint an agent runs never carries it
+        // the fence's bypass is the user's own choice: a hint an agent runs never carries it
         assert!(FIX.iter().all(|r| !r.1.contains("FATS_ALLOW_PRIVATE")), "a fix prints the private-address bypass");
         assert_eq!(fix("private_address", &at), format!("private address refused · see {b} config"));
         // a fix never names a tier that already ran (or cannot run: bd on a gov host)
@@ -1383,15 +1736,15 @@ mod tests {
         let want = format!("{b} u3 fresh:true provider:oxy js:true ≤$0.0015");
         assert_eq!(fix("captcha_wall", &done), want, "oxyjs untried");
         assert_eq!(fix("provider_refused", &done), want, "a refusal's no-JS fix, oxyjs untried");
-        let all = At { done: &["plain", "oxy", "bd", "oxyjs"], url: "", ..at };
+        let all = At { done: &["plain", "oxy", "bd", "oxyjs", "decodo", "decodojs"], url: "", ..at };
         assert_eq!(fix("captcha_wall", &all), "nothing left to try");
         // oxy no-JS skipped by the site's wear, the render captcha'd: oxy is the move
         let skipped = At { done: &["plain", "oxyjs", "bd"], ..at };
         assert_eq!(fix("captcha_wall", &skipped), format!("{b} u3 fresh:true provider:oxy ≤$0.0025"));
-        let free = format!("{b} u3 fresh:true ≤$0.0040 (last try not charged)");
+        let free = format!("{b} u3 fresh:true ≤$0.0040 · last try not charged");
         assert_eq!(fix("provider_error", &At { arg: "", ..all }), free, "a transient retry names no tier");
         let named = At { arg: "provider:oxy js:true", done: &["plain", "oxy", "bd"], ..all };
-        assert_eq!(fix("provider_error", &named), format!("{want} (last try not charged)"), "the tier left");
+        assert_eq!(fix("provider_error", &named), format!("{want} · last try not charged"), "the tier left");
     }
 
     /// `since:` ages count back from today; dates fill the missing month and day.

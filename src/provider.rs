@@ -1,11 +1,11 @@
 //! PROVIDERS: how a URL becomes bytes. `plain` = a direct GET with Safari 26's TLS, HTTP/2 and header profile;
 //! `bd` = Bright Data Web Unlocker; `oxy` / `oxyjs` = Oxylabs Web API `/v1/scrape` without / with JavaScript
-//! rendering (one key, two prices, two timeouts). One table holds names, keys, timeouts
-//! and list prices; the router (fetch.rs) decides which to call.
+//! rendering (one key, two prices, two timeouts); `decodo` / `decodojs` = Decodo Web Data API `/v1/scrape` the same
+//! way. One table holds names, keys, timeouts and list prices; the router (fetch.rs) decides which to call.
 
 use serde_json::{Value, json};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Tier {
@@ -14,6 +14,8 @@ pub enum Tier {
     Bd,
     Oxy,
     OxyJs,
+    Decodo,
+    DecodoJs,
 }
 
 #[derive(serde::Deserialize)]
@@ -23,12 +25,12 @@ pub struct Spec {
     pub name: &'static str,
     pub short: &'static str,
     pub env: &'static str,
-    pub file: &'static str,
     pub timeout: Duration,
     /// USD per request at list price (no API returns a cost).
     pub price: f64,
     /// THE capability row the router builds every ladder from (`fetch::Plan::ladder`): `page` (fetches a page),
-    /// `js` (renders JavaScript), `search`, `pdf` (a file's exact bytes), `gov` (government hosts served).
+    /// `js` (renders JavaScript), `search`, `pdf` (a file's exact bytes), `gov` (government hosts served),
+    /// `auto_geo` (its unset exit country is the best for the target: `sent` names none by default).
     can: Vec<&'static str>,
     /// The provider bills a finished job that relays the site's own 5xx (`charged`): Oxylabs' "Not
     /// charged" is its own API error (`500 REQUEST_FAILED_AFTER_TOO_MANY_RETRIES`, an error envelope, never a
@@ -42,10 +44,11 @@ pub struct Spec {
 
 /// The provider table (`src/data/providers.json`): `specs` indexed by `Tier as usize`, `apis` by `Api as usize`,
 /// `links` per account, `cctld` = TLD → `"<exit country> <its page languages>"` (`fetch::langs`).
-/// Prices: Oxylabs Web API $1.00/1k, $1.50/1k with `run_js` (smallest paid plan);
-/// Bright Data Web Unlocker ~$1.50/1k. Timeouts: plain 10 s, Oxylabs without JS 10 s (its wins took 1.4–5.6 s on
-/// 40 hard pages, 6 s cut 2 of 3 Reddit threads; no page tier since the 2026-10-14 spike: files, prefetch, `provider:oxy`), BD and Oxylabs with
-/// JS 60 s each (`timeout:` sets these two).
+/// Prices: Oxylabs Web API $1.00/1k, $1.50/1k with `run_js` (smallest paid plan); Bright Data Web Unlocker
+/// ~$1.50/1k; Decodo $1.00/1k, $1.50/1k with JS. Timeouts: plain 10 s, Oxylabs without JS 10 s (its wins took
+/// 1.4–5.6 s on 40 hard pages, 6 s cut 2 of 3 Reddit threads; a page rung after plain's captcha with both keys and
+/// on every rung with one key, also files, prefetch, `provider:oxy`), Decodo without JS 15 s, BD, Oxylabs and
+/// Decodo with JS 60 s each (`timeout:` sets the renders).
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields, bound(deserialize = "'de: 'static"))]
 pub struct Providers {
@@ -58,7 +61,7 @@ pub struct Providers {
 pub static PROVIDERS: LazyLock<Providers> = LazyLock::new(|| crate::settings::table("providers"));
 
 impl Tier {
-    pub const ALL: [Tier; 4] = [Tier::Plain, Tier::Bd, Tier::Oxy, Tier::OxyJs];
+    pub const ALL: [Tier; 6] = [Tier::Plain, Tier::Bd, Tier::Oxy, Tier::OxyJs, Tier::Decodo, Tier::DecodoJs];
 
     pub fn spec(self) -> &'static Spec {
         &PROVIDERS.specs[self as usize]
@@ -74,9 +77,10 @@ impl Tier {
         Tier::ALL.into_iter().find(|t| t.spec().env == self.spec().env).unwrap_or(self)
     }
 
-    /// The mods that ask for this tier alone: `provider:` takes the key's name, so oxyjs = `provider:oxy js:true`.
-    pub fn ask(self) -> String {
-        format!("provider:{}{}", self.owner().spec().short, if self.owner() == self { "" } else { " js:true" })
+    /// The JS rung of a provider whose key also fetches without JS (oxyjs, decodojs): the call asks for a render
+    /// (`Ask::js`) and the copy drops `<noscript>` (`clean::build_doc`); bd renders on its own.
+    pub fn renders(self) -> bool {
+        self.owner() != self
     }
 
     /// The tier's row says it does `job` (`Spec::can`).
@@ -84,13 +88,20 @@ impl Tier {
         self.spec().can.contains(&job)
     }
 
-    /// The key (and for BD the zone) this tier needs; None = not configured. Plain needs nothing.
+    /// The name `fats setup <name> on|off` switches: the key's owner, `free` for plain.
+    pub fn switch(self) -> &'static str {
+        if self == Tier::Plain { "free" } else { self.owner().spec().short }
+    }
+
+    /// The key this tier sends (`settings::key`; Bright Data's needs the zone too); None = not configured, or
+    /// switched off (`settings::on`). Plain needs none: an empty key.
     pub fn key(self) -> Option<String> {
-        let s = self.spec();
+        let key = || crate::settings::key(self.switch()).map(|k| k.0);
         match self {
+            _ if !crate::settings::on(self.switch()) => None,
             Tier::Plain => Some(String::new()),
-            Tier::Bd => crate::settings::zone().and(crate::settings::key(s.env, s.file).map(|k| k.0)),
-            Tier::Oxy | Tier::OxyJs => crate::settings::key(s.env, s.file).map(|k| k.0),
+            Tier::Bd => crate::settings::zone().and_then(|_| key()),
+            _ => key(),
         }
     }
 }
@@ -104,7 +115,7 @@ pub fn short(name: &str) -> &str {
 #[derive(Clone, Default)]
 pub struct Ask {
     pub url: String,
-    /// Oxylabs `run_js`.
+    /// A render (`Tier::renders`): Oxylabs `run_js`, Decodo `headless`.
     pub js: bool,
     /// `country:` as given, ISO 3166-1 alpha-2, lower case (`fr`); see `country` for what each tier sends.
     pub country: Option<String>,
@@ -137,6 +148,11 @@ pub struct Raw {
     pub charset: &'static str,
     /// The provider's request budget, when its answer said (`Limit`).
     pub limit: Option<Limit>,
+    /// The page whose meta refresh plain followed (`refresh`) to this one (`Meta::refreshed_from`): kept to be
+    /// seen, never a base, never what `outline::lost_page` judges (the target is, as any landing).
+    pub refreshed_from: Option<String>,
+    /// Plain's https failure an http copy stands in for (`plain`): `tls:wrong-version-number+http:200`.
+    pub why: String,
 }
 
 /// A provider's own request budget from its answer: the two numbers only. Oxylabs Web API sends
@@ -177,6 +193,7 @@ pub async fn get(t: Tier, ask: &Ask, key: &str) -> (Result<Raw, Fail>, bool) {
         Tier::Plain => plain(ask, wait).await,
         Tier::Bd => brightdata(ask, key, wait).await,
         Tier::Oxy | Tier::OxyJs => oxylabs(ask, key, wait).await,
+        Tier::Decodo | Tier::DecodoJs => decodo(ask, key, wait).await,
     };
     let billed = charged(t, r.as_ref().map(|raw| raw.status));
     (r.and_then(|raw| if raw.body.len() as u64 > ask.max_bytes { Err("too_big".into()) } else { Ok(raw) }), billed)
@@ -215,23 +232,94 @@ pub fn late(wait: Duration) -> Fail {
 
 /// The second resolver, asked only when the system resolver found no address: Cloudflare's DNS over HTTPS (JSON,
 /// developers.cloudflare.com 1.1.1.1 dns-json: GET `name` + `type`, `accept: application/dns-json`; `Status` = the
-/// DNS RCODE). Some(false) = NXDOMAIN (RCODE 3), Some(true) = the name exists, None = no verdict (unreachable).
+/// DNS RCODE, `Answer` the records, `type` 1 = A, 28 = AAAA). Some(true) = an address (A, else AAAA: asked only
+/// on no A), Some(false) = none: NXDOMAIN (RCODE 3) or NODATA (NOERROR, no address: a dead name in a signed zone
+/// answers so), None = no verdict (unreachable, SERVFAIL).
 pub async fn exists(host: &str) -> Option<bool> {
-    let (body, ..) = api(Api::Doh, "", json!({"name": host, "type": "A"}), 64 << 10, DOH_WAIT).await.ok()?;
-    match serde_json::from_slice::<Value>(&body).ok()?["Status"].as_u64()? {
-        3 => Some(false),
-        0 => Some(true),
-        _ => None,
+    for (ty, code) in [("A", 1), ("AAAA", 28)] {
+        let (body, ..) = api(Api::Doh, "", json!({"name": host, "type": ty}), 64 << 10, DOH_WAIT).await.ok()?;
+        let j = serde_json::from_slice::<Value>(&body).ok()?;
+        let records = j["Answer"].as_array().into_iter().flatten();
+        match j["Status"].as_u64()? {
+            0 if records.into_iter().any(|r| r["type"] == code) => return Some(true),
+            0 => {}
+            3 => return Some(false),
+            _ => return None,
+        }
     }
+    Some(false)
+}
+
+/// A keyless call to fats's own endpoint (`telemetry`): the 200's body, else what failed (the HTTP status, or the
+/// code when no reply came), never a row.
+pub async fn ours(to: Api, req: Value, wait: Duration) -> Result<Vec<u8>, String> {
+    let fail = |f: Fail| if f.status > 0 { f.status.to_string() } else { f.code.to_string() };
+    api(to, "", req, 64 << 10, wait).await.map(|a| a.0).map_err(fail)
 }
 
 pub const DOH_WAIT: Duration = Duration::from_millis(1500);
+
+/// THE host check, before any tier runs (`js:true` skips plain too): the system resolver, and on no address the second
+/// resolver (`exists`, asked on that failure only). A host with no address from both (NXDOMAIN or NODATA alike) is a
+/// plain hop `no_host`, one whose every address is private `private_address`: final, $0, no provider call. No paid call
+/// before a verdict on the address: none within `dns_wait` seconds is a final `dns_timeout` (when the providers ran at
+/// a shorter wait, a name of 127.0.0.1 billed a render of the provider's own loopback); worst case `dns_wait` + the
+/// second resolver's two calls (A, then AAAA on no A), `DOH_WAIT` 1.5 s each: ≤ 3 s. One lookup: the system resolver
+/// retries on its own, and a second one for the same name only joins the first (macOS mDNSResponder: an unanswered
+/// query is sent again at ≥ 1 s, doubling, uDNS.c `UDNSBackOffMultiplier`; the same question is a `DuplicateOf` the
+/// first, mDNS.c; glibc: `attempts:2` × `timeout:5`, resolv.conf(5)). Within the agent's `timeout:` (`agent_left`) when
+/// shorter: the lookup is no part of a call, the wall holds it all the same. None = the host resolves public, or the
+/// URL names an IP address; else the hop's code and why (`fetch::host_hop`). A real run's only: `dry:true` looks
+/// nothing up (`lang::real_host`, its shape rule `askable` here too).
+pub fn host_check(url: &str, wall: Option<Duration>) -> Option<(&'static str, String)> {
+    let url::Host::Domain(host) = url::Url::parse(url).ok()?.host()?.to_owned() else { return None };
+    let (t0, (tx, rx), name) = (Instant::now(), std::sync::mpsc::channel(), host.clone());
+    // a name no resolver can ask for (`lang::askable`: an empty or 64-char label, a hyphen at a label's end) is
+    // looked up by neither resolver: `no_host` at once, $0, never the network's fault
+    let ask = crate::lang::askable(&host);
+    ask.then(|| std::thread::spawn(move || tx.send(lookup(&name))));
+    let all = rx
+        .recv_timeout(Duration::from_secs(crate::settings::limit("dns_wait")).min(wall.unwrap_or(Duration::MAX)))
+        .ok();
+    let fast = t0.elapsed() < Duration::from_millis(crate::settings::limit("dns_fast_ms"));
+    // Ok = the system resolver's word (true: every address private); on no address, Err = the second resolver's
+    // (Some(true): it holds an address the system's did not give; Some(false): none, NXDOMAIN or NODATA) and the
+    // system resolver's error
+    let private = |all: &[std::net::SocketAddr]| all.iter().all(|a| private_ip(a.ip()));
+    let second = || block(exists(&host)).flatten();
+    let got = all.map(|all| match all {
+        Ok(all) if !all.is_empty() => Ok(private(&all)),
+        all => Err((second(), all.err())),
+    });
+    // an error back under `dns_fast_ms` was no wait cut short: `dns_wait:` cures nothing there
+    let (code, why) = match got {
+        _ if !ask => ("no_host", None),
+        Some(Ok(true)) if !crate::settings::get().allow_private.value => ("private_address", None),
+        Some(Ok(_) | Err((Some(true), _))) => return None,
+        Some(Err((Some(false), _))) => ("no_host", None),
+        Some(Err((None, why))) if fast => ("dns_failed", why),
+        _ => ("dns_timeout", None),
+    };
+    Some((code, why.unwrap_or_default()))
+}
+
+/// The system resolver's addresses for `host`, or its own error (getaddrinfo's words, `said_short`: `nodename nor
+/// servname provided, or not known`). Under a test's fake transport, the whole network: that error, a `lag.*`
+/// name's after 2 s (`host_check`'s wait).
+pub fn lookup(host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    if in_process() {
+        std::thread::sleep(Duration::from_secs(if host.starts_with("lag.") { 2 } else { 0 }));
+        return Err(said_short("nodename nor servname provided, or not known"));
+    }
+    let said = |e: std::io::Error| said_short(&e.to_string().rsplit(": ").next().unwrap_or_default().to_lowercase());
+    std::net::ToSocketAddrs::to_socket_addrs(&(host, 443)).map(Iterator::collect).map_err(said)
+}
 
 /// THE billing rule, one for both providers: an answer below 500 is billed; a refusal, a 5xx or a timeout is not,
 /// but a site's 5xx relayed in a finished job is where `bills_site_5xx` (Oxylabs, printed `(assumed)` until one is
 /// reconciled). Oxylabs: "All upstream engines failed. Not charged." (developers.oxylabs.io/products/web-api/
 /// troubleshooting, its own error envelope, a `provider_error` here); its no-JS and 60 s cuts end in that 500 (10 of
-/// 11 re-run at 60 s, spike 2026-10-14). Bright Data: the zone counter moved +20 for ~28 calls, its 3 `http_502` and
+/// 11 re-run at 60 s, measured 2026-10-14). Bright Data: the zone counter moved +20 for ~28 calls, its 3 `http_502` and
 /// 6 timeouts unbilled. A search answer with no result list is not (bd: +0
 /// for 2 such `provider_error`s). A call WE cut has no answer: its price is unverified (`fetch::billed`:
 /// bd billed 15 s search cuts; "a cut is free" held for 1-s cuts only).
@@ -241,7 +329,7 @@ pub fn charged(t: Tier, status: Result<u16, &Fail>) -> bool {
 
 /// THE list of the provider's own refusals (its error envelope, bd's `x-brd-error`, a rate limit): no answer, so
 /// never billed (`charged` gets them as an `Err`); a tried path says `$0 (not charged)`, a priced retry after one
-/// ` (last try not charged)` (one list, was three).
+/// ` · last try not charged`.
 pub const REFUSED: &[&str] = &["provider_error", "provider_refused", "rate_limited"];
 
 /// THE money total: from +0.0, so nothing spent prints `$0.0000` (`sum::<f64>()` of nothing is −0.0 → `$-0.0000`).
@@ -249,21 +337,27 @@ pub fn spend(costs: impl IntoIterator<Item = f64>) -> f64 {
     costs.into_iter().fold(0.0, |total, cost| total + cost)
 }
 
-fn net(e: &wreq::Error) -> &'static str {
+/// A transport error's code; a TLS handshake that failed says so in `why`: `tls:<reason>` from BoringSSL's error
+/// stack, whose text is `[REASON] …` (btls 0.5.6 `ErrorStack`'s Display: `tls:certificate-verify-failed`).
+fn net(e: &wreq::Error) -> Fail {
     let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    let mut tls = String::new();
     while let Some(s) = src {
         if s.is::<Private>() {
-            return "private_address";
+            return Fail::from("private_address");
+        }
+        let said = s.to_string();
+        if let Some(r) = said.strip_prefix('[').and_then(|r| r.split(']').next()) {
+            tls = format!("tls:{}", r.to_lowercase().replace('_', "-"));
         }
         src = s.source();
     }
-    if e.is_timeout() {
-        "provider_timeout"
-    } else if e.is_connect() || e.is_dns() || e.is_tls() {
-        "connect_failed"
-    } else {
-        "net_error"
-    }
+    let code = match () {
+        _ if e.is_timeout() => "provider_timeout",
+        _ if e.is_connect() || e.is_dns() || e.is_tls() => "connect_failed",
+        _ => "net_error",
+    };
+    Fail { why: said_short(&tls), ..Fail::from(code) }
 }
 
 /// A header map as (name, value) pairs; names are lower case already.
@@ -291,19 +385,83 @@ async fn plain(ask: &Ask, wait: Duration) -> Result<Raw, Fail> {
         async move {
             let r = req.send().await.map_err(|e| net(&e))?;
             let to = r.headers().get("location").map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
-            Ok((r.status().as_u16(), to, r))
+            Ok::<_, Fail>((r.status().as_u16(), to, r))
         }
     };
-    let (final_url, r) = follow(&ask.url, send).await?;
-    let (status, headers) =
-        (r.status().as_u16(), header_lines(pairs(r.headers()).iter().map(|h| (&h.0, h.1.as_str()))));
-    let ctype = r.headers().get("content-type").map(|v| String::from_utf8_lossy(v.as_bytes()).to_lowercase());
-    let ctype = ctype.unwrap_or_default();
-    let body = capped(r, ask.max_bytes).await?;
-    let declared = ctype.split("charset=").nth(1).map(|c| c.split(';').next().unwrap_or(c).trim_matches(['"', ' ']));
-    // a picture's bytes are never text (`cli::asset`)
-    let (body, charset) = if ctype.starts_with("image/") { (body, "") } else { decode_body(body, declared) };
-    Ok(Raw { status, final_url, ctype, headers, body, charset, ..Raw::default() })
+    let read = |at: String| {
+        let send = &send;
+        async move {
+            let (final_url, r) = follow(&at, send).await?;
+            let (status, headers) =
+                (r.status().as_u16(), header_lines(pairs(r.headers()).iter().map(|h| (&h.0, h.1.as_str()))));
+            let ctype = r.headers().get("content-type").map(|v| String::from_utf8_lossy(v.as_bytes()).to_lowercase());
+            let ctype = ctype.unwrap_or_default();
+            let body = capped(r, ask.max_bytes).await?;
+            let declared =
+                ctype.split("charset=").nth(1).map(|c| c.split(';').next().unwrap_or(c).trim_matches(['"', ' ']));
+            // a picture's bytes are never text (`cli::asset`)
+            let (body, charset) = if ctype.starts_with("image/") { (body, "") } else { decode_body(body, declared) };
+            Ok::<Raw, Fail>(Raw { status, final_url, ctype, headers, body, charset, ..Raw::default() })
+        }
+    };
+    // https the host's listener would not take (`connect_failed`: TLS, reset, refused; the host resolved,
+    // `host_check`) is no wall: every tier meets the same listener. The same URL over http, once, in the same turn
+    // of the brake (a redirect's way). Its why keeps the https cause first, then what http answered
+    // (`tls:wrong-version-number+http:200`); a 2xx copy goes through the content check as any plain body
+    // (`fetch::judge`), any other answer leaves the https failure. A certificate's refusal (expired, wrong host,
+    // untrusted: `tls:certificate-*`) under it is the site's answer (`tls_failed`, final): every tier meets the same
+    // certificate, a paid one only when asked (expired.badssl.com: http 301 back to https, then oxy + oxyjs, $0.0025)
+    let mut first = read(ask.url.clone()).await;
+    if let Err(f) = &mut first
+        && f.code == "connect_failed"
+        && let Some(r) = ask.url.strip_prefix("https:")
+    {
+        let cause = if f.why.is_empty() { String::new() } else { format!("{}+", f.why) };
+        match read(format!("http:{r}")).await {
+            Ok(raw) if (200..300).contains(&raw.status) => {
+                first = Ok(Raw { why: format!("{cause}http:{}", raw.status), ..raw })
+            }
+            h => {
+                f.why = format!("{cause}http:{}", h.map_or_else(|h| h.code.into(), |r| r.status.to_string()));
+                f.code = if f.why.starts_with("tls:certificate-") { "tls_failed" } else { f.code };
+            }
+        }
+    }
+    let first = first?;
+    let Some(to) = refresh(&first) else { return Ok(first) };
+    // the site's own move in its HTML is followed once, as a `Location` is; a target that errs or answers no 2xx
+    // leaves the refreshing page the page (its host was reached: never thrown away for the target's failure)
+    match read(to).await {
+        Ok(raw) if (200..300).contains(&raw.status) => Ok(Raw { refreshed_from: Some(first.final_url), ..raw }),
+        _ => Ok(first),
+    }
+}
+
+/// The site's own redirect in its HTML (`plain` follows it once, $0): a 2xx HTML page that shows under
+/// `page_chars`, loads no script and holds `<meta http-equiv=refresh content="0; url=…">` to its own origin
+/// (scheme, host and port; http → https the one scheme change) (the content parsed as the WHATWG "shared
+/// declarative refresh steps": a time of digits, `;` or `,`, an optional `url=`, the URL, quotes off). A delay,
+/// a sign, another origin, a script beside it or no URL (`url=` empty reloads the page) is no redirect: a
+/// challenge's 360 s `<noscript>` refresh (no URL), a scripted page's no-JS fallback (an "enable JavaScript"
+/// page). Only a body holding the bytes `http-equiv` is parsed. Some = the target.
+fn refresh(raw: &Raw) -> Option<String> {
+    let html = raw.status < 300 && crate::clean::kind_of(&raw.ctype, &raw.body) == "html";
+    let marked = html && raw.body.windows(10).any(|w| w.eq_ignore_ascii_case(b"http-equiv"));
+    let tree = crate::html::parse(&String::from_utf8_lossy(marked.then_some(&raw.body[..])?));
+    let tag = |n: &&crate::html::Node| n.attr("http-equiv").is_some_and(|v| v.eq_ignore_ascii_case("refresh"));
+    let (delay, rest) = tree.nodes.iter().find(tag)?.attr("content")?.split_once([';', ','])?;
+    let rest = rest.split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case("url")).map_or(rest, |(_, v)| v);
+    // both quote marks, the double one escaped: a bare one would pair this file's literals off (`lang` error_table)
+    let target = rest.trim().trim_matches(['\x22', '\'']);
+    let at = url::Url::parse(&raw.final_url).ok()?;
+    let delay = delay.trim();
+    let to = at.join(target).ok().filter(|_| !target.is_empty())?;
+    let scheme = at.scheme() == to.scheme() || (at.scheme(), to.scheme()) == ("http", "https");
+    let origin = scheme && (at.host_str(), at.port()) == (to.host_str(), to.port());
+    let alone = !tree.nodes.iter().any(|n| n.tag == "script") && origin;
+    let small = crate::fetch::visible(&tree).0.chars().count() < crate::settings::limit("page_chars");
+    let zero = !delay.is_empty() && delay.bytes().all(|b| b == b'0');
+    (zero && alone && small).then(|| to.into())
 }
 
 /// Text is kept as UTF-8: a body with no file magic is decoded from what the header or page declares (else
@@ -315,65 +473,73 @@ pub fn decode_body(body: Vec<u8>, declared: Option<&str>) -> (Vec<u8>, &'static 
 
 // ---------------------------------------------------------------- private-address fence
 
-/// Not a public unicast address: loopback, private, link-local (169.254.169.254 = cloud metadata), CGNAT,
-/// unspecified, multicast, reserved, documentation; IPv6 ULA and link-local; IPv4 inside IPv6 (mapped, NAT64)
-/// is judged as the IPv4 it carries.
+/// Not a public unicast address: inside a block of `sites.json` `fence`; IPv4 inside IPv6 (mapped, NAT64,
+/// compatible, 6to4) is judged as the IPv4 it carries.
 pub fn private_ip(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr::{V4, V6};
-    match ip {
-        V4(a) => {
-            let [x, y, ..] = a.octets();
-            a.is_private()
-                || a.is_loopback()
-                || a.is_link_local()
-                || a.is_unspecified()
-                || a.is_broadcast()
-                || a.is_multicast()
-                || a.is_documentation()
-                || x == 0
-                || x >= 240
-                || (x == 100 && (64..128).contains(&y))
-                || (x == 198 && (y & 0xfe) == 18)
-                || (x == 192 && y == 0 && a.octets()[2] == 0)
-        }
-        V6(a) => {
-            let s = a.segments();
-            // an IPv4 inside: mapped `::ffff:a.b.c.d`, NAT64 `64:ff9b::/96`, compatible `::/96`, 6to4 `2002::/16`
-            let v4 = |hi: u16, lo: u16| Some(std::net::Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo)));
-            let v4 = a.to_ipv4_mapped().or(match s {
-                [0x64, 0xff9b, 0, 0, 0, 0, ..] | [0, 0, 0, 0, 0, 0, ..] => v4(s[6], s[7]),
-                [0x2002, ..] => v4(s[1], s[2]),
-                _ => None,
-            });
-            match v4 {
-                Some(v4) => private_ip(V4(v4)),
-                None => {
-                    a.is_loopback()
-                        || a.is_unspecified()
-                        || a.is_multicast()
-                        || a.is_unique_local()
-                        || a.is_unicast_link_local()
-                        || (s[0] & 0xffc0) == 0xfec0
-                        || (s[0], s[1]) == (0x2001, 0xdb8)
-                }
-            }
-        }
-    }
+    let bits = |ip| match ip {
+        V4(a) => (u128::from(a.to_bits()), 32),
+        V6(a) => (a.to_bits(), 128),
+    };
+    let block = |(net, n): (&str, &str)| Some((bits(net.parse().ok()?), n.parse::<u32>().ok()?));
+    let (at, width) = bits(ip);
+    // inside a block: the same family, and the address's first `n` bits are the block's
+    let blocks = crate::fetch::SITES.fence.iter().filter_map(|b| block(b.split_once('/')?));
+    let within = || blocks.clone().any(|((net, w), n)| w == width && (at ^ net).checked_shr(w - n.min(w)) == Some(0));
+    let V6(a) = ip else { return within() };
+    let s = a.segments();
+    // an IPv4 inside: mapped `::ffff:a.b.c.d`, NAT64 `64:ff9b::/96`, compatible `::/96`, 6to4 `2002::/16`
+    let v4 = |hi: u16, lo: u16| Some(std::net::Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo)));
+    let v4 = a.to_ipv4_mapped().or(match s {
+        [0x64, 0xff9b, 0, 0, 0, 0, ..] | [0, 0, 0, 0, 0, 0, ..] => v4(s[6], s[7]),
+        [0x2002, ..] => v4(s[1], s[2]),
+        _ => None,
+    });
+    v4.map_or_else(within, |v4| private_ip(V4(v4)))
 }
 
 /// The URL's own host is private (an IP literal in any WHATWG spelling, or `localhost`); DNS names are judged
 /// by `Fence` when they resolve. Always false with `FATS_ALLOW_PRIVATE=1`.
 pub fn private_host(url: &str) -> bool {
-    !crate::settings::get().allow_private.value
-        && match url::Url::parse(url).ok().as_ref().and_then(url::Url::host) {
-            Some(url::Host::Ipv4(a)) => private_ip(a.into()),
-            Some(url::Host::Ipv6(a)) => private_ip(a.into()),
-            Some(url::Host::Domain(d)) => {
-                let d = d.trim_end_matches('.');
-                d == "localhost" || d.ends_with(".localhost")
-            }
-            None => true,
+    !crate::settings::get().allow_private.value && private_name(url)
+}
+
+fn private_name(url: &str) -> bool {
+    match url::Url::parse(url).ok().as_ref().and_then(url::Url::host) {
+        Some(url::Host::Ipv4(a)) => private_ip(a.into()),
+        Some(url::Host::Ipv6(a)) => private_ip(a.into()),
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.');
+            d == "localhost" || d.ends_with(".localhost")
         }
+        None => true,
+    }
+}
+
+/// THE home-IP brake (plain only, never a provider: they are the other IPs): one plain call to a host at a time
+/// and one start per `plain_host_pace_ms`, across processes (a lock file per host under the cache, `pace/<host>`,
+/// holding the last start, epoch seconds). A plain call WAITS its turn, keys or not: the brake protects the home IP,
+/// it never buys a provider call for a page plain serves free (12 JSON pages of one host: $0 waiting, $0.015
+/// skipping). 0 = no brake. It blocks before the call starts, so the wait is no part of the call's ms. Returns (the
+/// turn, held while the file is open; the ms waited, `Hop::waited`); a file that will not open or lock = no turn, no
+/// wait: the call runs unbraked rather than not at all.
+pub fn pace(url: &str) -> (Option<std::fs::File>, u64) {
+    use std::io::{Seek, Write};
+    let (gap, t0) = (Duration::from_millis(crate::settings::limit("plain_host_pace_ms")), Instant::now());
+    let at = crate::settings::get().cache.value.join("pace").join(crate::clean::host_of(url));
+    let open = || std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&at);
+    let file = at.parent().map(std::fs::create_dir_all).and_then(Result::ok).and_then(|()| open().ok());
+    let Some(mut f) = file.filter(|f| !gap.is_zero() && f.lock().is_ok()) else { return (None, 0) };
+    // the start is read and written under the lock (a new host = an empty file: lanes that opened it before the
+    // first start still wait), never the file's mtime (another clock, which a copy or a sync moves); 20 bytes wide,
+    // so each write covers the last whole and a crash mid-write leaves no shorter mix (an older, longer file's
+    // tail is never read)
+    let last = std::io::read_to_string(&f).ok().and_then(|s| s.get(..20)?.parse::<f64>().ok());
+    // a clock stepped back counts as no time gone
+    let since = last.and_then(|t| Duration::try_from_secs_f64((crate::cache::now() - t).max(0.0)).ok());
+    std::thread::sleep(since.and_then(|s| gap.checked_sub(s)).unwrap_or_default());
+    f.rewind().and_then(|()| write!(f, "{:020.6}", crate::cache::now())).ok();
+    (Some(f), t0.elapsed().as_millis() as u64)
 }
 
 /// The resolver for plain fetches: the system's answer minus private addresses, so a name that resolves (or
@@ -408,14 +574,14 @@ impl wreq::dns::Resolve for Fence {
 /// Redirects, followed here rather than by the client so every hop's host passes `private_host` (an IP literal
 /// in a `Location` never reaches the resolver). `send` = one request → (status, Location, response).
 /// Ok = (final URL, response); at most 10 redirects.
-async fn follow<R, F>(url: &str, send: impl Fn(String) -> F) -> Result<(String, R), &'static str>
+async fn follow<R, E: From<&'static str>, F>(url: &str, send: impl Fn(String) -> F) -> Result<(String, R), E>
 where
-    F: Future<Output = Result<(u16, Option<String>, R), &'static str>>,
+    F: Future<Output = Result<(u16, Option<String>, R), E>>,
 {
     let mut at = url.to_string();
     for _ in 0..=10 {
         if private_host(&at) {
-            return Err("private_address");
+            return Err("private_address".into());
         }
         match send(at.clone()).await? {
             (301 | 302 | 303 | 307 | 308, Some(to), _) => {
@@ -424,7 +590,7 @@ where
             (_, _, r) => return Ok((at, r)),
         }
     }
-    Err("redirect_loop")
+    Err("redirect_loop".into())
 }
 
 /// The body, frame by frame, refused as soon as it passes `cap` bytes: a chunked or lying server never fills
@@ -436,12 +602,11 @@ async fn capped(mut r: wreq::Response, cap: u64) -> Result<Vec<u8>, Fail> {
     }
     let mut v = Vec::new();
     while let Some(f) = std::future::poll_fn(|cx| std::pin::Pin::new(&mut r).poll_frame(cx)).await {
-        if let Ok(d) = f.map_err(|e| net(&e))?.into_data() {
-            if (v.len() + d.len()) as u64 > cap {
-                return Err("too_big".into());
-            }
-            v.extend_from_slice(&d);
+        let Ok(d) = f.map_err(|e| net(&e))?.into_data() else { continue };
+        if (v.len() + d.len()) as u64 > cap {
+            return Err("too_big".into());
         }
+        v.extend_from_slice(&d);
     }
     Ok(v)
 }
@@ -471,6 +636,12 @@ pub enum Api {
     /// GitHub repository search and one account's repositories (`gh_repos`): the GitHub token, or none.
     GhRepos,
     GhUser,
+    /// Decodo Web Data API (github.com/Decodo/sdk-ts `src/client.ts`, `Authorization: Bearer <api key>`): pages,
+    /// and the key check (`check_call`).
+    DecodoScrape,
+    /// fats's own endpoints (`telemetry`): the daily update check and the weekly counts; no key.
+    Telemetry,
+    TelemetryL2,
 }
 
 /// A row of `Providers::apis`: the method, the URL, and what an account read gets (`account dry:true`, `{from}`
@@ -495,26 +666,32 @@ impl Api {
     /// The URL a call to `self` goes to: a GET's `req` string fields as the query (`send`, `account dry:true`).
     pub fn url(self, req: &Value) -> String {
         let get = req.as_object().into_iter().flatten().filter(|_| self.row().method == "GET");
-        let q = url::form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(get.map(|(k, v)| (k, v.as_str().unwrap_or_default())))
-            .finish();
+        let pairs = get.map(|(k, v)| (k, v.as_str().unwrap_or_default()));
+        let q = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish();
         // a path's `{q}` (GhUser's login, `[A-Za-z0-9-]` only) is the request's `q`, also sent in the query
-        let url = self.row().url.replace("{q}", req["q"].as_str().unwrap_or_default());
+        let url = crate::lang::draw(self.row().url, &[("q", req["q"].as_str().unwrap_or_default())]);
         if q.is_empty() { url } else { format!("{url}?{q}") }
     }
 }
 
 /// A provider's dashboard pages, printed after a `!` row's fix (`→ <link>`); never requested, never sent a key.
 /// Only pages the providers' own docs give as a URL (read 2026-10-12);
-/// a page the docs reach only by menu path is None, never a guessed URL.
+/// a page the docs reach only by menu path is None, never a guessed URL. In rank order (`fats setup` lists them so,
+/// best first), with the setup card's words.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Links {
     pub short: &'static str,
+    pub name: &'static str,
     pub signup: &'static str,
+    pub mint: &'static str,
     pub keys: Option<&'static str>,
     pub billing: Option<&'static str>,
     pub usage: Option<&'static str>,
+    pub rank: &'static str,
+    pub free: &'static str,
+    pub cost: &'static str,
+    pub step: &'static str,
 }
 
 /// A provider's pages by any tier name that uses its key (`oxyjs` → Oxylabs).
@@ -570,10 +747,8 @@ impl Reply {
             serde_json::from_slice::<Value>(&self.body).ok().and_then(|j| j["title"].as_str().map(String::from));
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let reset = num("x-ratelimit-reset").filter(|_| num("x-ratelimit-remaining") == Some(0));
-        match () {
-            _ if self.status == 429 && title.as_deref() == Some("RATE_LIMIT_EXCEEDED") => after.or(Some(RETRY_AFTER)),
-            _ => after.or(reset.map(|t| t.saturating_sub(now).max(1))),
-        }
+        let rate = self.status == 429 && title.as_deref() == Some("RATE_LIMIT_EXCEEDED");
+        after.or(if rate { Some(RETRY_AFTER) } else { reset.map(|t| t.saturating_sub(now).max(1)) })
     }
 
     /// The account's own `x-ratelimit-…-limit` / `-remaining` pair (not the `system_` one every client shares).
@@ -586,6 +761,39 @@ impl Reply {
     }
 }
 
+/// The provider's own reason for its error answer (`Fail::why`, the `!` row's): its status, then what an RFC 9457
+/// problem document names (Oxylabs Web API, developers.oxylabs.io/api-reference/errors-and-status-codes): the
+/// first field error's pointer and detail (`400 url: value not supported`), else `faulted` when its own retries
+/// gave up (`state`) and the title (`500 faulted: request failed after too many retries`). Fields only, never raw
+/// text, each masked (`lang::redact`) as DECODED (a key spelled in JSON escapes is a key) before it is lowered:
+/// words of `[a-z0-9.,:/#-]` (a masked `***` drops), whole words up to 50 chars (the tier's name before it stays
+/// ≤ 60); the bare status when the body names nothing (Oxylabs' 401: empty; HTML). `fetch::settled` reads the
+/// status back.
+fn reason(status: u16, body: &[u8], secrets: &[String]) -> String {
+    let j: Value = serde_json::from_slice(body).unwrap_or_default();
+    let text = |v: &Value| crate::lang::redact(v.as_str().unwrap_or_default(), secrets).to_lowercase();
+    let e = &j["errors"][0];
+    let faulted = if j["state"] == "faulted" { "faulted".into() } else { String::new() };
+    let (label, said) = match text(&e["detail"]) {
+        d if !d.is_empty() => (text(&e["pointer"]).rsplit('/').next().unwrap_or_default().to_string(), d),
+        _ => (faulted, text(&j["title"]).replace('_', " ")),
+    };
+    let label = if label.is_empty() { label } else { label + ":" };
+    said_short(&format!("{status} {label} {said}"))
+}
+
+/// Words as a printable reason: those of `[a-z0-9.,:/#-]` only, at most `reason_chars` chars, no trailing `.` or `:`.
+fn said_short(words: &str) -> String {
+    let ok = |w: &&str| w.bytes().all(|b| b.is_ascii_alphanumeric() || b".,:/#-".contains(&b));
+    let (mut n, cap) = (0, crate::settings::limit::<usize>("reason_chars") + 1);
+    let fits = words.split_whitespace().filter(ok).take_while(|w| {
+        n += w.len() + 1;
+        n <= cap
+    });
+    let fits: Vec<&str> = fits.collect();
+    fits.join(" ").trim_end_matches(['.', ':']).to_string()
+}
+
 /// A header value as a printable token: `[a-z0-9_]`, at most 32 chars; anything else is dropped (empty).
 fn token(v: Option<&str>) -> String {
     let v = v.unwrap_or_default().trim().to_ascii_lowercase();
@@ -594,7 +802,7 @@ fn token(v: Option<&str>) -> String {
     if ok { v } else { String::new() }
 }
 
-/// Stand-in for the network in tests (tests/redact.rs): (api, key, request) → reply, set once per process. Only
+/// The fake network of tests (tests/redact.rs): (api, key, request) → reply, set once per process. Only
 /// in builds with the `fake` feature; the shipped binary has no such hook.
 #[cfg(feature = "fake")]
 pub type Fake = fn(Api, &str, &Value) -> Reply;
@@ -603,10 +811,10 @@ static FAKE: std::sync::OnceLock<Fake> = std::sync::OnceLock::new();
 
 #[cfg(feature = "fake")]
 pub fn fake(f: Fake) {
-    FAKE.set(f).ok(); // the first stand-in holds
+    FAKE.set(f).ok(); // the first fake holds
 }
 
-/// A test's stand-in transport answers (`fake`): it lives in this process only, so a detached fetch runs on a
+/// A test's fake transport answers (`fake`): it lives in this process only, so a detached fetch runs on a
 /// thread here, not in a new process (`cli::detach`).
 pub fn in_process() -> bool {
     #[cfg(feature = "fake")]
@@ -621,7 +829,7 @@ pub fn in_process() -> bool {
 async fn api(to: Api, key: &str, req: Value, cap: u64, wait: Duration) -> Result<Answer, Fail> {
     #[cfg(feature = "fake")]
     if let Some(f) = FAKE.get() {
-        // a stand-in answer may ask to be slow (`x-fake-delay-ms`): the router's cancel and wait paths under test
+        // a fake answer may ask to be slow (`x-fake-delay-ms`): the router's cancel and wait paths under test
         let r = f(to, key, &req);
         let ms = r.header("x-fake-delay-ms").and_then(|v| v.parse().ok()).unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(ms).min(wait)).await;
@@ -641,7 +849,7 @@ async fn send(to: Api, key: &str, req: Value, cap: u64, wait: Duration) -> Resul
     let r = r.header("user-agent", concat!("fatsearch/", env!("CARGO_PKG_VERSION")));
     let r = if to.row().accept.is_empty() { r } else { r.header("accept", to.row().accept) };
     let r = if key.is_empty() { r } else { r.bearer_auth(key) };
-    let r = r.send().await.map_err(|e| net(&e))?;
+    let r = r.send().await.map_err(|e| net(&e).code)?;
     let status = r.status().as_u16();
     let mut reply = Reply { status, headers: pairs(r.headers()), body: Vec::new() };
     reply.body = match (reply.refused(), status) {
@@ -684,7 +892,12 @@ fn read(to: Api, r: Reply) -> Result<Answer, Fail> {
         (_, 429) => ("rate_limited", String::new()),
         _ => ("provider_error", String::new()),
     };
-    let body = crate::lang::redact(&String::from_utf8_lossy(&r.body), &crate::settings::secrets()).into_bytes();
+    let secrets = crate::settings::secrets();
+    let why = if code == "provider_error" && why.is_empty() { reason(r.status, &r.body, &secrets) } else { why };
+    // a JSON answer is read as decoded (a key spelled in `\u00XX` escapes is a key), then masked
+    let text = serde_json::from_slice::<Value>(&r.body)
+        .map_or_else(|_| String::from_utf8_lossy(&r.body).into(), |j| j.to_string());
+    let body = crate::lang::redact(&text, &secrets).into_bytes();
     Err(Fail { code, status: r.status, body, why, limit })
 }
 
@@ -726,17 +939,17 @@ async fn brightdata(ask: &Ask, key: &str, wait: Duration) -> Result<Raw, Fail> {
         let (code, why) = bd_refused(why, inner("x-brd-status-code"), None);
         return Err(Fail { why, ..Fail::from(code) });
     }
+    relayed(&j, "body", j["headers"]["x-unblocker-redirected-to"].as_str().unwrap_or(&ask.url))
+}
+
+/// A target's answer a provider relayed as JSON, `{status_code, headers, <body>}` (Bright Data `body`, Decodo
+/// `content`): no `status_code` = 200; one that is no HTTP status is a broken answer, never truncated (65940 → 404).
+fn relayed(j: &Value, body: &str, final_url: &str) -> Result<Raw, Fail> {
     let headers =
         header_lines(j["headers"].as_object().into_iter().flatten().map(|(k, v)| (k, v.as_str().unwrap_or(""))));
-    // no `status_code` = 200; one that is no HTTP status is a broken answer, never truncated (65940 → 404)
     let status = j["status_code"].as_u64().map_or(Ok(200), u16::try_from).map_err(|_| "provider_error")?;
-    Ok(Raw {
-        status,
-        final_url: j["headers"]["x-unblocker-redirected-to"].as_str().unwrap_or(&ask.url).to_string(),
-        headers,
-        body: j["body"].as_str().unwrap_or_default().as_bytes().to_vec(),
-        ..Raw::default()
-    })
+    let body = j[body].as_str().unwrap_or_default().as_bytes().to_vec();
+    Ok(Raw { status, final_url: final_url.into(), headers, body, ..Raw::default() })
 }
 
 /// The country a page's domain names, upper case: its ccTLD's `Providers::cctld` row (sites that answer best from
@@ -761,7 +974,7 @@ pub fn home() -> String {
 /// the request (`outline::geo_fix`). What the serving call sent is the page's `meta.json` country (`stats` `@FR`).
 pub fn sent(ask: &Ask, t: Tier) -> Option<String> {
     let named = ask.country.as_ref().filter(|c| !c.is_empty()).map(|c| c.to_uppercase());
-    let home = Some(home()).filter(|h| h != "US" || t.owner() == Tier::Oxy);
+    let home = Some(home()).filter(|h| h != "US" || !t.can("auto_geo"));
     (t != Tier::Plain).then(|| named.or_else(|| domain_country(&ask.url)).or(home)).flatten()
 }
 
@@ -804,6 +1017,33 @@ async fn oxylabs(ask: &Ask, key: &str, wait: Duration) -> Result<Raw, Fail> {
         limit,
         ..Raw::default()
     })
+}
+
+/// Web Data API `/v1/scrape`, `universal` target (github.com/Decodo/sdk-ts `src/generated/request-schemas.ts`):
+/// `{url, target, geo, headless, device_type}` → `results[0].{content, status_code, url, headers}`. HTML, never
+/// `markdown: true`: a Markdown answer skips the content check (walls, shells) and loses the page's own data.
+/// `geo` = `sent` as Decodo's own CLI passes it (`--geo de`, github.com/Decodo/cli); `headless: "html"` = the JS
+/// rung; `device_type: "mobile"` (Decodo/Web-Scraping-API README).
+fn decodo_body(ask: &Ask) -> Value {
+    let mut req = json!({"url": ask.url, "target": "universal"});
+    if let Some(c) = sent(ask, Tier::Decodo) {
+        req["geo"] = c.to_lowercase().into();
+    }
+    if ask.js {
+        req["headless"] = "html".into();
+    }
+    if ask.mobile {
+        req["device_type"] = "mobile".into();
+    }
+    req
+}
+
+async fn decodo(ask: &Ask, key: &str, wait: Duration) -> Result<Raw, Fail> {
+    let (body, limit, _) = api(Api::DecodoScrape, key, decodo_body(ask), 2 * ask.max_bytes, wait).await?;
+    let j: Value = serde_json::from_slice(&body).map_err(|_| "provider_error")?;
+    let r = &j["results"][0];
+    r["content"].as_str().ok_or("provider_error")?;
+    Ok(Raw { limit, ..relayed(r, "content", r["url"].as_str().unwrap_or(&ask.url))? })
 }
 
 /// A file's bytes from Oxylabs' `html` string. It is the file decoded as UTF-8 with every byte that does not
@@ -924,7 +1164,7 @@ pub async fn search(
 /// note (the search's, then the account's: ` · no user <q>`, ` · user lookup: rate_limited retry in 60s`); the
 /// account's failure with no hit at all is the answer's (`! rate_limited gh user <q> …`), never `0 results`.
 pub async fn gh_repos(q: String, limit: usize) -> Result<(Vec<Hit>, Vec<(&'static str, String)>), Fail> {
-    let (key, per) = (crate::settings::gh_token(), limit.min(crate::settings::limit("gh_max")));
+    let (key, per) = (crate::settings::key("gh").unwrap_or_default().0, limit.min(crate::settings::limit("gh_max")));
     let call = |to: Api, req: Value| api(to, &key, req, 4 << 20, SEARCH_TIMEOUT);
     let login = q.len() <= 39 && !q.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-');
     let user = login.then_some(async {
@@ -964,8 +1204,10 @@ pub async fn gh_repos(q: String, limit: usize) -> Result<(Vec<Hit>, Vec<(&'stati
 
 // ---------------------------------------------------------------- account (`fats account`)
 
-/// The providers `fats account` reads, in row order.
+/// The providers `fats account` reads, in row order (Decodo documents no usage read for its API key).
 pub const ACCOUNTS: [Tier; 2] = [Tier::Oxy, Tier::Bd];
+/// Every provider with a key, in the order `fats setup` and the status line name them.
+pub const KEYS: [Tier; 3] = [Tier::Oxy, Tier::Bd, Tier::Decodo];
 /// Per call; the account APIs answered in 0.1–0.5 s (measured 2026-10-12).
 pub const ACCOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest account answer kept (the scraper list is ~14 KB).
@@ -1068,10 +1310,31 @@ pub async fn account(t: Tier, key: String, month: (String, String), zone: Option
     a
 }
 
-/// One free read with a key and no request fields (`OxyScrapers`, `BdZones`): its JSON (the body is dropped).
-pub async fn read_json(to: Api, key: String) -> Result<Value, Fail> {
-    let (body, ..) = api(to, &key, json!({}), ACCOUNT_CAP, ACCOUNT_TIMEOUT).await?;
-    Ok(serde_json::from_slice(&body).unwrap_or_default())
+/// A target that does not exist: Decodo's key check scrapes it (`check_call`); a key is never sent there.
+pub const NO_HOST: &str = "https://does-not-exist.decodo.com";
+
+/// `fats setup`'s free key check of `t`'s key: Oxylabs the scraper list, Bright Data the zone list (names and types,
+/// never an endpoint with a zone password), Decodo a `universal` scrape of `NO_HOST`, its CLI's own check
+/// (github.com/Decodo/cli `src/scrape/services/auth-validation.ts`): 401 = a bad key, a 400 = a good one.
+pub fn check_call(t: Tier) -> (Api, Value) {
+    match t.owner() {
+        Tier::Bd => (Api::BdZones, json!({})),
+        Tier::Decodo => (Api::DecodoScrape, json!({"url": NO_HOST, "target": "universal"})),
+        _ => (Api::OxyScrapers, json!({})),
+    }
+}
+
+/// `t`'s key check (`check_call`): what it shows (Oxylabs' scraper count, else `key ok`) and Bright Data's Web
+/// Unlocker zones in the list's order (its rows carry `name` and `type` only); Decodo's 400 on `NO_HOST` = a good key.
+pub async fn check_key(t: Tier, key: String) -> Result<(String, Vec<String>), Fail> {
+    let (to, req) = check_call(t);
+    let j: Value = match api(to, &key, req, ACCOUNT_CAP, ACCOUNT_TIMEOUT).await {
+        Err(f) if to == Api::DecodoScrape && f.status == 400 => json!({}),
+        r => serde_json::from_slice(&r?.0).unwrap_or_default(),
+    };
+    let zones = j.as_array().into_iter().flatten().filter(|z| z["type"] == "unblocker");
+    let what = j["scrapers"].as_array().map_or("key ok".into(), |s| format!("{} scrapers", s.len()));
+    Ok((what, zones.filter_map(|z| z["name"].as_str().map(String::from)).collect()))
 }
 
 /// Safari 26 on macOS (TLS ClientHello, HTTP/2 settings, navigation headers, as maintained by wreq-util). Measured
@@ -1083,6 +1346,29 @@ fn browser() -> wreq_util::Emulation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE home-IP brake: a second plain call to a host waits while the first holds its turn, and until
+    /// `plain_host_pace_ms` after its start (unit tests run with every key: a key never skips the wait).
+    #[test]
+    fn plain_calls_to_one_host_are_paced() {
+        let url = format!("https://pace-{}.example/a", std::process::id());
+        let (first, waited) = pace(&url);
+        assert!(first.is_some() && waited < 500, "the first call runs at once: {waited} ms");
+        let second = std::thread::spawn(move || pace(&url).1);
+        std::thread::sleep(Duration::from_millis(300));
+        drop(first);
+        let waited = second.join().expect("second call");
+        assert!((600..2000).contains(&waited), "the held turn, then 1 s from the first start: {waited} ms");
+        // the start is written over the last one, fixed-width: a longer old file's tail is never read
+        let other = format!("https://pace-tail-{}.example/", std::process::id());
+        let at = crate::settings::get().cache.value.join("pace").join(crate::clean::host_of(&other));
+        std::fs::create_dir_all(at.parent().expect("pace dir")).ok();
+        std::fs::write(&at, format!("1.0{}", "x".repeat(40))).ok();
+        drop(pace(&other));
+        let kept = std::fs::read_to_string(&at).unwrap_or_default();
+        assert!(kept.get(..20).and_then(|k| k.parse::<f64>().ok()).is_some_and(|t| t > 1e9), "one start: {kept}");
+        assert_eq!(kept.len(), 43, "written over, never cut or grown");
+    }
 
     /// THE billing rule (bd's zone counter): an answer below 500 is billed, a 5xx (bd's
     /// `http_502`), a timeout (a search's too: counter +0 for 2) or a refusal is not, for both providers.
@@ -1126,13 +1412,17 @@ mod tests {
     /// A key goes only to `Providers::apis`: scrape, search and account reads on the two provider API hosts, never an
     /// endpoint that returns secrets (Bright Data `GET /zone`, `/zone/passwords`; Webshare `/proxy/list`), and a
     /// POST only where the docs make it a query. `send` is the only request with a key, and no provider URL is
-    /// written outside `apis` and `links` in providers.json (pages printed for people, never requested): a new one is a visible row.
+    /// written outside `apis` and `links` in providers.json (pages printed for people, never requested): a new one is a
+    /// visible row.
     #[test]
     fn keys_go_only_to_listed_endpoints() {
-        // 1.1.1.1 (DoH) is sent no key: `exists` passes an empty one, which `send` never puts in a header
-        const HOSTS: &[&str] = &["api.brightdata.com", "webapi.oxylabs.io", "1.1.1.1", "api.github.com"];
+        // 1.1.1.1 (DoH) and fatsearch.com (telemetry, `ours`) are sent no key: an empty one, which `send` never puts
+        // in a header
+        const HOSTS: &[&str] = &[
+            "api.brightdata.com", "webapi.oxylabs.io", "1.1.1.1", "api.github.com", "data.decodo.com", "fatsearch.com",
+        ];
         const NEVER: &[&str] = &["password", "/proxy/list", "/billing", "/account", "/users"];
-        const POST: &[&str] = &["/request", "/scrape", "/search", "/costs/export/json"];
+        const POST: &[&str] = &["/request", "/scrape", "/search", "/costs/export/json", "/v1/l2"];
         for (i, ApiRow { api, method, url, .. }) in PROVIDERS.apis.iter().enumerate() {
             assert_eq!(*api as usize, i, "apis is indexed by Api");
             let u = url::Url::parse(url).expect("url");
@@ -1144,8 +1434,12 @@ mod tests {
             assert!(p != "/zone" && (public || NEVER.iter().all(|n| !p.contains(n))), "{url}: returns secrets");
             assert!(*method == "GET" || (*method == "POST" && POST.iter().any(|e| p.ends_with(e))), "{url}");
         }
-        let links: Vec<&str> =
-            PROVIDERS.links.iter().flat_map(|l| [Some(l.signup), l.keys, l.billing, l.usage]).flatten().collect();
+        let links: Vec<&str> = PROVIDERS
+            .links
+            .iter()
+            .flat_map(|l| [Some(l.signup), Some(l.mint), l.keys, l.billing, l.usage])
+            .flatten()
+            .collect();
         assert!(links.iter().all(|l| l.starts_with("https://")));
         let src: String = [
             include_str!("provider.rs"),
@@ -1162,11 +1456,15 @@ mod tests {
         assert_eq!(src.matches("bearer_auth(").count(), 1, "one request carries a key");
         assert!(!src.contains("basic_auth(") && !src.to_ascii_lowercase().contains("\"authorization\""));
         let listed: Vec<&str> = PROVIDERS.apis.iter().map(|a| a.url).chain(links).collect();
-        let provider =
-            ["oxylabs.io", "brightdata.com", "luminati", "webshare.io", "decodo.com", "1.1.1.1", "github.com"];
+        let provider = [
+            "oxylabs.io", "brightdata.com", "luminati", "webshare.io", "decodo.com", "1.1.1.1", "github.com",
+            "fatsearch.com",
+        ];
         let lits: Vec<String> =
             src.split("\"http").skip(1).filter_map(|r| r.split('"').next()).map(|r| format!("http{r}")).collect();
-        let found: Vec<&String> = lits.iter().filter(|l| provider.iter().any(|h| l.contains(h))).collect();
+        // Decodo's key check target is a page asked for, no place a key goes
+        let found: Vec<&String> =
+            lits.iter().filter(|l| *l != NO_HOST && provider.iter().any(|h| l.contains(h))).collect();
         assert_eq!(found.len(), listed.len(), "each provider URL is written once, in apis or links: {found:?}");
         assert!(found.iter().all(|l| listed.contains(&l.as_str())), "provider URL outside apis/links: {found:?}");
     }
@@ -1232,7 +1530,29 @@ mod tests {
             read(Api::OxyScrape, acct(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")])).map_err(|f| f.why),
             Err("retry in 5s".into())
         );
-        assert_eq!(r(500, false, "<html>oops").map_err(|f| f.code), Err("provider_error"));
+        assert_eq!(r(500, false, "<html>oops").map_err(|f| (f.code, f.why)), Err(("provider_error", "500".into())));
+    }
+
+    /// The provider's own reason (`reason`): an RFC 9457 field error, its faulted title; fields only, ≤ 50 chars.
+    #[test]
+    fn a_refusal_keeps_its_reason() {
+        let why = |status, body: &str| {
+            let r = Reply { status, headers: vec![], body: body.into() };
+            read(Api::OxyScrape, r).map_err(|f| f.why).expect_err("refused")
+        };
+        let url =
+            r##"{"title":"INVALID_BODY_PROPERTY","errors":[{"detail":"Value not supported.","pointer":"#/url"}]}"##;
+        assert_eq!(why(400, url), "400 url: value not supported");
+        let faulted =
+            r#"{"status":500,"state":"faulted","title":"REQUEST_FAILED_AFTER_TOO_MANY_RETRIES","detail":"x"}"#;
+        assert_eq!(why(500, faulted), "500 faulted: request failed after too many retries");
+        let long = r#"{"title":"A_B","errors":[{"detail":"key=*** <b>is</b> wrong and this sentence goes on far too long to fit"}]}"#;
+        assert_eq!(why(400, long), "400 wrong and this sentence goes on far too long", "masked and markup words drop");
+        // a key in JSON escapes is masked once decoded, before it is lowered: no run of it in the reason
+        let key = ["Ab3dEf6hIj9kLm2nOp".to_string()];
+        let escaped: String = key[0].chars().map(|c| format!("\\u{:04x}", c as u32)).collect();
+        let body = format!(r##"{{"errors":[{{"detail":"key {escaped} refused","pointer":"#/key"}}]}}"##);
+        assert_eq!(reason(400, body.as_bytes(), &key), "400 key: key refused");
     }
 
     /// Search requests carry only the documented fields; the parser reads both providers' saved answers.
@@ -1360,7 +1680,14 @@ mod tests {
             let a = ask(url, c);
             assert_eq!(oxy_body(&a)["location"].as_str(), Some(oxy), "{url} {c:?}");
             assert_eq!(bd_body(&a).get("country").and_then(Value::as_str), bd, "{url} {c:?}");
+            assert_eq!(decodo_body(&a)["geo"].as_str(), Some(oxy.to_lowercase().as_str()), "Decodo as Oxylabs");
         }
+        // Decodo: `universal`, HTML (no `markdown`), `headless: html` on its render only, a mobile ask as its device
+        let js = Ask { js: true, mobile: true, ..ask("https://ex.com/", None) };
+        let mut want = json!({"url": "https://ex.com/", "target": "universal", "geo": "us"});
+        assert_eq!(decodo_body(&ask("https://ex.com/", None)), want);
+        (want["headless"], want["device_type"]) = ("html".into(), "mobile".into());
+        assert_eq!(decodo_body(&js), want);
     }
 
     /// Every spelling of a private address is private; public ones pass.
@@ -1370,13 +1697,21 @@ mod tests {
             "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
             "255.255.255.255", "224.0.0.1", "240.0.0.1", "198.18.0.1", "192.0.0.8", "::1", "::", "fe80::1", "fc00::1",
             "fd12::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "64:ff9b::a9fe:a9fe", "2001:db8::1", "::7f00:1",
-            "::a9fe:a9fe", "2002:7f00:1::", "2002:c0a8:101::1",
+            "::a9fe:a9fe", "2002:7f00:1::", "2002:c0a8:101::1", "203.0.113.9", "fec0::1", "ff02::1", "192.0.2.1",
+            "198.51.100.7",
         ] {
             assert!(private_ip(ip.parse().unwrap()), "{ip} is private");
         }
-        for ip in
-            ["8.8.8.8", "1.1.1.1", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "2002:808:808::1"]
-        {
+        // every block parses: one that does not is silently no block (`private_ip`'s `filter_map`)
+        let block =
+            |b: &str| b.split_once('/').map(|(ip, n)| (ip.parse::<std::net::IpAddr>().is_ok(), n.parse::<u32>()));
+        let bad: Vec<&&str> =
+            crate::fetch::SITES.fence.iter().filter(|b| !matches!(block(b), Some((true, Ok(_))))).collect();
+        assert!(bad.is_empty(), "{bad:?}");
+        for ip in [
+            "8.8.8.8", "172.32.0.1", "100.128.0.1", "198.20.0.1", "2606:4700::1111", "::ffff:8.8.8.8",
+            "2002:808:808::1",
+        ] {
             assert!(!private_ip(ip.parse().unwrap()), "{ip} is public");
         }
         for url in [
@@ -1393,6 +1728,44 @@ mod tests {
             assert!(private_host(url), "{url} is refused");
         }
         assert!(!private_host("https://example.com/") && !private_host("http://8.8.8.8/"));
+    }
+
+    /// A meta refresh is a redirect only as the page's one move: no delay, its own host, no script, under
+    /// `page_chars` shown, a 2xx page. A challenge's `<noscript>` refresh (a time, no URL) and a scripted page's
+    /// no-JS fallback are no redirect (the 27 saved plain copies with a refresh were all of those kinds).
+    #[test]
+    fn a_meta_refresh_moves_only_alone() {
+        let page = |status: u16, head: &str, body: &str| Raw {
+            status,
+            ctype: "text/html".into(),
+            body: format!("<html><head>{head}</head><body>{body}</body></html>").into_bytes(),
+            final_url: "https://a.example/releases/latest/".into(),
+            ..Raw::default()
+        };
+        let tag = |c: &str| format!("<meta http-equiv=\"Refresh\" content=\"{c}\">");
+        let to = |status, head: &str, body: &str| refresh(&page(status, head, body));
+        let at = Some("https://a.example/2026/10/15/one/".to_string());
+        assert_eq!(to(200, &tag("0; url=/2026/10/15/one/"), ""), at);
+        assert_eq!(to(200, &tag("0;URL='../../2026/10/15/one/'"), ""), at, "WHATWG: any case, quotes, relative");
+        assert_eq!(to(200, &tag("0, https://a.example/2026/10/15/one/"), ""), at, "a comma, no url=");
+        assert_eq!(to(200, &tag("5; url=/2026/10/15/one/"), ""), None, "a delay");
+        assert_eq!(to(200, &tag("0; url=https://b.example/one/"), ""), None, "another host");
+        // one origin: scheme, host and port; http → https the one scheme move
+        assert_eq!(to(200, &tag("0; url=https://a.example:8443/one/"), ""), None, "another port");
+        assert_eq!(to(200, &tag("0; url=http://a.example/one/"), ""), None, "https → http");
+        let up = Raw { final_url: "http://a.example/x".into(), ..page(200, &tag("0; url=https://a.example/one/"), "") };
+        assert_eq!(refresh(&up).as_deref(), Some("https://a.example/one/"), "http → https");
+        // a time of digits only; an empty `url=` reloads the page
+        for c in ["+0; url=/one/", "-0; url=/one/", "0.0; url=/one/", " ; url=/one/", "0; url=", "0; url=''"] {
+            assert_eq!(to(200, &tag(c), ""), None, "{c}");
+        }
+        assert_eq!(to(200, &tag("00 ; url=/one/"), "").as_deref(), Some("https://a.example/one/"));
+        // the bytes `http-equiv` gate the parse: a page that merely says refresh is no candidate
+        assert_eq!(to(200, "<meta name=refresh content='0; url=/one/'>", ""), None, "no http-equiv");
+        assert_eq!(to(200, &tag("0; url=/one/"), "<script src=/app.js></script>"), None, "a script");
+        assert_eq!(to(200, "", &format!("<noscript>{}</noscript>", tag("360"))), None, "no URL");
+        assert_eq!(to(404, &tag("0; url=/one/"), ""), None, "no 2xx");
+        assert_eq!(to(200, &tag("0; url=/one/"), &"<p>A page of its own. </p>".repeat(80)), None, "a page");
     }
 
     /// Redirects run through the fence: a public page that bounces to the metadata address is refused before

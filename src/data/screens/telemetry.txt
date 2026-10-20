@@ -1,0 +1,8 @@
+§ notice
+~ anonymous usage stats on · what's sent: fats telemetry show · off: fats setup
+§ row
+telemetry  {level} anonymous usage stats, to fix and improve fats
+                  never sent: URLs, searches, page text, files, keys, your IP, any id
+                  sent: fatsearch version, OS, which package (npm, Homebrew, cargo…), commands used, errors,
+                  which providers worked, crashes in our code
+                  see exactly what's sent: {b} telemetry show · change: {b} setup telemetry full | minimal | off

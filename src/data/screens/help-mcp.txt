@@ -1,0 +1,10 @@
+{bold}fats mcp{/}
+
+fats mcp starts the agent connection (an MCP server with one tool, `fats`). Add it once:
+
+  Claude Code   claude mcp add --scope user fats -- fats mcp
+  Codex         codex mcp add fats -- fats mcp
+  Cursor        ~/.cursor/mcp.json: { "mcpServers": { "fats": { "command": "fats", "args": ["mcp"] } } }
+
+Then ask your agent: “read example.com with fats”.
+Or do it from the menu: fats setup → Settings → Agent connection.

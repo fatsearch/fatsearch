@@ -4,7 +4,9 @@
 use crate::cache::{Asset, Cache, Cursor, Detached, Done, Entry, HopRow, Meta, NoDoc, Snap, State, jload, now};
 use crate::clean::{Doc, host_of};
 use crate::fetch::{self, Hop, Plan};
-use crate::lang::{At, CARD, Cmd, Flag, Id, Match, Out, WORDS, bang, bin, emit, fix, ksize, mib, parse, short};
+use crate::lang::{
+    At, CARD, Cmd, Flag, GUIDE, Id, Match, Out, WORDS, bang, bin, emit, fix, ksize, mib, parse, short, to_guide,
+};
 use crate::outline::{self, Page, Shown};
 use crate::provider::{self, Ask, Hit, Tier};
 use crate::{search, settings, stats};
@@ -32,24 +34,70 @@ pub fn fence(dirs: Vec<PathBuf>) {
     FENCE.set(dirs).ok(); // the first fence holds
 }
 
-/// Why the fence refuses this local read, if it does. A missing file falls through to `not_found`.
-fn fenced(f: &str, path: &Path) -> Option<&'static str> {
-    let dirs = FENCE.get()?;
-    if f == "-" {
-        return Some("stdin carries the MCP protocol");
+/// Outside the fence by its name alone (`..` folded, the disk never read), so under `fats mcp` no answer tells
+/// whether a path out there exists: `/x/y words` searches and `/x/y` is refused either way.
+pub fn outside(path: &Path) -> bool {
+    let Some(dirs) = FENCE.get() else { return false };
+    let mut p = PathBuf::new();
+    for c in std::env::current_dir().unwrap_or_default().join(path).components() {
+        match c {
+            std::path::Component::ParentDir => {
+                p.pop();
+            }
+            c => p.push(c),
+        }
     }
-    let p = path.canonicalize().ok()?; // symlinks resolved: ./link → /etc/hosts is outside
-    let inside = dirs.iter().filter_map(|d| d.canonicalize().ok()).any(|d| p.starts_with(d));
-    (!inside).then_some("outside the working directory and the cache")
+    !dirs.iter().any(|d| p.starts_with(d) || d.canonicalize().is_ok_and(|d| p.starts_with(d)))
+}
+
+/// A key or credential file by its bare name, in any directory: a `Words::secret_names` name (`.env.*` = a
+/// prefix) or a secret extension (`Sites::doc_ext` kind `secret`: `.pem`). Never read, stored or searched
+/// (`fenced`: `secret_file`; missing, `no_file`).
+pub fn secret(p: &Path) -> bool {
+    let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let named = |s: &&str| s.strip_suffix('*').map_or(name == *s, |pre| name.starts_with(pre));
+    crate::lang::WORDS.secret_names.iter().any(named) || crate::fetch::doc_kind(&name) == Some("secret")
+}
+
+/// The path a local read opens: the canonical one the fence judged, by name first, then with symlinks resolved
+/// (so a link swapped in after the check never reaches outside: the open never resolves it again). Err = why the
+/// fence refuses it (`not_allowed`), or a key or credential file that exists, by its name or its target's
+/// (`secret_file`, `secret`: never opened); `Ok(Err)` = a path that does not resolve, its error the `no_file`
+/// answer.
+fn fenced(f: &str, path: &Path) -> Result<std::io::Result<PathBuf>, (&'static str, &'static str)> {
+    if f == "-" && FENCE.get().is_some() {
+        return Err(("not_allowed", "stdin carries the MCP protocol"));
+    }
+    let real = path.canonicalize();
+    // symlinks resolved only inside: ./link → /etc/hosts is outside
+    if outside(path) || real.as_ref().is_ok_and(|p| outside(p)) {
+        return Err(("not_allowed", "outside the working directory and the cache"));
+    }
+    if real.as_ref().is_ok_and(|p| secret(p) || secret(path)) {
+        return Err(("secret_file", "a key or credential file is not read · $0"));
+    }
+    Ok(real)
+}
+
+/// The output is JSON Lines: `json`, `json:true` or `FATS_JSON`.
+fn json_of(cmd: &Cmd) -> bool {
+    cmd.has("json") || cmd.flag("json") || settings::get().json.value
 }
 
 /// Run one invocation: (stdout text, exit code, the picture it asked for: `fats mcp` attaches it). Never panics
 /// on user input.
 pub fn run(argv: &[String]) -> (String, i32, Option<String>) {
     let cmd = parse(argv);
+    settings::mods(&cmd.mods);
     let set = settings::get();
-    let json = cmd.has("json") || cmd.flag("json") || set.json.value;
+    let json = json_of(&cmd);
     let mut c = Cache::open();
+    // a human on a terminal: `fats` alone = the home screen, help = the help screens (the agent's: status, the card)
+    let human = crate::lang::human(json);
+    let screen = || if argv.is_empty() { Some(stats::home(&c)) } else { crate::lang::help_screen(argv) };
+    if let Some(s) = human.then(screen).flatten() {
+        return (s, 0, None);
+    }
     let mut out = if let Some(q) = &cmd.ask {
         Out::ask(q.clone())
     } else if cmd.flag("dry") {
@@ -76,7 +124,11 @@ pub fn run(argv: &[String]) -> (String, i32, Option<String>) {
     rows.extend(ignored(&cmd));
     out.warn(rows);
     let image = out.rec.get("image").and_then(|v| v.as_str()).map(String::from);
+    stats::tally_run(&c.root, &cmd, &out);
     let tail = footer(&c, &out.lines, !json && FENCE.get().is_none());
+    if let Some(t) = human.then(|| crate::lang::tip(&cmd, &out, is_search(&cmd))).flatten() {
+        return (t, out.rc, image);
+    }
     (emit(&out, json) + &tail, out.rc, image)
 }
 
@@ -123,29 +175,26 @@ fn ignored(cmd: &Cmd) -> Vec<String> {
     let (list, at) = (lists.into_iter().find(|w| cmd.has(w)), cmd.ids.first().map(|i| i.page() + " "));
     let fix = |w| format!("! ignored more · lists page by from:K → {} {}{w} from:K", bin(), at.unwrap_or_default());
     let more = list.filter(|_| cmd.has("more")).map(fix);
-    cmd.mods
-        .iter()
-        .filter_map(|(k, v)| {
-            let (code, why) = match k.as_str() {
-                "verbose" if v == "true" => ("not_in_v1", "no diagnostics in this build"),
-                "fetch" if !search => ("ignored", "only a web search prefetches"),
-                "site" | "since" if !search || is_gh(cmd) => ("ignored", "only a web search uses it"),
-                "country" if is_gh(cmd) => ("ignored", "only a web search or a page fetch uses it"),
-                "zone" if !cmd.has("setup") => ("ignored", "only setup uses it"),
-                "from" if list.is_none() => ("ignored", "only a links, cards, media or comments list pages"),
-                _ => return None,
-            };
-            // the arrow only to a command that does something without the mod (`fats u1`, never a bare `fats open`)
-            let rest = Some(cmd.with_mod(k, None)).filter(|r| !parse(std::slice::from_ref(r)).idle);
-            Some(format!("! {code} {k}:{v} · {why}{}", rest.map_or(String::new(), |r| format!(" → {} {r}", bin()))))
-        })
-        .chain(more)
-        .collect()
+    let row = |(k, v): &(String, String)| {
+        let (code, why) = match k.as_str() {
+            "verbose" if v == "true" => ("not_in_v1", "no diagnostics in this build"),
+            "fetch" if !search => ("ignored", "only a web search prefetches"),
+            "site" | "since" if !search || is_gh(cmd) => ("ignored", "only a web search uses it"),
+            "country" if is_gh(cmd) => ("ignored", "only a web search or a page fetch uses it"),
+            "zone" if !cmd.has("setup") => ("ignored", "only setup uses it"),
+            "from" if list.is_none() => ("ignored", "only a links, cards, media or comments list pages"),
+            _ => return None,
+        };
+        // the arrow only to a command that does something without the mod (`fats u1`, never a bare `fats open`)
+        let rest = Some(cmd.with_mod(k, None)).filter(|r| !parse(std::slice::from_ref(r)).idle);
+        Some(format!("! {code} {k}:{v} · {why}{}", rest.map_or(String::new(), |r| format!(" → {} {r}", bin()))))
+    };
+    cmd.mods.iter().filter_map(row).chain(more).collect()
 }
 
 /// Free words (or `site:` alone) without a page id, a local file or a page URL: a web search (`fats <words>`,
 /// `fats <host> <words>`, `fats site:x.com/news since:1d`).
-fn is_search(cmd: &Cmd) -> bool {
+pub fn is_search(cmd: &Cmd) -> bool {
     let any = !cmd.words.is_empty() || cmd.get("site").is_some();
     any && cmd.ids.is_empty() && cmd.files.is_empty() && page_url(cmd).is_none()
 }
@@ -207,7 +256,7 @@ fn search_of(cmd: &Cmd) -> Result<Search, Out> {
         return Err(Out::ask(format!("? provider:{p} cannot search · provider:oxy|bd|auto")));
     }
     let max = if gh { settings::limit("gh_max") } else { provider::SEARCH_MAX };
-    let (p, asked) = (plan_of(cmd, None, 0.0), wait_of(cmd));
+    let (p, asked) = (plan_of(cmd, None), wait_of(cmd));
     // a lead slower than `wait:` runs detached (`searching`): no `wait:`, one call (`one_call`), so `dry` routes that
     let wait = Some(p.search_wait(asked)).filter(|w| *w <= asked);
     Ok(Search {
@@ -326,7 +375,7 @@ fn prefetched(c: &mut Cache, cmd: &Cmd, job: usize, mut o: Out) -> Out {
         // a stored page opens on demand (no alias id); a running one, a private host, offline: `at_once` says no
         let want = Want { url, slot: Some(*n), ..Want::default() };
         let free = c.lookup(url).is_none() && at_once(c, want, cmd).is_none();
-        queued.extend(free.then(|| reserve(c, Entry::default(), want, cmd).ok()).flatten().map(|n| (n, want, 0.0)));
+        queued.extend(free.then(|| reserve(c, Entry::default(), want, cmd).ok()).flatten().map(|n| (n, want)));
     }
     // THE placement a batch's runs get: `fetch:20` starts 4 processes, not 20
     let ids: Vec<String> = queued.iter().map(|q| format!("u{}", q.0)).collect();
@@ -404,14 +453,10 @@ fn search_out(c: &Cache, cmd: &Cmd, job: usize, m: &Meta) -> Result<Out, Out> {
     };
     let (id, done) = (cmd.canon(), fetch::spent(m, &[], &fetch::keyed()));
     let at = At { id: &id, arg, done: &done, ..At::default() };
-    let (who, owners) = fetch::fail_detail(m, "", &[]);
+    let (who, owners) = fetch::fail_detail(m, "");
     // The same failure on this query again = a count, never the call that failed twice
     let n = fetch::fail_count(m, c.serps().iter().filter(|s| s.0 != job).map(|s| &s.1), Some(arg));
-    let next = match n {
-        Some(_) => String::new(),
-        None if is_gh(cmd) && m.code == "bad_key" => "gh auth login, or unset GH_TOKEN".into(), // `setup` keeps no GH key
-        None => fix(&m.code, &at),
-    };
+    let next = if n.is_some() { String::new() } else { fix(&m.code, &at) };
     let what = format!("{who}{}", n.unwrap_or_default()).trim_start().into();
     let row = Flag { code: m.code.clone(), what, next, row: true }.bang("") + &provider::pages(&m.code, owners);
     Ok(Out::fail(&m.code, format!("= ! {} j{job} search \"{q}\" {detail}", m.code), row))
@@ -436,7 +481,7 @@ fn searched(rec: &Meta) -> String {
     let gh = rec.provider == "github";
     let tried = if rec.hops.len() > 1 && !gh { format!(" after {}", rec.tried()) } else { String::new() };
     let mut note: String = rec.hops.iter().filter(|h| gh && h.code != "ok").map(|h| h.why.as_str()).collect();
-    note += if gh && settings::gh_token().is_empty() { " · no token: 10 searches/min" } else { "" };
+    note += if gh && settings::key("gh").is_none() { " · no token: 10 searches/min" } else { "" };
     let usd = provider::bill(rec.cost, rec.upto());
     format!("{}{cc}{tried}{note} · {:.1}s · spent {usd}", rec.provider, rec.ms as f64 / 1e3)
 }
@@ -473,7 +518,7 @@ fn serp_list(c: &mut Cache, job: usize, off: usize, new: bool) -> Out {
     // a search's own `limit:N` = at most N rows a page (20 at most, `more` goes on) within a read's token cap; else
     // what fits the list cap. A cut by tokens says so: `14 shown u1-u14 of limit:20 (1000 tok cap)`
     let n = c.job(job).and_then(|j| parse(&[j.cmd]).count("limit")).map(|n| n.min(provider::SEARCH_MAX));
-    let (mut lines, cap) = (Vec::new(), n.map_or(outline::LIST_CAP, |_| outline::READ_CAP));
+    let (mut lines, cap) = (Vec::new(), settings::limit::<usize>(if n.is_some() { "read_cap" } else { "list_cap" }));
     let next = off + outline::cap_rows(&mut lines, &rows, 0, (cap, 1, n));
     let cut = n.filter(|&n| lines.len() < n && next < hits.len());
     let cut = cut.map_or(String::new(), |n| format!(" of limit:{n} ({cap} tok cap)"));
@@ -510,19 +555,14 @@ fn search_dry(cmd: &Cmd, c: &Cache) -> Result<Out, Out> {
     let (runs, max) = fetch::route(&search.plan);
     let cc = search.country.as_ref().map(|cc| format!(" · country:{cc}")).unwrap_or_default();
     let off = settings::get().offline.value;
-    let q = &search.q;
-    let new = format!("new u{}-u{}", c.st.u.len() + 1, c.st.u.len() + search.limit);
+    let (q, lim, nokey) = (&search.q, search.limit, nokey_row(&search.plan));
+    let (via, wait) = (path_of(&runs), wait_of(cmd).as_secs());
+    let new = format!("new u{}-u{}", c.st.u.len() + 1, c.st.u.len() + lim);
     let line = match (runs.is_empty(), off) {
         (_, true) => format!("search \"{q}\" · $0 · ! offline → {}", fix("offline", &At::default())),
-        _ if search.gh => format!("search github \"{q}\" by stars · limit:{} → {new} · $0", search.limit),
-        (true, _) => format!("search \"{q}\" · nothing can search · $0{}", nokey_row(&search.plan)),
-        _ => format!(
-            "search \"{q}\" via {} · limit:{}{cc} · wait:{}s → {new} · up to ${max:.4}{}",
-            path_of(&runs),
-            search.limit,
-            wait_of(cmd).as_secs(),
-            nokey_row(&search.plan)
-        ),
+        _ if search.gh => format!("search github \"{q}\" by stars · limit:{lim} → {new} · $0"),
+        (true, _) => format!("search \"{q}\" · nothing can search · $0{nokey}"),
+        _ => format!("search \"{q}\" via {via} · limit:{lim}{cc} · wait:{wait}s → {new} · up to ${max:.4}{nokey}"),
     };
     let n = prefetch_n(cmd).min(search.limit);
     let pre = format!("then fetch:{n} prefetches the top {n} detached · free, plain only");
@@ -539,15 +579,18 @@ fn search_dry(cmd: &Cmd, c: &Cache) -> Result<Out, Out> {
     Ok(o)
 }
 
-/// ` · ! no_key oxy · would try … → fats setup · oxy <sign-up>` for the plan's tiers without a key (`fetch::no_key`).
+/// ` · ! no_key oxy · would try … → fats setup oxy` for the plan's tiers without a key (`fetch::no_key`)
+/// while no paid tier has one, else for the provider `provider:` names only (a failed run names the rest).
 fn nokey_row(p: &Plan) -> String {
-    fetch::no_key(p, &p.tiers(), "", false).iter().map(|r| format!(" · {r}")).collect()
+    let paid = p.keys.iter().any(|t| *t != Tier::Plain);
+    let asked = |t: &Tier| matches!(p.mode, fetch::Mode::Only(o) if o.owner() == t.owner());
+    let left: Vec<Tier> = p.ladder(&[]).into_iter().filter(|t| !paid || asked(t)).collect();
+    fetch::no_key(p, &left, "", false).iter().map(|r| format!(" · {r}")).collect()
 }
 
-/// The router plan for one URL (None = the command's web search) from the command's mods; `spent` = what earlier
-/// URLs of this command cost.
-fn plan_of(cmd: &Cmd, url: Option<&str>, spent: f64) -> Plan {
-    let mut p = Plan::of(cmd, url, spent);
+/// The router plan for one URL (None = the command's web search) from the command's mods.
+fn plan_of(cmd: &Cmd, url: Option<&str>) -> Plan {
+    let mut p = Plan::of(cmd, url);
     p.prefetch = url.is_some() && is_search(cmd);
     if settings::get().offline.value {
         p.keys.clear();
@@ -564,7 +607,8 @@ pub fn path_of(route: &[(Tier, Option<Duration>)]) -> String {
         (0, _) => t.spec().short.to_string(),
         (_, Some(d)) => format!(" ∥ {} after {}s", t.spec().short, d.as_secs_f64()),
         (_, None) if route[..i].iter().any(|r| r.0 == *t) => format!(" → {} retry", t.spec().short),
-        (_, None) => format!(" → {}{}", t.spec().short, if i == 1 && gate { " (after a captcha)" } else { "" }),
+        // a paid no-JS rung before a hedged render runs after plain's captcha only (`Plan::ladder`)
+        (_, None) => format!(" → {}{}", t.spec().short, if !t.can("js") && gate { " (after a captcha)" } else { "" }),
     };
     route.iter().enumerate().map(step).collect()
 }
@@ -574,28 +618,49 @@ pub fn plan(cmd: &Cmd, c: &Cache) -> Out {
     if cmd.has("account") {
         return stats::account_dry(c, cmd.flag("fresh"));
     }
+    if !cmd.sub.is_empty() && cmd.get("zone").is_none() {
+        return stats::change(cmd);
+    }
     if cmd.has("setup") {
         return stats::setup(cmd.get("zone"), true, wait_of(cmd));
     }
     if is_search(cmd) {
         return merged(search_dry(cmd, c));
     }
-    let mut dry = Dry { cmd, c, next: c.st.u.len(), refused: 0 };
+    let mut dry = Dry { cmd, c, next: c.st.u.len(), refused: 0, total: 0.0 };
     let mut lines = vec![format!("= dry {} · spends nothing now", cmd.canon())];
+    // a file: the run's own verdict on its path (`fenced`), refused or missing as the run would say, else its size
     for f in &cmd.files {
-        let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-        lines.push(format!("{f} {}B local → clean → outline → {} · $0", ksize(size as usize), dry.to(None)));
+        let size = match fenced(f, &crate::lang::local_path(f)) {
+            Err((code, _)) => Err(code),
+            Ok(_) if f == "-" => Ok(0),
+            Ok(real) => real.and_then(std::fs::metadata).map(|m| m.len()).map_err(|_| "no_file"),
+        };
+        dry.refused += usize::from(size.is_err());
+        lines.push(match size {
+            Ok(n) => format!("{f} {}B local → clean → outline → {} · $0", ksize(n as usize), dry.to(None)),
+            Err(code) => format!("! {code} {f} · $0"),
+        });
     }
     for (i, u) in cmd.urls.iter().enumerate() {
         // a URL named twice: one run, as `fetch_all` runs it
         let twice = cmd.urls[..i].contains(u).then(|| format!("{} (same as above) · $0", short(u, 60)));
         lines.push(twice.unwrap_or_else(|| dry.would(&short(u, 60), u, None)));
     }
+    // a batch's runs share one `cost:` pool (`fetch::pooled`): its rows' total against it
+    if cmd.urls.len() > 1 {
+        let cap = plan_of(cmd, None).cap;
+        lines.push(format!("batch up to ${:.4} · cap ${cap:.4}", dry.total.min(cap)));
+    }
     let cur = c.st.cursor.clone().unwrap_or_default();
     let ids = match (&cmd.ids[..], cur.u) {
         ([], u) if u > 0 && cmd.urls.is_empty() && cmd.files.is_empty() => vec![Id { u, ..Id::default() }],
         (ids, _) => ids.to_vec(),
     };
+    // an id this session does not hold: the run's own `?`, rc 2
+    if let Some(id) = ids.iter().find(|i| load(c, i).is_none()) {
+        return unknown(c, id);
+    }
     for id in &ids {
         lines.push(dry.id_row(id));
     }
@@ -619,6 +684,8 @@ struct Dry<'a> {
     next: usize,
     /// Rows the fence refuses: nothing would run for them.
     refused: usize,
+    /// The `up to` of every fetch row.
+    total: f64,
 }
 
 impl Dry<'_> {
@@ -630,6 +697,9 @@ impl Dry<'_> {
 
     /// What a fetch of `u` would do: a cache hit, a refusal, or the route it would take and its worst cost.
     fn would(&mut self, what: &str, u: &str, slot: Option<usize>) -> String {
+        if let Some(n) = render_of(self.c, u, self.cmd) {
+            return format!("{what} = u{n} (rendered, cache) · $0");
+        }
         if let Some((_, age)) = self.c.lookup(u).filter(|_| !self.cmd.fresh()) {
             return format!("{what} cache hit, cache {} → {} · $0", outline::fmt_age(age), self.to(slot));
         }
@@ -637,19 +707,20 @@ impl Dry<'_> {
             self.refused += 1;
             return format!("{what} ! private_address → {}", fix("private_address", &At { url: u, ..At::default() }));
         }
-        let mut p = plan_of(self.cmd, Some(u), 0.0);
+        let mut p = plan_of(self.cmd, Some(u));
         fetch::route_of(self.c, u, &mut p);
         let (tiers, cost) = fetch::route(&p);
         if settings::get().offline.value {
             return format!("{what} not cached → ! offline (FATS_OFFLINE) · $0");
         }
-        // the one lookup a plan makes (free): a host no resolver knows would end the run before any tier
-        if fetch::host_hop(u).is_some_and(|h| h.code == "no_host") {
+        // dry spends nothing, the network included: the host by its name alone, never a lookup (`lang::real_host`:
+        // no real TLD = `no_host`; a private literal or `localhost` was refused above); a lookup's verdicts
+        // (`dns_timeout`, `dns_failed`, a name with a private address) are the real run's (`provider::host_check`)
+        if !crate::lang::real_host(u) {
             self.refused += 1;
-            let at = At { url: u, ..At::default() };
             // the run stores its failure in an id all the same
-            let (host, to, id) = (host_of(u), fix("no_host", &at), self.to(slot));
-            return format!("{what} ! no_host {host} does not resolve (2 resolvers) · {id} · $0 → {to}");
+            let (host, to, id) = (host_of(u), fix("no_host", &At { id: u, url: u, ..At::default() }), self.to(slot));
+            return format!("{what} ! no_host {host} · {id} · $0 → {to}");
         }
         let nokey = nokey_row(&p);
         if tiers.is_empty() {
@@ -661,6 +732,7 @@ impl Dry<'_> {
         // a paid ask runs one provider at a time (`Plan::hedged`)
         let off = if p.hedged() { "" } else { " · hedge:off, one provider at a time" };
         let quote = if p.js { format!(" · {}", fetch::JS_QUOTE) } else { String::new() };
+        self.total += cost;
         format!("{what} fetch {} → {to} · up to ${cost:.4}{quote}{off}{mods}{nokey}", path_of(&tiers))
     }
 
@@ -674,7 +746,8 @@ impl Dry<'_> {
                 None => format!("{page}{} l{li} unknown · $0", i.sec_tail()),
             };
         }
-        // a refetch (`fresh:true`, `js:true`) of a fetched page is a new id (`fetch_again`), a search result fills its own
+        // a refetch (`fresh:true`, `js:true`) of a fetched page is a new id (`fetch_again`); a search result fills
+        // its own id
         let again = cmd.fresh().then(|| load(c, i)).flatten().map(|l| l.meta.url).filter(|u| u.starts_with("http"));
         // an id whose run has not ended reads it (`pending`, `! abandoned`), the way `dispatch_one` does
         let ran = pending(c, i.u, &[]).is_some_and(|o| o.rc == 0 || !cmd.fresh());
@@ -689,23 +762,20 @@ impl Dry<'_> {
 /// The `country:` and `device:` a fetch would send, as `dry:true` prints them (`provider::sent`).
 fn dry_mods(cmd: &Cmd, u: &str, tiers: &[(Tier, Option<Duration>)]) -> String {
     let ask = Ask { url: u.into(), country: cmd.get("country").map(String::from), ..Ask::default() };
-    let country = match (provider::sent(&ask, Tier::Bd), cmd.get("country")) {
-        (Some(cc), from) if tiers.iter().any(|t| t.0 != Tier::Plain) => {
-            format!(" · country:{cc}{}", if from.is_none() { " (from the domain)" } else { "" })
-        }
-        _ => String::new(),
-    };
+    let paid = tiers.iter().any(|t| t.0 != Tier::Plain);
+    let from = if cmd.get("country").is_none() { " (from the domain)" } else { "" };
+    let country = provider::sent(&ask, Tier::Bd).filter(|_| paid).map(|cc| format!(" · country:{cc}{from}"));
     let device = match cmd.get("device") {
-        Some("mobile") => " · device:mobile (oxy only; bd serves desktop)",
+        Some("mobile") => " · device:mobile (oxy, decodo; bd serves desktop)",
         _ => "",
     };
-    country + device
+    country.unwrap_or_default() + device
 }
 
-/// `fats j<N>`: a search's list, its failure (its `!` row and tried path, as when it ran) or `pending`; a read
-/// naming `wait:` waits for a search still running, as for a page (`wait_for`), then reads the ids its run stored.
+/// `fats j<N>`: a search's list, its failure (its `!` row and tried path, as when it ran) or `pending`; a search
+/// still running is waited for within `wait:`, as a page (`wait_for`), then the read lists the ids its run stored.
 fn job_read(cmd: &Cmd, c: &mut Cache, j: usize) -> Out {
-    poll_until(c.born, wait_of(cmd), || cmd.get("wait").is_none() || search_pending(c, j).is_none());
+    poll_until(c.born, wait_of(cmd), || search_pending(c, j).is_none());
     c.reload();
     let failed = c.serp(j).filter(|m| !m.ok).zip(c.job(j)).map(|(m, x)| search_out(c, &parse(&[x.cmd]), j, &m));
     let mut o = failed.map(merged).or_else(|| search_pending(c, j)).unwrap_or_else(|| job_view(c, j));
@@ -769,29 +839,29 @@ fn dispatch(cmd: &Cmd, c: &mut Cache) -> Out {
     }
     let Some(id) = ids.first().cloned() else { return nothing_to_do(cmd, cur.u) };
     // one page per command in v1: name the others instead of dropping them (the cross-page filter comes later)
-    let rest: Vec<String> = ids[1..]
-        .iter()
-        .map(|i| {
-            let (p, q) = (i.page(), cmd.words.join(" "));
-            let what = if q.is_empty() { "read" } else { "filter" };
-            format!("{p} ! not_in_v1 multi-page {what} → {}", format!("{b} {p} {q}").trim_end())
-        })
-        .collect();
+    let q = cmd.words.join(" ");
+    let what = if q.is_empty() { "read" } else { "filter" };
+    let row = |p: String| format!("{p} ! not_in_v1 multi-page {what} → {}", format!("{b} {p} {q}").trim_end());
+    let rest: Vec<String> = ids[1..].iter().map(|i| row(i.page())).collect();
     let mut out = dispatch_one(cmd, c, &cur, id, false);
     out.warn(rest);
     out
 }
 
-/// The commands that read no page: status (also `fats` alone), version, stats, config, account, setup, guide;
+/// The commands that read no page: status (also `fats` alone), version, stats, config, account, setup, telemetry,
+/// help (the card), guide (`lang::GUIDE`);
 /// `routes` (gone) a `?`, `install` a `!` with the install page.
 fn command(cmd: &Cmd, c: &mut Cache) -> Option<Out> {
     let b = bin();
     Some(match () {
         _ if cmd.idle || cmd.has("status") => stats::status(c),
         _ if cmd.has("version") => {
-            Out::new(vec![format!("= {b} {} · status: {b} · guide: {b} guide", env!("CARGO_PKG_VERSION"))])
+            Out::new(vec![format!("= {b} {} · status: {b} · {}", env!("CARGO_PKG_VERSION"), to_guide())])
         }
-        _ if cmd.has("stats") => stats::stats(c),
+        _ if cmd.has("stats") => stats::stats(c, cmd, json_of(cmd)),
+        _ if cmd.has("telemetry") => crate::telemetry::show(),
+        _ if cmd.has("setup") && cmd.sub == ["telemetry"] => Out::new(crate::telemetry::row()),
+        _ if !cmd.sub.is_empty() && cmd.get("zone").is_none() => stats::change(cmd),
         _ if cmd.has("config") => stats::config(),
         _ if cmd.has("account") => stats::account(c, cmd.flag("fresh"), wait_of(cmd)),
         _ if cmd.has("setup") => stats::setup(cmd.get("zone"), settings::get().offline.value, wait_of(cmd)),
@@ -799,7 +869,8 @@ fn command(cmd: &Cmd, c: &mut Cache) -> Option<Out> {
         _ if cmd.has("routes") => {
             Out::ask(format!("? routes: gone (no learned starts) · a page's route: {b} <url> dry:true · {b} config"))
         }
-        _ if cmd.has("guide") => Out::new(CARD.lines().map(String::from).collect()),
+        _ if cmd.has("help") => Out::new(CARD.lines().map(String::from).chain([to_guide()]).collect()),
+        _ if cmd.has("guide") => Out::new(GUIDE.lines().map(String::from).collect()),
         _ => return None,
     })
 }
@@ -807,12 +878,15 @@ fn command(cmd: &Cmd, c: &mut Cache) -> Option<Out> {
 /// One page id + mods. `new` = this command just stored the page (no `· cache` age on it).
 fn dispatch_one(cmd: &Cmd, c: &mut Cache, cur: &Cursor, id: Id, new: bool) -> Out {
     let mine = id.job.is_none_or(|j| c.job(j).is_some_and(|x| x.session == c.session));
-    let refetch = cmd.fresh() && cmd.links.is_empty() && cmd.media.is_empty() && !new;
-    // a fetch still running answers at once, or as it ends within a `wait:` the read names (`pending`'s arrow:
-    // `poll_wait`: one turn per 30 s, not per 5); `fresh:true` starts only an abandoned one again
-    if mine && cmd.get("wait").is_some() && wait_for(c, id.u, wait_of(cmd)).is_some() {
+    // a fetch still running is waited for like a fetch: its page the moment it ends within `wait:` (default
+    // `WAIT`), else `pending` (`wait:0` = at once); a run that ended while waited for is this read's fresh copy,
+    // `fresh:true` starts only an abandoned one again
+    let live = mine && c.run(id.u).is_some_and(|(r, alive)| alive && r.done.is_none());
+    let ended = live && wait_for(c, id.u, wait_of(cmd)).is_some();
+    if ended {
         c.reload();
     }
+    let refetch = cmd.fresh() && cmd.links.is_empty() && cmd.media.is_empty() && !new && !ended;
     if let Some(o) = pending(c, id.u, &cmd.words).filter(|o| mine && (o.rc == 0 || !refetch)) {
         return o;
     }
@@ -829,10 +903,7 @@ fn dispatch_one(cmd: &Cmd, c: &mut Cache, cur: &Cursor, id: Id, new: bool) -> Ou
     if let Some(&li) = cmd.links.first() {
         return open_link(cmd, c, &id, li);
     }
-    if let Some(&k) = cmd.media.first() {
-        return asset(c, &id, k, cmd.fresh());
-    }
-    read(cmd, c, cur, &id, new)
+    if let Some(&k) = cmd.media.first() { asset(c, &id, k, cmd.fresh()) } else { read(cmd, c, cur, &id, new) }
 }
 
 /// Pictures fetched on demand (`asset`): plain only, never a paid tier; an `image/*` answer of at most
@@ -887,7 +958,7 @@ fn download(rec: &Path, src: &str) -> Result<Asset, (String, String)> {
     if settings::get().offline.value {
         return Err(err("offline", "FATS_OFFLINE is on".into()));
     }
-    let t0 = Instant::now();
+    let (_turn, t0) = (provider::pace(src), Instant::now());
     let ask = Ask { url: src.into(), timeout: Some(ASSET_WAIT), max_bytes: ASSET_MAX, html: true, ..Ask::default() };
     let got = provider::block(provider::get(Tier::Plain, &ask, "")).map_or(Err("net_error".into()), |g| g.0);
     let raw = got.map_err(|f| match f.code {
@@ -1030,24 +1101,9 @@ fn job_view(c: &Cache, j: usize) -> Out {
     if job.cmd.is_empty() {
         return refused("expired", "", &format!("j{j} · its command and pages went after an hour"), &At::default());
     }
-    let mut rows = Vec::new();
-    for (idx, entry) in st.u.iter().enumerate().filter(|(_, e)| e.job == Some(j)) {
-        let u = idx + 1;
-        if entry.dir.is_empty() {
-            // a search result whose URL is in the cache opens from it (as the list and `stats` say); THE liveness
-            // rule (`Cache::run`, the lock), as `stats` reads it
-            let cached = if c.lookup(&entry.url).is_some() { "cached $0" } else { "not fetched" };
-            let run = if c.run(u).is_some_and(|r| !r.1 && r.0.done.is_none()) { "! abandoned" } else { "pending" };
-            let what = if entry.serp { format!("search result, {cached}") } else { run.into() };
-            rows.push(format!("j{j}.u{u} {what} {} → {b} j{j}.u{u}", short(&entry.url, 60)));
-            continue;
-        }
-        let (meta, doc) = c.page(entry);
-        let size = |doc: Doc| format!("{} · {}~tok", short(&doc.title, 50), ksize(doc.tokens.clean));
-        let what = doc.map_or_else(|_| format!("{} · no doc", meta.kind), size);
-        let prov = if entry.alias { "cache" } else { meta.provider.as_str() };
-        rows.push(format!("j{j}.u{u} {prov} {}ms ${:.4} {} | {what}", meta.ms, meta.cost, short(&entry.url, 60)));
-    }
+    // the page's `stats` row (`stats::page_row`: a result's cached / not fetched, THE liveness rule), in this job
+    let mine = st.u.iter().enumerate().filter(|(_, e)| e.job == Some(j));
+    let rows: Vec<_> = mine.map(|(i, e)| stats::page_row(c, i + 1, e, &format!("j{j}.")).lean).collect();
     let age = outline::fmt_age((now() - job.t).max(0.0));
     // a search's rows are results, fetched or not (`9 pages` for 9 unfetched results)
     let what = if st.u.iter().any(|e| e.job == Some(j) && e.serp) { "results" } else { "pages" };
@@ -1096,45 +1152,48 @@ fn load(c: &Cache, id: &Id) -> Option<Loaded> {
     let (st, other) = ids_of(c, id.job)?;
     let e = st.u.get(id.u.checked_sub(1)?)?.clone();
     let (meta, doc) = c.page(&e);
-    let (pid, eq) = match (other, e.job) {
-        (true, _) => (id.page(), id.page()),
-        (false, Some(j)) => (format!("u{}", id.u), format!("j{j}.u{}", id.u)),
-        (false, None) => (format!("u{}", id.u), format!("u{}", id.u)),
-    };
+    let pid = if other { id.page() } else { format!("u{}", id.u) };
+    let eq = if other { pid.clone() } else { e.eq(id.u) };
     Some(Loaded { pid, eq, meta, doc, dir: c.dir(&e).unwrap_or_default(), other })
 }
 
-/// The other stored copies of page `n`'s URL in this session: the newest id a paid ask (`js:true`, `provider:`:
-/// its meta says `hedge:off`) served with other text than `doc`'s (`u2 (rendered)`), else, when `doc` shows none of
-/// the page's own words, a copy's part that does (`u1#3fy (page content)`), else, when it holds no record of
-/// its own either, a copy's unread page record (`u1#2fv (page record) · 995 tok · $0`, never the error page
-/// as "the best copy" beside it); and whether one of two copies with the same served text was a paid ask (the paid
-/// hint bought that copy back already); and the first newer copy asked another way (country, provider: a geo
-/// fix that ran), whether the run that fetched this one named `country:`.
+/// The other stored copies of page `n`'s URL in this session: the newest id a render (`rendered`, the auto ladder's
+/// too) or a paid ask (`js:true`, `provider:`: its meta says `hedge:off`) served with other text than `doc`'s
+/// (`u2 · rendered`), else, when `doc` shows none of the page's own words, a copy's part that does
+/// (`u1#3fy · page content`), else, when it holds no record of its own either, a copy's unread page record
+/// (`u1#2fv · page record · 995 tok · $0`, never the error page as "the best copy" beside it); for a copy the cap
+/// stopped (`fetch::budget_row`) the newest later copy that served, first (`u4`: its fix ran, the move at $0, never the
+/// same `cost:` arrow again); and whether one of two copies with the same served text was a paid ask (the paid hint
+/// bought that copy back already); and the first newer copy asked another way (country, provider: a geo fix that ran),
+/// whether the run that fetched this one named `country:`.
 type Copies = (Option<String>, bool, (Option<String>, bool));
-fn copies(c: &Cache, n: usize, (meta, doc): (&Meta, &Doc), log: &[String]) -> Copies {
+pub(crate) fn copies(c: &Cache, n: usize, (meta, doc): (&Meta, &Doc), log: &[String]) -> Copies {
     let text = |d: &Doc| d.sections[..d.served()].iter().flat_map(|s| s.lines.clone()).collect::<Vec<_>>();
-    // a paid ask, or the longer time (the 150 s call that answered is the page)
-    let (me, fix) = (&c.st.u[n - 1], settings::limit::<u64>("render_fix_s"));
-    let paid = |m: &Meta| m.hedge == "off" || m.hops.iter().any(|h| h.timeout_s >= fix);
+    // a paid ask (`js:true`, `provider:`: one provider at a time)
+    let me = &c.st.u[n - 1];
+    let paid = |m: &Meta| m.hedge == "off";
     let owner = |m: &Meta| Tier::parse(&m.provider).map(Tier::owner);
     let runs = c.st.u.iter().enumerate().filter(|(_, e)| e.dir == me.dir).filter_map(|(i, _)| c.run(i + 1));
     let asked = runs.into_iter().any(|(r, _)| parse(std::slice::from_ref(&r.cmd)).get("country").is_some());
     let mut found = (None, false, (None, asked));
     // A copy with neither the page's own words nor a record of its own (a 536 B error page)
     let bare = outline::shown(doc, meta).is_none() && outline::record_in(doc, meta, &[]).is_none();
+    // a starved copy (its row reads the pool file): once, not once a copy
+    let starved = fetch::budget_row(meta, "", &[]).is_some();
     for (i, o) in c.st.u.iter().enumerate().filter(|(_, o)| o.url == me.url && !o.dir.is_empty() && o.dir != me.dir) {
         let (m, Ok(d)) = c.page(o) else { continue };
         let other = m.ok && (m.country != meta.country || owner(&m) != owner(meta));
         found.2.0 = found.2.0.or((i >= n && other).then(|| format!("u{}", i + 1)));
         let same = text(&d) == text(doc);
         found.1 |= same && (paid(&m) || paid(meta));
-        // a paid render with other text, else (this copy without the page's own words) a copy's part holding them
+        // a render or a paid ask with other text, else (this copy without the page's own words) a copy's part
+        // holding them
         let held = outline::shown(&d, &m).filter(|_| outline::shown(doc, meta).is_none());
         let rec = || outline::record_in(&d, &m, log).filter(|_| bare).map(|r| format!("u{}{r}", i + 1));
         found.0 = match held {
-            _ if !same && m.ok && paid(&m) => Some(format!("u{} (rendered)", i + 1)),
-            Some(tail) => Some(format!("u{}{tail} (page content)", i + 1)),
+            _ if i >= n && m.ok && starved => Some(format!("u{}", i + 1)),
+            _ if !same && (rendered(&m) || m.ok && paid(&m)) => Some(format!("u{} · rendered", i + 1)),
+            Some(tail) => Some(format!("u{}{tail} · page content", i + 1)),
             None => found.0.or_else(rec),
         };
     }
@@ -1229,10 +1288,8 @@ fn record(o: &mut Out, p: &Page, path: &str, new: bool) {
         .set("age", (now() - m.t).max(0.0) as u64)
         .set("path", path.to_string())
         .set("mode", p.doc.mode.clone());
-    if let Some(l) = o.lines.first()
-        && let Some(i) = l.find("match:")
-    {
-        o.set("match", l[i + 6..].to_string());
+    if let Some((_, m)) = o.lines.first().and_then(|l| l.split_once("match:")) {
+        o.set("match", m.to_string());
     }
 }
 
@@ -1247,7 +1304,7 @@ fn text_of_zip(path: &str) -> String {
 pub(crate) fn no_doc(id: &str, eq: &str, m: &Meta, others: &[Meta], why: &NoDoc, served: Option<String>) -> Out {
     let url = short(&m.url, 60);
     let mut at = At { id, url: &m.url, ..At::default() };
-    let (mut owners, mut next) = (Vec::new(), None);
+    let (mut owners, mut next, newer) = (Vec::new(), None, served.is_some());
     let zip = if let NoDoc::Zip(path) = why { text_of_zip(&path.to_string_lossy()) } else { String::new() };
     let (code, what, detail) = match why {
         NoDoc::Zip(_) => {
@@ -1271,6 +1328,10 @@ pub(crate) fn no_doc(id: &str, eq: &str, m: &Meta, others: &[Meta], why: &NoDoc,
     // a failed fetch's move (`fail_row`: none = a COUNT), else the table's fix
     let next = next.unwrap_or_else(|| fix(code, &at));
     let row = Flag { code: code.into(), what: detail, next, row: true }.bang(id) + &provider::pages(code, owners);
+    // a copy the cap stopped: its `budget_hit` row (`fetch::skipped`) is its row, the arrow its own, unless a newer
+    // copy served (the row points there)
+    let budget = fetch::budget_row(m, id, others).filter(|_| !newer);
+    let row = budget.map_or(row, |r| format!("{id} {r}"));
     let mut o = Out::fail(code, format!("= {eq} ! {code} {what}"), row);
     if let NoDoc::Zip(path) = why {
         o.set("kind", "zip").set("path", path.to_string_lossy().into_owned());
@@ -1280,11 +1341,11 @@ pub(crate) fn no_doc(id: &str, eq: &str, m: &Meta, others: &[Meta], why: &NoDoc,
 
 /// Local files, then URLs (cache or network); every URL's id is reserved in input order (`dry:true` names the same
 /// ones), then every run is placed before any is waited for (`launch`: at most `batch_parallel` processes), all
-/// under the one `wait:`; they share the `cost:` cap. A URL named twice is one run, its second row `(same as
-/// above)`. Several inputs = one job: a `=` summary line, then each input's block; `json` = one record per input,
-/// carrying `i`. Exit 0 when any input succeeded (the failures are `!` rows), else the worst code.
+/// under the one `wait:`; they share the `cost:` cap (`fetch::pooled`). A URL named twice is one run, its second row
+/// `(same as above)`. Several inputs = one job: a `=` summary line, then each input's block; `json` = one record per
+/// input, carrying `i`. Exit 0 when any input succeeded (the failures are `!` rows), else the worst code.
 fn fetch_all(cmd: &Cmd, c: &mut Cache) -> Out {
-    let (t0, mut spent) = (Instant::now(), 0.0);
+    let t0 = Instant::now();
     let want = |url| Want { url, ..Want::default() };
     let mut started: Vec<_> = cmd.files.iter().map(|f| Some(local(c, f, cmd).map(Err))).collect();
     let mut queued = Vec::new();
@@ -1296,8 +1357,7 @@ fn fetch_all(cmd: &Cmd, c: &mut Cache) -> Out {
         let now = at_once(c, want(u), cmd).map(Err);
         let id = now.unwrap_or_else(|| reserve(c, Entry::default(), want(u), cmd).map(Ok).map_err(cache_write));
         if let Ok(Ok(n)) = id {
-            queued.push((n, want(u), spent));
-            spent += fetch::route(&plan_of(cmd, Some(u), spent)).1;
+            queued.push((n, want(u)));
         }
         started.push(Some(id));
     }
@@ -1363,7 +1423,7 @@ struct Want<'a> {
 fn fetch(c: &mut Cache, want: Want, cmd: &Cmd) -> Result<Out, Out> {
     let new = |c: &mut Cache| {
         let n = reserve(c, Entry::default(), want, cmd).map_err(cache_write)?;
-        launch(c, &[(n, want, 0.0)], cmd).map_err(cache_write).and_then(|()| finish(c, n, want, cmd))
+        launch(c, &[(n, want)], cmd).map_err(cache_write).and_then(|()| finish(c, n, want, cmd))
     };
     at_once(c, want, cmd).map_or_else(|| new(c), Ok)
 }
@@ -1414,30 +1474,35 @@ pub fn wait_of(cmd: &Cmd) -> Duration {
 pub const POLL: Duration = Duration::from_millis(20);
 
 /// THE placement, a batch's and a search's prefetch alike: the reserved runs, in input order, dealt round-robin onto
-/// at most `batch_parallel` lanes (50 URLs ran 50 processes at once, 608 MB), ONE process a lane, `fats --continue
-/// j<J>.u<N>` on its first run (`detach`), which runs the others queued behind it after (`Detached::by`,
-/// `resume`). No host rule: renders leave through the providers' own exits, and one run a host made 3 walled
-/// pages of one site take 107 s, not 50.
-/// A run = its reserved id, what it asks, what the command's earlier URLs may cost.
-fn launch(c: &Cache, runs: &[(usize, Want, f64)], cmd: &Cmd) -> Result<(), String> {
-    let cap = settings::limit::<usize>("batch_parallel").max(1);
+/// at most `batch_parallel` lanes, a RAM guard (50 URLs ran 50 processes at once, 608 MB; 8 lanes peak at ~230 MB),
+/// ONE process a lane, `fats --continue j<J>.u<N>` on its first run (`detach`), which runs the others queued behind
+/// it after (`Detached::by`, `resume`). No host rule: renders leave through the providers' own exits, and one lane a
+/// host made 3 walled pages of one site take 107 s, not 50.
+/// A run = its reserved id, what it asks; two or more share one `cost:` pool, its first run's file.
+fn launch(c: &Cache, runs: &[(usize, Want)], cmd: &Cmd) -> Result<(), String> {
+    let (cap, pool) =
+        (settings::limit::<usize>("batch_parallel").max(1), runs.get(1).map(|_| c.run_file(runs[0].0, "pool.json")));
+    if let Some(at) = &pool {
+        fetch::seed(at, runs.iter().map(|(n, w)| (*n, plan_of(cmd, Some(w.url)))), plan_of(cmd, None).cap)?;
+    }
     for (head, &(n, ..)) in runs.iter().enumerate().take(cap) {
         let job = c.st.u.get(n - 1).and_then(|e| e.job).unwrap_or_default();
         // the lane's lock before its run files: no reader sees one without it (`Cache::run`)
         let lock = c.run_claim(n).ok_or_else(|| format!("{}: not locked", c.run_file(n, "lock").display()))?;
-        for (k, &(id, w, spent)) in runs.iter().skip(head).step_by(cap).enumerate() {
+        for (k, &(id, w)) in runs.iter().skip(head).step_by(cap).enumerate() {
             let (by, status) = if k == 0 { (0, String::new()) } else { (n, format!("queued after u{n}")) };
-            let (url, line, prov) = (w.url.into(), cmd.raw.clone(), w.prov.map(String::from));
-            c.run_put(id, &Detached { url, cmd: line, prov, job, spent, by, status, t: now(), ..<_>::default() })?;
+            let (url, line, prov, pool) = (w.url.into(), cmd.raw.clone(), w.prov.map(String::from), pool.clone());
+            c.run_put(id, &Detached { url, cmd: line, prov, job, pool, by, status, t: now(), ..<_>::default() })?;
         }
         detach(format!("j{job}.u{n}"), &c.run_file(n, "log"), Some(lock))?;
     }
     Ok(())
 }
 
-/// `fats --continue <id>` in its own process (own process group, stdio to `log`, `lock` its stdin: held while it
-/// lives); in-process on a thread holding `lock` when a test's stand-in transport answers.
-fn detach(id: String, log: &std::path::Path, lock: Option<std::fs::File>) -> Result<(), String> {
+/// `fats --continue <id>` in its own process (own process group, stdio to `log`, `lock` held while it lives: its stdin
+/// on Unix, kept here and taken again by the run on Windows); in-process on a thread holding `lock` when a test's fake
+/// transport answers.
+pub(crate) fn detach(id: String, log: &std::path::Path, lock: Option<std::fs::File>) -> Result<(), String> {
     // and its folder: a search may be the session's first command (a fetch's `run_put` made it)
     let made = log.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::File::create(log));
     let log = made.map_err(|e| e.to_string())?;
@@ -1446,14 +1511,36 @@ fn detach(id: String, log: &std::path::Path, lock: Option<std::fs::File>) -> Res
         return Ok(());
     }
     let mut p = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
-    p.args(["--continue", &id]).stdin(lock.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
+    // Unix: the lock goes as the run's stdin (a flock is the open file's, the child's too). Windows: a lock is the
+    // process's that took it, never a child's that inherits the handle (LockFileEx, learn.microsoft.com), and goes
+    // when it closes the handle: this process keeps it until the run or this process ends, the run takes its own
+    // (`hold_lane`), granted when this one lets go
+    let (stdin, keep) = if cfg!(windows) { (None, lock) } else { (lock, None) };
+    p.args(["--continue", &id]).stdin(stdin.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
     p.stdout(log.try_clone().map_err(|e| e.to_string())?).stderr(log);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut p, 0);
+    #[cfg(windows)] // CREATE_NO_WINDOW: no console window flashes up for the detached run (learn.microsoft.com)
+    std::os::windows::process::CommandExt::creation_flags(&mut p, 0x0800_0000);
     let mut child = p.spawn().map_err(|e| format!("fats --continue {id}: {e}"))?;
     // reaped when it ends while this process still runs (`fats mcp`); else the system reaps the orphan
-    std::thread::spawn(move || child.wait().ok());
+    std::thread::spawn(move || (child.wait().ok(), keep));
     Ok(())
+}
+
+/// Windows: a detached run takes its lane's lock (`detach`) on a thread that waits while the launcher holds it,
+/// then keeps it while this process lives (the lock is a run's sign of life, `cache::run_at`).
+fn hold_lane(c: &Cache, n: usize) {
+    if let Ok(f) = std::fs::File::open(c.run_file(n, "lock")) {
+        std::thread::spawn(move || {
+            // held until the process exits (`main` exits with this thread parked); a spurious wake parks again
+            if f.lock().is_ok() {
+                loop {
+                    std::thread::park();
+                }
+            }
+        });
+    }
 }
 
 /// Run `n` as it ended, waiting while it lives (its lock held: a run that has not started yet answers `starting`)
@@ -1471,10 +1558,10 @@ fn poll_until(born: Instant, wait: Duration, done: impl Fn() -> bool) {
     }
 }
 
-/// A pending run's next move, `fats u3 wait:30 (free, usually ready in ~11s)`: the median time of this session's
+/// A pending run's next move, `fats u3 wait:30 · free, usually ready in ≈11s`: the median time of this session's
 /// calls on its route (its host, the tiers it waits for: `bd running`) from the newest one's start, never past the
 /// running calls' own deadline (`Plan::timeout_of` as they started: `timeout:1s`), less the time now, rounded
-/// once; from < 3 such calls or past it no number, `(free; check again in 30 s)`: a wrong number is worse than none
+/// once; from < 3 such calls or past it no number, `· free, check again in 30 s`: a wrong number is worse than none
 /// (one constant promised 42 s for a 0.6 s plain prefetch; any host's bd calls promised 28 s, it took 60.5 s).
 fn ready(c: &Cache, n: usize, run: &Detached, words: &[String]) -> String {
     let words = words.iter().map(|w| format!(" {w}")).collect::<String>();
@@ -1488,16 +1575,16 @@ fn ready(c: &Cache, n: usize, run: &Detached, words: &[String]) -> String {
     poll_next(&format!("u{n}{words}"), left)
 }
 
-/// THE pending move, a page's and a search's alike: `fats u3 wait:30 (free, usually ready in ~11s)`, or
-/// `(free; check again in 30 s)` with no time to promise (`left` 0).
+/// THE pending move, a page's and a search's alike: `fats u3 wait:30 · free, usually ready in ≈11s`, or
+/// `· free, check again in 30 s` with no time to promise (`left` 0).
 fn poll_next(id: &str, left: u64) -> String {
     let poll = settings::limit::<u64>("poll_wait");
-    let eta = if left == 0 { format!("; check again in {poll} s") } else { format!(", usually ready in ~{left}s") };
-    format!("{} {id} wait:{poll} (free{eta})", bin())
+    let eta = if left == 0 { format!("check again in {poll} s") } else { format!("usually ready in ≈{left}s") };
+    format!("{} {id} wait:{poll} · free, {eta}", bin())
 }
 
 /// An id whose detached run has not ended, as the answer: `= j5.u3 pending 31s ex.com · bd running → fats u3 <words>
-/// wait:30 (free, usually ready in ~11s)`, or, when its process died, its failed copy (`Detached::cut`, `! abandoned`,
+/// wait:30 · free, usually ready in ≈11s`, or, when its process died, its failed copy (`Detached::cut`, `! abandoned`,
 /// the read the sweep's stored copy gives). None = no such run, or it ended (the page is stored).
 fn pending(c: &Cache, n: usize, words: &[String]) -> Option<Out> {
     let (run, alive) = c.run(n).filter(|x| x.0.done.is_none())?;
@@ -1523,6 +1610,12 @@ fn running(c: &Cache, url: &str, words: &[String]) -> Option<Out> {
 /// `fats --continue j5.u3`: the detached half of a fetch. Runs the router for the run `fetch` reserved and stores
 /// the page in that id, whether or not the call that started it still waits. Exit code for `main`.
 pub fn resume(id: &str) -> i32 {
+    if let Some(p) = id.strip_prefix("setup-") {
+        return crate::setup::serve(p);
+    }
+    if id == "telemetry" {
+        return crate::telemetry::send();
+    }
     let (mut c, cmd) = (Cache::open(), parse(&[id.to_string()]));
     // a detached search (`searching`): its own command, past every lead's `search_s` (`wait:0`): no `wait:`, so
     // `search_of` plans the one call at the retry's time (`one_call`), never cut
@@ -1533,6 +1626,9 @@ pub fn resume(id: &str) -> i32 {
         return rc.max(i32::from(c.save().is_err()));
     }
     let Some(n) = cmd.ids.first().map(|i| i.u) else { return 2 };
+    if cfg!(windows) && !provider::in_process() {
+        hold_lane(&c, n);
+    }
     // its lane: this run, then the ones queued behind it (`launch`), one after another; the worst exit code
     c.runs().into_iter().filter(|r| r.0 == n || r.1.by == n).map(|r| run_one(&mut c, r.0)).max().unwrap_or(1)
 }
@@ -1557,7 +1653,8 @@ fn run_one(c: &mut Cache, n: usize) -> i32 {
 /// The router for run `n`, its page stored in `u<n>`: how it ended.
 fn routed(c: &mut Cache, run: &Detached, n: usize, seen: fetch::Seen) -> Done {
     let (cmd, url) = (parse(std::slice::from_ref(&run.cmd)), run.url.as_str());
-    let mut p = plan_of(&cmd, Some(url), run.spent);
+    settings::mods(&cmd.mods);
+    let mut p = Plan { pool: run.pool.clone().map(|f| (f, n)), ..plan_of(&cmd, Some(url)) };
     fetch::route_of(c, url, &mut p);
     p.prior = c.lookup(url).and_then(|(dir, _)| c.dir(&Entry { dir, ..Entry::default() }));
     let t0 = Instant::now();
@@ -1572,10 +1669,18 @@ fn routed(c: &mut Cache, run: &Detached, n: usize, seen: fetch::Seen) -> Done {
     let mut got = fetch::outcome(url, &mut hops, t0.elapsed().as_millis() as u64);
     let served = Tier::parse(&got.meta.provider);
     got.meta.country = served.and_then(|t| provider::sent(&ask, t)).unwrap_or_default();
-    // a paid ask ran one provider at a time: `stats` and the `=` line say `hedge:off` (`Meta::hedge_off`)
+    // a paid ask ran one provider at a time: `stats` and the `=` line say `hedge:off` (`Meta::how`)
     got.meta.hedge = if p.hedged() { "" } else { "off" }.into();
-    let (ok, code, cost, id) = (got.meta.ok, got.meta.code.clone(), got.meta.cost, format!("u{n}"));
-    got.meta.extra.insert("skipped".into(), fetch::skipped(&p, &hops, "", &id, url).into());
+    let (ok, cost, id) = (got.meta.ok, got.meta.cost, format!("u{n}"));
+    let skipped = fetch::skipped(&p, &hops, "", &id, url);
+    // a page the cap left without a paid try failed on the budget, not the site (`budget_hit` on its `=` line and in
+    // `stats`); one that bought a rung failed on what the rung met
+    let starved = !hops.iter().any(|h| h.tier.spec().price > 0.0) && skipped.iter().any(|r| r.contains("budget_hit"));
+    got.meta.code = if starved { "budget_hit".into() } else { got.meta.code };
+    let code = got.meta.code.clone();
+    got.meta.extra.insert("skipped".into(), skipped.into());
+    // who spent a batch's pool is read at each print (`fetch::budget_row`)
+    got.meta.extra.extend(p.pool.as_ref().map(|(at, _)| ("pool".into(), at.to_string_lossy().into())));
     let file = got.file.as_ref().map(|(name, body)| (name.as_str(), body.as_slice()));
     let (index, error, doc) = (ok.then_some(url), got.error.as_deref(), got.doc.as_ref());
     let snap = Snap { file, error, doc, meta: got.meta, index, slot: Some(n) };
@@ -1587,23 +1692,44 @@ fn routed(c: &mut Cache, run: &Detached, n: usize, seen: fetch::Seen) -> Done {
 /// The snapshot indexed under `key` (unless `fresh:true`) as a new id of `url` that points at it: no second
 /// copy, no cost. None = not cached.
 fn cached(c: &mut Cache, key: &str, want: Want, cmd: &Cmd) -> Option<Out> {
+    if let Some(n) = render_of(c, key, cmd) {
+        return Some(outlined(c, n, false, None));
+    }
     let (dir, _) = c.lookup(key).filter(|_| !cmd.fresh())?;
     let n = reserve(c, Entry { dir, alias: true, ..Entry::default() }, want, cmd);
     Some(n.map_or_else(cache_write, |n| outlined(c, n, false, want.prov)))
+}
+
+/// THE stored-render rule: `js:true` without `fresh:true` on a URL whose session holds a served render (any id,
+/// any provider: `rendered`) = that copy, the newest, $0; `dry:true` says so (`Dry::would`). A second render
+/// of it came back with the same page (4.4k vs 4.2k tok, 16 photos each) for $0.0015 more.
+fn render_of(c: &Cache, url: &str, cmd: &Cmd) -> Option<usize> {
+    let has = |e: &Entry| e.url == url && !e.dir.is_empty() && c.meta(&e.dir).is_some_and(|m| rendered(&m));
+    (cmd.flag("js") && !cmd.flag("fresh")).then(|| c.st.u.iter().rposition(has)).flatten().map(|i| i + 1)
+}
+
+/// A copy a render served: a tier that renders (`Tier::can("js")`: bd, oxyjs, decodojs), ok, never a shell's og
+/// card (`fetch::og_card`).
+fn rendered(m: &Meta) -> bool {
+    m.ok && m.kind != "og" && Tier::parse(&m.provider).is_some_and(|t| t.can("js"))
+}
+
+/// A canonical path as a user writes it: Windows' canonical form is verbatim (`\\?\C:\x`, `\\?\UNC\host\share`),
+/// a prefix no one types; a path without one is unchanged.
+fn shown(p: &Path) -> String {
+    let p = p.to_string_lossy();
+    p.strip_prefix(r"\\?\UNC\").map_or_else(|| p.strip_prefix(r"\\?\").unwrap_or(&p).into(), |s| format!(r"\\{s}"))
 }
 
 /// A local file (or stdin, `-`) → a new id: the stored snapshot when the same bytes came from the same place
 /// before, else converted and stored.
 fn local(c: &mut Cache, f: &str, cmd: &Cmd) -> Result<Out, Out> {
     let t0 = Instant::now();
-    let path = if let Some(r) = f.strip_prefix("~/") { dirs::home_dir().unwrap_or_default().join(r) } else { f.into() };
-    let bytes = read_local(f, &path, cap_of(cmd))?;
-    let url = if f == "-" {
-        "stdin:".to_string()
-    } else {
-        let abs = std::fs::canonicalize(&path).unwrap_or(path);
-        format!("file://{}", abs.to_string_lossy())
-    };
+    let path = crate::lang::local_path(f);
+    let real = fenced(f, &path).map_err(|(code, why)| refused(code, f, &format!("{f} · {why}"), &At::default()))?;
+    let bytes = read_local(f, real, &path, cap_of(cmd))?;
+    let file = || format!("file://{}", shown(&std::fs::canonicalize(&path).unwrap_or(path)));
+    let url = if f == "-" { "stdin:".to_string() } else { file() };
     // the same bytes from the same place again: the stored snapshot (read without a second parse)
     let key = blake3::Hasher::new().update(url.as_bytes()).update(&[0]).update(&bytes).finalize();
     let key = format!("blake3:{}", key.to_hex());
@@ -1614,11 +1740,9 @@ fn local(c: &mut Cache, f: &str, cmd: &Cmd) -> Result<Out, Out> {
     let kind = crate::clean::kind_of("", &bytes);
     if kind == "zip" {
         let next = text_of_zip(f);
-        let mut o =
-            Out::new(vec![format!("= ! not_in_v1 zip text: {f} · not in this build (pages, files, cache) → {next}")]);
-        o.rc = 1;
-        o.set("error", "not_in_v1").set("hint", next).set("what", "zip");
-        return Ok(o);
+        let eq = format!("= ! not_in_v1 zip text: {f} · not in this build (pages, files, cache) → {next}");
+        let o = Out::new(vec![eq]).with("error", "not_in_v1").with("hint", next).with("what", "zip");
+        return Ok(Out { rc: 1, ..o });
     }
     // provider `local`, one free hop, never a render
     let meta = Meta {
@@ -1649,15 +1773,13 @@ fn outlined(c: &mut Cache, n: usize, new: bool, prov: Option<&str>) -> Out {
     page_cmd(c, &Id { u: n, ..Id::default() }, new, |p| Ok(outline::outline(p, prov))).unwrap_or_default()
 }
 
-/// A local file's (or stdin's) bytes, up to `cap`. Err = the answer: fenced, unreadable, or over the cap.
-fn read_local(f: &str, path: &Path, cap: u64) -> Result<Vec<u8>, Out> {
-    if let Some(why) = fenced(f, path) {
-        return Err(refused("not_allowed", f, &format!("{f} · {why}"), &At::default()));
-    }
+/// A local file's (or stdin's) bytes, up to `cap`, opened at `real` (the fence's canonical path, `fenced`), never
+/// at `path` again. Err = the answer: unreadable, or over the cap.
+fn read_local(f: &str, real: std::io::Result<PathBuf>, path: &Path, cap: u64) -> Result<Vec<u8>, Out> {
     let mut v = Vec::new();
     let read = match f {
         "-" => std::io::stdin().take(cap + 1).read_to_end(&mut v),
-        _ => std::fs::File::open(path).and_then(|h| h.take(cap + 1).read_to_end(&mut v)),
+        _ => real.and_then(std::fs::File::open).and_then(|h| h.take(cap + 1).read_to_end(&mut v)),
     };
     if let Err(e) = read {
         let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -1675,12 +1797,45 @@ fn read_local(f: &str, path: &Path, cap: u64) -> Result<Vec<u8>, Out> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     fn cmd(s: &str) -> Cmd {
         parse(&s.split(' ').map(String::from).collect::<Vec<_>>())
     }
 
-    /// `more` beside a list (the old hint syntax) is named, never a silent page 1 (review 2026-10-14 #18).
+    /// A local page's URL holds the path a user types: no Windows verbatim prefix; other paths as they are.
+    #[test]
+    fn a_path_is_shown_as_typed() {
+        let p = |s: &str| shown(Path::new(s));
+        assert_eq!(
+            (p(r"\\?\C:\a\b.html"), p(r"\\?\UNC\host\share\b.html")),
+            (r"C:\a\b.html".into(), r"\\host\share\b.html".into())
+        );
+        assert_eq!((p("/tmp/a b.html"), p(r"C:\a.html")), ("/tmp/a b.html".into(), r"C:\a.html".into()));
+    }
+
+    /// A local read opens the canonical path the fence judged (TOCTOU): a link swapped to another file after the
+    /// check is never read (`read_local` opening the link again reads the swapped file); a path that does not
+    /// resolve is its own error.
+    #[test]
+    #[cfg(unix)]
+    fn a_local_read_opens_the_path_it_checked() {
+        let root = Scratch::new("fenced");
+        let [a, b, link] = ["a.txt", "b.txt", "l.txt"].map(|n| root.join(n));
+        std::fs::write(&a, "checked").ok();
+        std::fs::write(&b, "swapped").ok();
+        std::os::unix::fs::symlink(&a, &link).ok();
+        let real = fenced("l.txt", &link);
+        assert_eq!(real.as_ref().ok().and_then(|r| r.as_ref().ok()), a.canonicalize().ok().as_ref());
+        std::fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(&b, &link).ok();
+        let Ok(real) = real else { panic!("inside the fence") };
+        let read = read_local("l.txt", real, &link, 64).ok();
+        assert_eq!(read.as_deref(), Some(&b"checked"[..]), "the link's new target is never opened");
+        assert!(fenced("x", &root.join("none")).is_ok_and(|r| r.is_err()), "a missing file falls to no_file");
+    }
+
+    /// `more` beside a list (the old hint syntax) is named, never a silent page 1.
     #[test]
     fn more_beside_a_list_is_named() {
         let b = bin();
@@ -1771,9 +1926,8 @@ mod tests {
     /// `fats jN` read the same verdict.
     #[test]
     fn a_run_lives_while_its_lock_is_held() {
-        let root = std::env::temp_dir().join(format!("fats-start-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let mut c = Cache::at(root.clone(), "t".into());
+        let root = Scratch::new("start");
+        let mut c = Cache::at(root.to_path_buf(), "t".into());
         let job = c.job_of("https://ex.com/a").expect("job");
         c.alloc(vec![Entry { url: "https://ex.com/a".into(), job: Some(job), ..Entry::default() }], None).expect("id");
         let lock = c.run_claim(1).expect("the launcher's lock");
@@ -1783,20 +1937,18 @@ mod tests {
         let (alive, out) = read();
         assert!(alive == Some(true) && out.contains(" pending 60s ex.com · starting → "), "pid 0 at 60 s: {out}");
         let row = |c: &Cache| job_view(c, job).lines.get(1).cloned().unwrap_or_default();
-        assert!(row(&c).starts_with("j1.u1 pending ex.com/a → "), "{}", row(&c));
+        assert!(row(&c).starts_with("j1.u1 ex.com/a · pending → "), "{}", row(&c));
         drop(lock);
         let (alive, out) = read();
         assert!(alive == Some(false) && out.contains(" ! abandoned ex.com"), "no lock: {out}");
-        assert!(row(&c).starts_with("j1.u1 ! abandoned ex.com/a → "), "{}", row(&c));
-        std::fs::remove_dir_all(&root).ok();
+        assert!(row(&c).starts_with("j1.u1 ex.com · ! abandoned ex.com/a · "), "{}", row(&c));
     }
 
     /// A session holding one plain id, then a saved Oxylabs answer listed as a search: (cache, its root, the hits,
     /// the search record, the listed output). No network: the provider call is the only part not run.
-    fn listed_session(tag: &str) -> (Cache, PathBuf, Vec<Hit>, Meta, Out) {
-        let root = std::env::temp_dir().join(format!("fats-serp-{tag}-{}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let mut cache = Cache::at(root.clone(), "t".into());
+    fn listed_session(tag: &str) -> (Cache, Scratch, Vec<Hit>, Meta, Out) {
+        let root = Scratch::new(&format!("serp-{tag}"));
+        let mut cache = Cache::at(root.to_path_buf(), "t".into());
         let old = Entry { url: "https://ex.com/".into(), dir: "t/u1".into(), ..Entry::default() };
         assert_eq!(cache.alloc(vec![old], None), Ok(1));
         let body = include_bytes!("../tests/fixtures/oxy-search.json");
@@ -1819,7 +1971,7 @@ mod tests {
     /// resolving the result's URL.
     #[test]
     fn search_results_become_ids() {
-        let (cache, root, _, _, out) = listed_session("ids");
+        let (cache, _root, _, _, out) = listed_session("ids");
         let b = bin();
         // the list cap is 300 real tokens (`clean::tok`): four of the five snippet rows, then `more`
         let first =
@@ -1843,13 +1995,12 @@ mod tests {
         assert!(unfetched(1).is_none() && unfetched(7).is_none());
         let dry = plan(&cmd("u2 dry:true"), &cache).lines.join("\n");
         assert!(dry.contains("u2 uni-heidelberg.de/en (search result)") && !dry.contains("local read"), "{dry}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// 20 results: the list stops at the cap, `more` goes on from the cursor, `more` at the end says so.
     #[test]
     fn more_lists_past_the_cap() {
-        let (mut cache, root, hits, meta, _) = listed_session("more");
+        let (mut cache, _root, hits, meta, _) = listed_session("more");
         let b = bin();
         let many: Vec<Hit> = (0..4).flat_map(|_| hits.clone()).collect();
         let job = cache.job_of("again").expect("job");
@@ -1862,6 +2013,5 @@ mod tests {
         assert!(more.lines[0].starts_with(&format!("= j{job} search ")), "{:?}", more.lines);
         assert!(more.lines[0].contains(&format!(" shown u{}-", 7 + rows)), "{:?}", more.lines);
         assert!(more.lines[1].starts_with(&format!("u{}  ", 7 + rows)), "{:?}", more.lines);
-        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -1,19 +1,19 @@
 {
   "reserved": [
-    "more", "up", "all", "full", "json", "guide", "stats", "links", "config", "account", "status", "version",
-    "routes", "setup", "media", "comments", "cards"
+    "more", "up", "all", "full", "json", "guide", "help", "stats", "links", "config", "account", "status", "version",
+    "routes", "setup", "media", "comments", "cards", "telemetry"
   ],
   "lists": ["links", "cards"],
-  "alone": ["status", "version", "routes", "setup", "account", "guide"],
+  "alone": ["status", "version", "routes", "setup", "account", "guide", "help", "telemetry"],
   "aliases": [
-    ["help", "guide"], ["ls", "status"], ["stat", "stats"], ["-V", "version"], ["login", "setup"], ["auth", "setup"],
+    ["ls", "status"], ["stat", "stats"], ["-V", "version"], ["login", "setup"], ["auth", "setup"],
     ["signin", "setup"], ["sign-in", "setup"], ["keys", "setup"], ["key", "setup"], ["credentials", "setup"],
-    ["commands", "guide"], ["balance", "account"], ["usage", "account"], ["spend", "account"],
+    ["commands", "help"], ["balance", "account"], ["usage", "account"], ["spend", "account"],
     ["credits", "account"]
   ],
   "elsewhere": [
-    ["logout signup register init doctor whoami exit quit", " is not a fats command · keys: {b} setup · status: {b}"],
-    ["install update upgrade", ": see docs/installation.md in the repo · {b} guide"]
+    ["logout signup register init doctor whoami info exit quit", " is not a fats command · keys: {b} setup · status: {b}"],
+    ["install update upgrade", ": see docs/installation.md in the repo"]
   ],
   "verbs": ["read", "open", "get", "grep", "fetch", "search", "filter", "find"],
   "keys": [
@@ -22,10 +22,9 @@
     "wait", "zone", "from"
   ],
   "bools": ["js", "fresh", "dry", "json", "verbose"],
-  "commands": ["stats", "config", "account", "guide", "status", "version", "routes", "setup", "fetch"],
+  "commands": ["stats", "config", "account", "guide", "status", "version", "routes", "setup", "fetch", "telemetry"],
   "led": ["mcp", "help"],
-  "doc_ext": ["html", "htm", "xhtml", "pdf", "docx"],
-  "file_tlds": ["md", "rs", "py", "sh", "zip", "mov", "java", "tf", "pl", "ml", "so", "cc", "pm", "cr", "mk", "ps"],
+  "operators": ["filetype", "intitle", "inurl", "intext", "before", "after", "allintitle", "allinurl"],
   "tlds": [
     "aaa", "aarp", "abb", "abbott", "abbvie", "abc", "able", "abogado", "abudhabi", "ac", "academy", "accenture",
     "accountant", "accountants", "aco", "actor", "ad", "ads", "adult", "ae", "aeg", "aero", "aetna", "af", "afl",
@@ -153,6 +152,12 @@
     "xn--ygbi2ammx", "xn--zfr164b", "xxx", "xyz", "yachts", "yahoo", "yamaxun", "yandex", "ye", "yodobashi", "yoga",
     "yokohama", "you", "youtube", "yt", "yun", "za", "zappos", "zara", "zero", "zip", "zm", "zone", "zuerich", "zw"
   ],
+  "file_tlds": ["md", "rs", "py", "sh", "zip", "mov", "java", "tf", "pl", "ml"],
+  "secret_names": [
+    ".env", ".env.*", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "authorized_keys", "known_hosts", ".netrc",
+    ".npmrc", ".pypirc", ".git-credentials", "credentials.json", ".htpasswd"
+  ],
+  "hosts": [["CLAUDECODE", "claude_code"], ["CODEX_THREAD_ID", "codex"], ["PI_CODING_AGENT", "pi"]],
   "media": ["image", "images", "img", "photo", "photos", "picture", "pictures", "pic", "pics", "video", "videos"],
   "stop": [
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "was", "what", "how", "much", "does",

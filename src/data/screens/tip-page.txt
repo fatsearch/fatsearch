@@ -1,0 +1,3 @@
+{red}✗{/} {bold}{site}{/} blocks the free fetch (it shows a "checking your browser" wall or needs JavaScript).
+  With a provider key (Oxylabs, Bright Data or Decodo) fats gets through, for a fraction of a cent a page.
+  {cyan}→{/} tip: add a provider (2 min): {bold}fats setup{/}

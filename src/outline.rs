@@ -1,20 +1,17 @@
 //! OUTLINE + READ: lines → sections; outline-top, `all`, section parts, `full`, `links`.
 
-use crate::cache::{Cursor, Meta};
+use crate::cache::{Cursor, HopRow, Meta};
 use crate::clean::{
     CARD, COMMENT, Doc, Info, LISTS, LREF, Line, PIECE, Section, collapse, fold, host_of, is_word, paragraph, tok,
     tok_cut,
 };
-use crate::fetch::{JS_QUOTE, fail_row, move_code, spent, title_head};
+use crate::fetch::{JS_QUOTE, KEY_ROWS, budget_row, clear, fail_row, move_code, no_key_left, skips, spent, title_head};
 use crate::html::py_strip;
 use crate::lang::{Flag, Id, WORDS, bin, cut, ksize, letters, priced, restamp, short, uniq};
 use crate::provider::{Tier, domain_country};
 use crate::settings::limit;
 use std::cmp::Reverse;
 
-pub const LIST_CAP: usize = 300;
-pub const GREP_CAP: usize = 500;
-pub const READ_CAP: usize = 1000;
 /// Media rows: in the outline, in `fats uN media`.
 const MEDIA_ROWS: usize = 3;
 /// Every heading (≤ 120 chars) opens a section, the text before the first one = `(top)` (level 0, never a
@@ -58,8 +55,8 @@ pub fn span(doc: &Doc, k: usize) -> Vec<usize> {
     (k..=k + subs).collect()
 }
 
-/// `, 3 sub, 30 cards` (`1 card`) after a row's size: its `sub` subsections and the card rows (`clean::CARD`) in sections
-/// `js` (the row's own and those no other row shows: each card counted once), the counts that are not 0.
+/// `, 3 sub, 30 cards` (`1 card`) after a row's size: its `sub` subsections and the card rows (`clean::CARD`) in
+/// sections `js` (the row's own and those no other row shows: each card counted once), the counts that are not 0.
 fn counts(doc: &Doc, js: &[usize], sub: usize) -> String {
     let cards = js.iter().flat_map(|&j| &doc.sections[j - 1].lines).filter(|l| l.starts_with(CARD)).count();
     let card = if cards == 1 { "card" } else { "cards" };
@@ -140,10 +137,8 @@ pub fn preview(text: &str, n: usize) -> String {
         return t;
     }
     let c = cut(&t, n);
-    match c.rfind(' ') {
-        Some(sp) if c[..sp].chars().count() as f64 > n as f64 * 0.6 => format!("{}…", &c[..sp]),
-        _ => format!("{c}…"),
-    }
+    let keep = c.rfind(' ').filter(|&sp| c[..sp].chars().count() as f64 > n as f64 * 0.6).map_or(c, |sp| &c[..sp]);
+    format!("{keep}…")
 }
 
 /// Distinct words of ≥ 3 word chars, folded, in order of appearance.
@@ -198,10 +193,7 @@ fn sec_preview(s: &Section, title: &[String], n: usize) -> String {
     // the start holding the most (a strict `>` keeps the earliest of a tie); none when the lead holds one
     let pick = |b: (u32, usize), i| if held(i) > b.0 { (held(i), i) } else { b };
     let best = if held(0) > 0 { (0, 0) } else { (0..toks.len()).filter(|&i| has[i] != 0).fold((0, 0), pick) };
-    match best.1 {
-        0 => preview(&t, n),
-        i => preview(&format!("…{}", toks[i..].join(" ")), n),
-    }
+    if best.1 == 0 { preview(&t, n) } else { preview(&format!("…{}", toks[best.1..].join(" ")), n) }
 }
 
 /// Title words a light render's previews look for (≤ 64): `words3` minus the filter's stopwords.
@@ -227,7 +219,7 @@ pub fn info_line(info: &Info) -> String {
 
 /// A title cut to `n` chars at a word, marked `…`. When the cut-off words hold a number (a year, a model, an
 /// issue), the first of them end the line: `Volkswagen Golf Automobile for sale in parts … 2000-02, | A28920205`.
-fn title_cut(t: &str, n: usize) -> String {
+pub fn title_cut(t: &str, n: usize) -> String {
     const TAIL: usize = 24;
     if t.chars().count() <= n {
         return t.to_string();
@@ -253,11 +245,12 @@ fn title_cut(t: &str, n: usize) -> String {
 
 /// Host for web pages; file name for local documents. `landed <host>` when the page is off the asked site (bd's
 /// Airbnb `.com` ask served from `.com.pe`, in Spanish): neither host (no `www.`, no root dot) is
-/// the other or under it.
-fn place(asked: &str, url: &str) -> String {
+/// the other or under it; `landed http://<host>` when an https ask was served over http (`provider::plain`).
+pub fn place(asked: &str, url: &str) -> String {
     let [a, h] = [asked, url].map(|u| format!(".{}", host_of(u).trim_start_matches("www.").trim_end_matches('.')));
     match host_of(url) {
-        f if f.is_empty() => url.rsplit('/').next().unwrap_or(url).to_string(),
+        f if f.is_empty() => url.rsplit(['/', '\\']).next().unwrap_or(url).to_string(),
+        f if asked.starts_with("https:") && url.starts_with("http:") => format!("landed http://{f}"),
         f if a == "." || a.ends_with(&h) || h.ends_with(&a) => f,
         _ => format!("landed {}", &h[1..]),
     }
@@ -280,7 +273,8 @@ pub struct Page<'a> {
     /// Where the read stands: the parts read, this one first (`#5b`, "" = the page), then the ones read before in this
     /// session (`Entry::read`): a pointer to one is no next move; and the URL's other stored copies
     /// (`cli::copies`): the newest paid ask's (`js:true`) copy that served other text, whether a paid ask
-    /// brought back this same text; the URL's other copies (the timeouts its fix ran: `fetch::fix_arg`; the failure count).
+    /// brought back this same text; the URL's other copies (the timeouts its fix ran: `fetch::fix_arg`; the failure
+    /// count).
     pub at: Seen,
 }
 
@@ -321,17 +315,21 @@ fn moves(doc: &Doc, id: &str) -> String {
 /// Outline-top: a cached page says `cache 2h` where a fetch says `1.2s spent $.001`.
 pub fn outline(p: &Page, prov: Option<&str>) -> Shown {
     let (doc, id, b) = (p.doc, &p.id, bin());
-    let mut lines = vec![head_line(p, prov, doc.tokens.clean)];
+    let mut lines = vec![head_line(p, prov, doc.tokens.clean, None)];
     lines.extend(page_flags(p).iter().filter(|f| f.row).map(|f| f.bang(id)));
     // a failed run's skipped tiers (`fetch::skipped`: `no_key`, `budget_hit`), kept with it: every read says them,
     // a `no_key` row only while that key is still missing ("set BRIGHTDATA_API_KEY" under an arrow using it),
-    // its arrow the reader's (`lang::restamp`)
-    let skipped = p.meta.extra.get("skipped").and_then(|v| v.as_array()).into_iter().flatten();
-    let set = |r: &&str| crate::fetch::keyed().iter().any(|t| r.starts_with(&format!("! no_key {} ", t.spec().short)));
-    let rows = skipped.filter_map(|r| r.as_str()).filter(|r| !set(r));
-    lines.extend(rows.map(|r| format!("{id} {}", restamp(r, id, &p.meta.url))));
+    // a `budget_hit` row only while no newer copy served (the page's row points there), its arrow the reader's
+    // (`lang::restamp`)
+    let missing = no_key_left(p.meta);
+    let kept = |r: &&str| !KEY_ROWS.iter().chain(&["! budget_hit "]).any(|k| r.starts_with(k)) || missing.contains(r);
+    let rows = skips(p.meta).filter(kept).map(|r| restamp(r, id, &p.meta.url));
+    let rows = rows.chain(budget_row(p.meta, id, &p.at.4).filter(|_| p.at.1.is_none()));
+    lines.extend(rows.map(|r| format!("{id} {r}")));
     let il = Some(info_line(&doc.info)).filter(|il| !il.is_empty());
     lines.extend(il.map(|il| format!("{id}#0 info | {}", preview(&il, 150))));
+    // the page plain's meta refresh came from (`provider::refresh`): shown, never judged
+    lines.extend(p.meta.refreshed_from.as_ref().map(|f| format!("{id}#0 info | refreshed from: {f}")));
     // content media only (`Media::demoted` rows come last), unless the page has nothing else
     let content = doc.media.iter().filter(|m| !m.demoted).count();
     let rows = doc.media.len().min(if content == 0 { MEDIA_ROWS } else { content.min(MEDIA_ROWS) });
@@ -351,10 +349,13 @@ pub fn outline(p: &Page, prov: Option<&str>) -> Shown {
     let islands = (doc.served() + 1..=doc.sections.len()).map(|k| {
         let size = ksize(sec_tokens(doc, k));
         let dup = if own && anchor(doc, k, true).is_some_and(|a| a.sec == Some(k)) { " (dup)" } else { "" };
-        format!("[{id}#{k}] {}{dup} · {size} tok → {b} {id}#{k}", doc.sections[k - 1].title)
+        // an encoded island has no way in: its size, no arrow
+        let (mark, to) =
+            if encoded(doc, k) { (" (encoded)", String::new()) } else { (dup, format!(" → {b} {id}#{k}")) };
+        format!("[{id}#{k}] {}{mark} · {size} tok{to}", doc.sections[k - 1].title)
     });
     let moves = moves(doc, id);
-    if doc.tokens.clean <= READ_CAP {
+    if whole_read(doc) {
         lines.extend(whole(doc, id, &(1..=doc.served()).collect::<Vec<_>>()));
         lines.extend(islands);
         // never a claim of the whole page when its `=` line says some of it is elsewhere; a card says it is one
@@ -365,21 +366,17 @@ pub fn outline(p: &Page, prov: Option<&str>) -> Shown {
             _ => "",
         };
         lines.push(format!("{claim}{moves}"));
-        // a whole read: the `=` figure is what it printed, rows and all; else what `full` prints
-        lines[0] = head_line(p, prov, lines.iter().map(|x| tok(x)).sum());
+        lines[0] = head_line(p, prov, size(p, &lines), None);
         return (lines, cursor);
     }
     let tops: Vec<usize> = (1..=doc.served()).filter(|&k| doc.sections[k - 1].level <= doc.top).collect();
     // PDF pages carry no links here; an empty page is a no_text page, not a menu
-    let mut lists: Vec<usize> = tops.iter().copied().filter(|&k| doc.mode != "pdf" && is_link_list(doc, k)).collect();
-    if lists.len() == tops.len() {
-        lists.clear(); // only link lists (SERP, index): the lists are the content
-    }
+    let lists: Vec<usize> = tops.iter().copied().filter(|&k| doc.mode != "pdf" && is_link_list(doc, k)).collect();
+    // only link lists (SERP, index): the lists are the content
+    let lists = if lists.len() == tops.len() { Vec::new() } else { lists };
     let rows = top_rows(doc, id, &lists);
-    let shown = cap_rows(&mut lines, &rows, used, (LIST_CAP, 3, None));
-    if shown < rows.len() {
-        lines.push(format!("… +{} sections → {b} {id} all", rows.len() - shown));
-    }
+    let shown = cap_rows(&mut lines, &rows, used, (limit::<usize>("list_cap"), 3, None));
+    lines.extend((shown < rows.len()).then(|| format!("… +{} sections → {b} {id} all", rows.len() - shown)));
     lines.extend(islands);
     if !lists.is_empty() {
         lines.push(format!("{id} {} link-list sections folded (menus, related) → {b} {id} all", lists.len()));
@@ -389,17 +386,49 @@ pub fn outline(p: &Page, prov: Option<&str>) -> Shown {
     (lines, cursor)
 }
 
+/// An island no reader can use: its first part is an encoded blob (base64 or its URL-safe form: ≥ `blob_share`
+/// of its chars, no space in it, line ids aside). Its row prints the size and no way in.
+fn encoded(doc: &Doc, k: usize) -> bool {
+    let lid = |n: &str| n.strip_prefix('l').is_some_and(|d| d.parse::<usize>().is_ok());
+    let first = parts_of(doc, k).into_iter().next().unwrap_or_default();
+    let text: String =
+        first.iter().map(|l| l.split_once(' ').filter(|x| lid(x.0)).map_or(l.as_str(), |x| x.1)).collect();
+    let coded = text.chars().filter(|c| c.is_ascii_alphanumeric() || "+/=-_".contains(*c)).count();
+    let share: f64 = limit("blob_share");
+    !text.is_empty() && !text.contains(char::is_whitespace) && coded as f64 >= share * text.chars().count() as f64
+}
+
+/// A page its outline prints whole: an HTML page within `read_cap` (a text document reads by `text_outline`).
+fn whole_read(doc: &Doc) -> bool {
+    !LISTS.text.contains(&doc.mode.as_str()) && doc.tokens.clean <= limit::<usize>("read_cap")
+}
+
+/// THE `=` figure of a page's outline (its `=` line, `fats stats`): read whole, what it prints (`lines`: the `=`
+/// line with its flags, no `←` and the HOW at `HOW_WIDTH`, then the rows); else the page (what `full` prints).
+pub fn size(p: &Page, lines: &[String]) -> usize {
+    if !whole_read(p.doc) {
+        return p.doc.tokens.clean;
+    }
+    let head = head_line(p, None, p.doc.tokens.clean, Some(HOW_WIDTH)) + &flags(p);
+    tok(&head) + lines.iter().skip(1).map(|x| tok(x)).sum::<usize>()
+}
+
+/// The HOW a whole read's `=` figure counts in place of its own: `local 2ms`, `cache 2h`, `bd 4321ms spent $0.0015`
+/// differ per read of one page, so it counts a plain fetch's width and a fetch and its cache read print one size.
+const HOW_WIDTH: &str = "plain 400ms spent $0.0000";
+
 /// The `=` line: id, a failed fetch's code, title, shape (sections, PDF pages, text lines), `size` tok, and how it
-/// came (a cache read too: a paid run is read from the cache).
-fn head_line(p: &Page, prov: Option<&str>, size: usize) -> String {
+/// came (a cache read too: a paid run is read from the cache); `how` = a HOW in place of this read's (`HOW_WIDTH`).
+fn head_line(p: &Page, prov: Option<&str>, size: usize, how: Option<&str>) -> String {
     let (doc, meta) = (p.doc, p.meta);
-    let tail = match p.age {
-        Some(age) => format!("cache {}{}", fmt_age(age), meta.hedge_off()),
-        None => {
+    let tail = match (how, p.age) {
+        (Some(how), _) => how.to_string(),
+        (None, Some(age)) => format!("cache {}{}", fmt_age(age), meta.how()),
+        (None, None) => {
             // the path when it was more than one plain call (a second ask says why: `md:thin`)
             let more = meta.hops.len() > 1 || meta.hops.iter().any(|h| h.why.starts_with("md:"));
             let by = if more { meta.tried() } else { meta.provider.clone() + &meta.geo() };
-            format!("{by} {}ms spent ${:.4}{}", meta.ms, meta.cost, meta.hedge_off())
+            format!("{by} {}ms spent ${:.4}{}", meta.ms, meta.cost, meta.how())
         }
     };
     let n = doc.served();
@@ -446,25 +475,26 @@ pub fn flags(p: &Page) -> String {
 
 /// `! redirected /listing` when the site served another CLASS of page than the one asked for: the asked path's last
 /// segment (its id or slug, without `.html`) is gone from the final URL (its path, a query value, a host label: the
-/// same id moved to `?v=` or to a user subdomain is the same page), or a bare-path URL lost a query pair that is not
-/// `utm_` tracking. A site adding a slug, a locale, a query or another host to the same id is the same page; a wrong
-/// product slug landing on its listing, a login or a consent page is not, and passes every content check. So is a
-/// path of the same depth with the same numeric ids: a slug fixed beside its id (`/questions/26946646/<slug>`).
-/// Pure (two URLs in, the landing as shown out), so the fetch judges a landing by the same rule (`fetch::check`).
+/// same id moved to `?v=` or to a user subdomain is the same page), and it held 8+ letters or digits, or the path's
+/// all-digit segments, 2 or more, are its id and the landing keeps none of them (`/eli/reg/2021/821` →
+/// `/TodayOJ/index.html`). A short segment with no such id is an alias resolved (`/releases/latest/` → the latest
+/// post); a URL with no path segment names no page (`?q=` alone). A site adding a slug, a locale, a query or
+/// another host to the same id is the same page; a wrong product slug landing on its listing, a login or a consent
+/// page is not, and passes every content check. So is a path of the same depth with the same numeric ids: a slug
+/// fixed beside its id (`/questions/26946646/<slug>`). Pure (two URLs in, the landing as shown out): THE rule for a
+/// fetch's landing (`fetch::check`) and a served page's alike.
 pub fn lost_page(asked: &str, landed: &str) -> Option<String> {
     let (a, b) = (url::Url::parse(asked).ok()?, url::Url::parse(landed).ok()?);
-    let last = a.path_segments().and_then(|mut s| s.rfind(|s| !s.is_empty()));
-    let kept = match last.map(|s| s.rsplit_once('.').map_or(s, |(stem, _)| stem).to_lowercase()) {
-        Some(seg) => {
-            let id = seg.trim_start_matches('@');
-            let host = b.host_str().is_some_and(|h| h.split('.').any(|l| l == id));
-            b.path().to_lowercase().contains(&seg) || b.query_pairs().any(|(_, v)| v.to_lowercase() == id) || host
-        }
-        None => a.query_pairs().filter(|p| !p.0.starts_with("utm_")).all(|p| b.query_pairs().any(|q| q == p)),
-    };
     let segs = |u: &url::Url| u.path().split('/').filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>();
-    let (sa, sb, id) = (segs(&a), segs(&b), |s: &String| s.bytes().all(|c| c.is_ascii_digit()));
-    let fixed = sa.len() == sb.len() && sa.iter().any(id) && sa.iter().zip(&sb).all(|(x, y)| !id(x) || x == y);
+    let (sa, sb, num) = (segs(&a), segs(&b), |s: &&String| s.bytes().all(|c| c.is_ascii_digit()));
+    let nums: Vec<&String> = sa.iter().filter(num).collect();
+    let gone = nums.len() >= 2 && !nums.iter().any(|n| sb.contains(n));
+    let last = sa.last().filter(|l| gone || l.bytes().filter(u8::is_ascii_alphanumeric).count() >= 8)?;
+    let seg = last.rsplit_once('.').map_or(last.as_str(), |(stem, _)| stem).to_lowercase();
+    let id = seg.trim_start_matches('@');
+    let host = b.host_str().is_some_and(|h| h.split('.').any(|l| l == id));
+    let kept = b.path().to_lowercase().contains(&seg) || b.query_pairs().any(|(_, v)| v.to_lowercase() == id) || host;
+    let fixed = !nums.is_empty() && sa.len() == sb.len() && sa.iter().zip(&sb).all(|(x, y)| !num(&x) || x == y);
     if kept || fixed {
         return None;
     }
@@ -493,13 +523,13 @@ pub fn is_thin(doc: &Doc) -> bool {
 /// string, a moderation policy or a legal notice (TikTok and Instagram).
 fn thin(doc: &Doc, next: Option<String>) -> Option<Flag> {
     let doc = Some(doc).filter(|d| is_thin(d))?;
-    // the visible text is a char count: ~2 chars a token (printed reads, median 1.97: the tok spike)
+    // the visible text is a char count: ~2 chars a token (printed reads, median 1.97)
     let what = format!("{} of ~{} visible", ksize(doc.tokens.clean), ksize(doc.loss.visible_chars / 2));
     Some(Flag { code: "thin".into(), what, next: next.unwrap_or_default(), row: false })
 }
 
 /// The way to the page from a copy without it, free first: a render of it already stored (`→ fats u2
-/// (rendered)`), else the `<template>` island with the most paragraphs (texts of ≥ `paragraph_words` words) when it
+/// · rendered`), else the `<template>` island with the most paragraphs (texts of ≥ `paragraph_words` words) when it
 /// holds ≥ `island_paragraphs` (a thread's comments: `→ fats u1#5 · 3.3k tok · $0`), at its first part not read in
 /// this session (`#5` read → `#5b`, never back at a read part; all read → the next island, then none),
 /// else a JS render (`js_next`). A data island is never one: its long strings are an app's i18n table.
@@ -513,10 +543,9 @@ fn way_out(p: &Page) -> Option<String> {
         let at = Id { sec: Some(k), part: i, ..Id::default() }.sec_tail();
         Some(format!("{b} {}{at} · {} tok · $0", p.id, ksize(n)))
     };
+    let island = islands.iter().copied().find_map(unread);
     // every part of the islands read: no arrow, never a render of what was read
-    let render = islands.is_empty();
-    let island = islands.into_iter().find_map(unread);
-    p.at.1.as_ref().map(|r| format!("{b} {r}")).or(island).or_else(|| js_next(p).filter(|_| render))
+    p.at.1.as_ref().map(|r| format!("{b} {r}")).or(island).or_else(|| js_next(p).filter(|_| islands.is_empty()))
 }
 
 /// The `<template>` islands holding ≥ `island_paragraphs` paragraphs (texts of ≥ `paragraph_words` words: a
@@ -553,7 +582,7 @@ fn anchor(doc: &Doc, from: usize, any: bool) -> Option<Id> {
     let head = own(title_head(&doc.title));
     let title = Some(fold(&doc.title)).filter(|t| head && info("site").as_ref() != Some(t));
     let alt = doc.media.iter().find(|m| !m.demoted).map(|m| fold(&m.alt));
-    // a description too short to anchor falls back to the title (review 2026-10-14 #19)
+    // a description too short to anchor falls back to the title
     let mut texts = [info("description"), title.clone(), alt].into_iter().flatten().filter(|t| own(t));
     let text = texts.find(|w| w.chars().count() >= ANCHOR)?;
     let words: String = text.chars().take(ANCHOR).collect();
@@ -610,26 +639,28 @@ fn record(doc: &Doc) -> Option<(Id, usize)> {
     })?
 }
 
-/// The way into a copy's page record (`record`) when no words anchor it, as an id tail: `#2fv (page record) · 995
+/// The way into a copy's page record (`record`) when no words anchor it, as an id tail: `#2fv · page record · 995
 /// tok · $0`; None once the read log `log` holds its text (`key_of`, under any copy) or on a missing page.
 pub fn record_in(doc: &Doc, meta: &Meta, log: &[String]) -> Option<String> {
     let (at, n) = record(doc).filter(|_| anchor(doc, 1, false).is_none() && meta.code != "not_found")?;
     let key = key_of(parts_of(doc, at.sec?).get(at.part)?);
-    (!log.contains(&key)).then(|| format!("{} (page record) · {} tok · $0", at.sec_tail(), ksize(n)))
+    (!log.contains(&key)).then(|| format!("{} · page record · {} tok · $0", at.sec_tail(), ksize(n)))
 }
 
-/// `fats u1 js:true ≤$0.0030 ~25s`: a JS render at its worst case (`fetch::worst`) and a render's time
-/// (`fetch::JS_QUOTE`); None for a file (nothing to render), when no render with a key is left untried
-/// (`fetch::spent`; nor one another copy of the URL called, cut or not: a cut's one move is the longer call on
-/// that copy's row, `fetch::fix_arg`), or a paid ask brought this copy back. An app page (`no_copy`) gets it
-/// too: every `!` has a next step, the agent decides on the price.
+/// `fats u1 js:true · oxyjs ≤$0.0015 ≈25s`: a JS render, the tiers its `dry:true` would call (`bd, then oxyjs`),
+/// its worst case (`fetch::worst`) and a render's time (`fetch::JS_QUOTE`); None for a file (nothing to render),
+/// when none of those tiers is left untried (`fetch::spent` with the URL's other copies: nor one another copy
+/// called, cut or not: a cut's one move is the longer call on that copy's row, `fetch::fix_arg`), when one is
+/// settled for the URL (`fetch::settled`: the same ask is refused again), or a paid ask brought this copy
+/// back. An app page (`no_copy`) gets it too: every `!` has a next step, the agent decides on the price.
 fn js_next(p: &Page) -> Option<String> {
-    let done = spent(p.meta, &[], &crate::fetch::keyed());
-    let tried = |t: Tier| p.at.4.iter().flat_map(|o| &o.hops).any(|h| h.provider == t.spec().name);
-    let left = Tier::ALL.into_iter().any(|t| t.can("js") && !done.contains(&t.spec().short) && !tried(t));
-    let m = Some(p.meta).filter(|m| m.url.starts_with("http") && left && !p.at.2)?;
-    let js = priced(&format!("{} {} js:true", bin(), p.id), &m.url);
-    Some(format!("{js} {}", JS_QUOTE))
+    let cuts: Vec<HopRow> = p.at.4.iter().flat_map(|o| o.hops.clone()).collect();
+    let done = spent(p.meta, &cuts, &crate::fetch::keyed());
+    let cmd = format!("{} {} js:true", bin(), p.id);
+    let (tiers, c) = crate::fetch::worst(&cmd, &p.meta.url).filter(|_| p.meta.url.starts_with("http") && !p.at.2)?;
+    let names: Vec<&str> = tiers.iter().map(|t| t.0.spec().short).collect();
+    let open = names.iter().any(|n| !done.contains(n)) && clear(&cmd, p.meta, &p.at.4);
+    open.then(|| format!("{cmd} · {} ≤${c:.4} {JS_QUOTE}", names.join(", then ")))
 }
 
 /// ` · 56 of 224 numbers pruned` (a COUNT group of the `=` line): numbers the light render holds that the served one
@@ -676,7 +707,7 @@ fn page_flags(p: &Page) -> Vec<Flag> {
         let why = if why.is_empty() { why } else { format!(" · {why}") };
         // an app page's way out, or a stored copy of the page (never "nothing left" with the page in the cache)
         let next = held.clone().or(way.take().filter(|_| move_code(meta) == "no_copy" || p.at.1.is_some()));
-        let again = if next.is_some() && fix.is_some() { "" } else { &again }; // the fix's `one more try` goes with it
+        let again = if next.is_some() && fix.is_some() { "" } else { &again };
         let what = format!("{}{url} · tried {tried}{copy}{why}{again}", read.unwrap_or_default());
         v.push(flag(&format!("{}{shown}", meta.code), what, next.or(fix).unwrap_or_default()));
     }
@@ -723,7 +754,7 @@ fn geo_flags(p: &Page) -> Vec<Flag> {
     let flag = |(lang, tier): (&str, Tier)| {
         let asked = p.at.3.1 && !meta.country.is_empty();
         let fix = geo_fix(&meta.url, &meta.country, tier, &crate::fetch::keyed()).filter(|_| !asked);
-        let fix = fix.map(|f| priced(&format!("{b} {} {f}", p.id), &meta.url));
+        let fix = fix.map(|f| priced(&format!("{b} {} {f}", p.id), &meta.url)).filter(|a| clear(a, meta, &p.at.4));
         let next = p.at.3.0.clone().map(|n| format!("{b} {n}")).or(fix);
         let what = match (asked, next.is_some()) {
             (true, _) => format!("· served in {lang} (asked {sent})"),
@@ -792,13 +823,13 @@ pub fn viewed(w: u32, h: u32, (edge, most): (u32, u32)) -> ((u32, u32), u32) {
     (size, patches(size))
 }
 
-/// `fats uN media`: every picture and video of the page, a `READ_CAP` page at a time from `off` (`media from:N`).
+/// `fats uN media`: every picture and video of the page, a `read_cap` page at a time from `off` (`media from:N`).
 pub fn media(p: &Page, off: usize, limit: Option<usize>) -> Shown {
     let rows: Vec<String> = media_rows(p.doc, usize::MAX).collect();
     // `pixels` only when there is an `m1` to look at (docs-2)
     let px = if rows.is_empty() { String::new() } else { format!(" · pixels {} {} m1", bin(), p.id) };
     let head = format!("= {} media{} · up {} {}{px}", p.eq, photos(p.doc, p.meta), bin(), p.id);
-    paged(&p.id, head, &rows, (off, limit, READ_CAP, "media"))
+    paged(&p.id, head, &rows, (off, limit, crate::settings::limit::<usize>("read_cap"), "media"))
 }
 
 /// A text document as it is: its first lines up to the read cap; `more` goes on.
@@ -854,7 +885,7 @@ pub fn outline_all(p: &Page) -> Shown {
         format!("{pad}{} ({size}) | {}", head.trim_end(), sec_preview(s, &tq, 50))
     };
     let rows: Vec<String> = doc.sections.iter().enumerate().map(row).collect();
-    let shown = cap_rows(&mut lines, &rows, used0, (READ_CAP, 0, None));
+    let shown = cap_rows(&mut lines, &rows, used0, (limit::<usize>("read_cap"), 0, None));
     if shown < doc.sections.len() {
         lines.push(format!("… +{} sections · read one: {b} {id}#{}", doc.sections.len() - shown, shown + 1));
     }
@@ -866,14 +897,14 @@ pub fn chunks_of(text: &[String]) -> Vec<Vec<String>> {
     for ln in text {
         let mut ln = ln.as_str();
         // one huge line: parts of 95% of the cap, each cut found in one pass (a 660k-char JSON island line)
-        while tok_cut(ln, READ_CAP) < ln.len() {
-            let h = ln[..tok_cut(ln, READ_CAP - 50)].to_string();
+        while tok_cut(ln, limit::<usize>("read_cap")) < ln.len() {
+            let h = ln[..tok_cut(ln, limit::<usize>("read_cap") - 50)].to_string();
             ln = &ln[h.len()..];
             parts.extend((!cur.is_empty()).then(|| std::mem::take(&mut cur)));
             parts.push(vec![h]);
             n = 0;
         }
-        if n + tok(ln) > READ_CAP && !cur.is_empty() {
+        if n + tok(ln) > limit::<usize>("read_cap") && !cur.is_empty() {
             parts.push(std::mem::take(&mut cur));
             n = 0;
         }
@@ -939,7 +970,7 @@ fn body(doc: &Doc, ks: &[usize], tag: impl Fn(usize) -> Option<String>) -> Vec<S
 }
 
 /// The parts `fats uN#k<part>` reads: section k with its subsections (a comment: its own text, its replies are
-/// rows: `read_sec`), cut at `READ_CAP`.
+/// rows: `read_sec`), cut at `read_cap`.
 fn parts_of(doc: &Doc, k: usize) -> Vec<Vec<String>> {
     let ks = if doc.sections[k - 1].level >= COMMENT { vec![k] } else { span(doc, k) };
     let id = |j: usize| if doc.sections[j - 1].level < COMMENT { String::new() } else { format!("#{j} ") };
@@ -986,7 +1017,9 @@ fn tally(doc: &Doc, n: usize, whole: bool) -> String {
 
 /// `fats uN comments`: the top-level comments (`uN#k comments`: comment k's direct replies, also the head of its
 /// read), most replied first (`replies` = the comments under it), one row each: `u3#12 · replies 42 · its first
-/// words`; `from:N` goes on. None served (a thin copy: in its islands) says so, never a hint to open nothing.
+/// words`; `from:N` goes on. No thread recognised (under `thread_rows`, flat posts, a thin copy) says so and points
+/// at the page's sections, never that no comment is served (a short thread's comments are its sections' text);
+/// a comment with none under it says `no replies`.
 pub fn comments(p: &Page, k: Option<usize>, off: usize, limit: Option<usize>) -> Shown {
     let (doc, secs, id, at) = (p.doc, &p.doc.sections, &p.id, k.map(|k| format!("#{k}")).unwrap_or_default());
     let all = k.map_or_else(|| said(doc), |k| span(doc, k)[1..].to_vec());
@@ -997,10 +1030,14 @@ pub fn comments(p: &Page, k: Option<usize>, off: usize, limit: Option<usize>) ->
     tops.sort_by_key(|t| Reverse(t.1));
     let row = |&(j, n): &(usize, usize)| format!("{id}#{j} · replies {n} · {}", sec_preview(&secs[j - 1], &[], 120));
     let head = match all.len() {
-        0 => format!("= {}{at} comments · no comment thread served · outline: {b} {id}", p.eq),
+        0 if said(doc).is_empty() => {
+            format!("= {}{at} comments · no thread found · {} sections: {b} {id}", p.eq, doc.served())
+        }
+        0 => format!("= {}{at} comments · no replies · list: {b} {id} comments", p.eq),
         n => format!("= {}{at} {} · {} {word} · open one: {b} {id}#<k>", p.eq, tally(doc, n, k.is_none()), tops.len()),
     };
-    paged(&format!("{id}{at}"), head, &tops.iter().map(row).collect::<Vec<_>>(), (off, limit, LIST_CAP, "comments"))
+    let (rows, cap) = (tops.iter().map(row).collect::<Vec<_>>(), crate::settings::limit::<usize>("list_cap"));
+    paged(&format!("{id}{at}"), head, &rows, (off, limit, cap, "comments"))
 }
 
 /// `fats uN links|cards [<words>]` from `off` up to the list cap (or `limit:` rows), `from:N` goes on: every link
@@ -1017,13 +1054,12 @@ pub fn list(p: &Page, off: usize, limit: Option<usize>, words: &[String], kind: 
         let card = |k: usize| doc.sections[k - 1].lines.iter().filter(|l| l.starts_with(CARD)).map(move |l| (k, l));
         (1..=doc.served()).flat_map(card).map(|(k, l)| (l.clone(), format!("{id}#{k} {}", lead(l)))).collect()
     };
-    let rows: Vec<String> =
-        all.iter().filter(|r| words.iter().all(|w| fold(&r.0).contains(&fold(w)))).map(|r| r.1.clone()).collect();
+    let rows: Vec<String> = all.iter().filter(|r| crate::search::holds(&r.0, words)).map(|r| r.1.clone()).collect();
     let of = if q.is_empty() { String::new() } else { format!(" of {} \"{q}\"", all.len()) };
     let open =
         (kind == "links" || rows.iter().any(|r| LREF.is_match(r))).then(|| format!(" · open one: {b} {id} l<N>"));
     let head = format!("= {} {kind} {}{of}{}", p.eq, rows.len(), open.unwrap_or_default());
-    let cap = if kind == "links" && q.is_empty() { LIST_CAP } else { READ_CAP };
+    let cap = crate::settings::limit(if kind == "links" && q.is_empty() { "list_cap" } else { "read_cap" });
     paged(&p.id, head, &rows, (off, limit, cap, format!("{kind} {q}").trim_end()))
 }
 
@@ -1102,6 +1138,9 @@ mod tests {
         assert_eq!(place("https://www.cnn.com/a", "https://edition.cnn.com/a"), "edition.cnn.com");
         assert_eq!(place("https://medium.com/@k", "https://k.medium.com/"), "k.medium.com");
         assert_eq!(place("/tmp/a.pdf", "/tmp/a.pdf"), "a.pdf");
+        let win = r"file://C:\Users\a\b.pdf"; // a Windows file names its file, never its whole path
+        assert_eq!(place(win, win), "b.pdf");
+        assert_eq!(place("https://ex.com/a", "http://ex.com/a"), "landed http://ex.com", "served over http");
         assert_eq!(place("https://ex.com./a", "https://www.ex.com/a"), "www.ex.com", "the root dot");
         // A part read says it too
         let sections = vec![Section { level: 1, title: "Rooms".into(), lines: vec!["Lima".into()] }];
@@ -1130,18 +1169,12 @@ mod tests {
             let meta = Meta { code: "thin_content".into(), ..Meta::default() };
             flags(&pg(&doc, &meta))
         };
-        assert_eq!(failed("https://x.org/a"), " · ! thin_content · redirected");
+        assert_eq!(failed("https://x.org/a-long-slug"), " · ! thin_content · redirected");
         assert_eq!(failed("stdin:"), " · ! thin_content");
         // a bd landing by canonical (`Meta::landed`) is judged; the doc's base stays where the bytes came from
-        let (doc, at) = (
-            Doc {
-                url: "https://a.example/i/9-x".into(),
-                final_url: "https://a.example/i/9-x".into(),
-                ..Doc::default()
-            },
-            Some("https://a.example/singles".into()),
-        );
-        let meta = Meta { landed: at, ok: true, ..Meta::default() };
+        let u = "https://a.example/i/9-charizard";
+        let doc = Doc { url: u.into(), final_url: u.into(), ..Doc::default() };
+        let meta = Meta { landed: Some("https://a.example/singles".into()), ok: true, ..Meta::default() };
         assert_eq!(flags(&pg(&doc, &meta)), " · ! redirected /singles");
         let same = [
             ("https://apps.apple.com/app/id68", "https://apps.apple.com/us/app/catchhour/id68"),
@@ -1155,6 +1188,13 @@ mod tests {
             ("https://medium.com/@karpathy", "https://karpathy.medium.com/"),
             ("http://x.org/blog/post-1", "https://www.x.org/blog/post-1/"),
             ("https://x.org/?utm_source=hn", "https://x.org/"),
+            // a segment under 8 letters or digits and no numeric id: an alias resolved (the latest post, the
+            // current docs), a short path, a search's own canonical; no segment: a bare search
+            ("https://blog.rust-lang.org/releases/latest/", "https://blog.rust-lang.org/2026/10/15/Rust-1.99.1"),
+            ("https://x.org/docs/latest", "https://x.org/docs/v2.1"),
+            ("https://x.org/a", "https://x.org/"),
+            ("https://html.duckduckgo.com/html/?q=rust", "https://duckduckgo.com/"),
+            ("https://duckduckgo.com/?q=rust", "https://duckduckgo.com/"),
             // A slug fixed beside its numeric id, at the same depth
             (
                 "https://stackoverflow.com/questions/26946646/wrong-slug",
@@ -1165,22 +1205,28 @@ mod tests {
             assert_eq!(redirected(url, fin), "", "{url} → {fin}");
         }
         let other = [
+            ("https://eur-lex.europa.eu/eli/reg/2021/821-annex", "https://eur-lex.europa.eu/TodayOJ/", "/TodayOJ"),
+            // a short segment whose numeric id (2+ all-digit segments) the landing drops: the page is lost
             ("https://eur-lex.europa.eu/eli/reg/2021/821", "https://eur-lex.europa.eu/TodayOJ/index.html", "/TodayOJ/"),
+            ("https://x.org/reg/2021/821", "https://x.org/b", "/b"),
             (
-                "https://old.reddit.com/r/fr/comments/1d/food/",
+                "https://old.reddit.com/r/fr/comments/1d/food_trucks/",
                 "https://old.reddit.com/login/?dest=https%3A%2F%2Fold.reddit.com%2Fr%2Ffr%2Fcomments%2F1d%2Ffood%2F",
                 "/login?dest",
             ),
-            ("https://www.youtube.com/@Brian", "https://consent.youtube.com/m?continue=x", "consent.youtube.com/m?"),
+            (
+                "https://www.youtube.com/@BrianWilson",
+                "https://consent.youtube.com/m?continue=x",
+                "consent.youtube.com/m?",
+            ),
             (
                 "https://cards.example/en/Singles/Base-Set/Charizard-V9",
                 "https://cards.example/en/Singles/Base-Set",
                 "/en/",
             ),
-            ("https://duckduckgo.com/?q=rust", "https://duckduckgo.com/", "· ! redirected"),
             // another id at the same depth, the same id one level up: another page
-            ("https://x.org/questions/26946646/a-b", "https://x.org/questions/31/a-c", "/questions/31/a-c"),
-            ("https://x.org/q/26946646/a-b", "https://x.org/q/26946646", "/q/26946646"),
+            ("https://x.org/questions/26946646/async-await", "https://x.org/questions/31/a-c", "/questions/31/a-c"),
+            ("https://x.org/q/26946646/async-await", "https://x.org/q/26946646", "/q/26946646"),
         ];
         for (url, fin, shown) in other {
             assert!(redirected(url, fin).contains(shown), "{url} → {fin}: {}", redirected(url, fin));
@@ -1238,7 +1284,7 @@ mod tests {
         assert_eq!(record_in(&doc, &Meta::default(), &[]), None);
         doc.sections[1].lines.push(text);
         let rec = record_in(&doc, &Meta::default(), &[]).unwrap_or_default();
-        assert!(rec.starts_with("#2 (page record) · "), "{rec}");
+        assert!(rec.starts_with("#2 · page record · "), "{rec}");
     }
 
     /// The thin pointer is the island PART holding the description's first 25 chars, never the biggest
@@ -1293,14 +1339,20 @@ mod tests {
                 "{f} {row}"
             );
         }
-        // an app page (`no_copy`): every `!` has a next step, the render at its price (was none)
+        // an app page (`no_copy`): every `!` has a next step, the render at its price
         let dead = Meta { code: "no_copy".into(), ..meta.clone() };
         let mut doc = thin_doc(&[("site", "Facebook")], "Facebook");
         let (f, row) = (flags(&pg(&doc, &dead)), page_flags(&pg(&doc, &dead)).remove(0).bang("u1"));
         // No own words, no island pointer (Instagram's longest prose string: a 107-char legal notice); the
         // render is the `no_copy` row's one next move, the `=` line has none
         assert_eq!(f, " · thin 10 of ~5.0k visible · ! no_copy");
-        assert!(row.ends_with(&format!("→ {b} u1 js:true ≤$0.0030 ~25s")), "{row}");
+        assert!(row.ends_with(&format!("→ {b} u1 js:true · bd, then oxyjs ≤$0.0030 ≈25s")), "{row}");
+        // a render tier the arrow names refused the URL (`fetch::settled`): the same ask is refused again, no arrow
+        let why = "400 url: value not supported".to_string();
+        let hop = HopRow { provider: "oxylabs-js".into(), code: "provider_error".into(), why, ..HopRow::default() };
+        let refused = Meta { hops: vec![hop], ..dead.clone() };
+        let row = page_flags(&pg(&doc, &refused)).remove(0).bang("u1");
+        assert!(!row.contains("js:true"), "{row}");
         // TikTok's card (`reg/u2` doc.json): no description, the site's title, the caption as the picture's
         // alt; the island part holding it, not the policy text (its longest prose string)
         doc.media = vec![crate::clean::Media::default()];
@@ -1362,9 +1414,8 @@ mod tests {
         }
     }
 
-    /// Review 2026-10-14 #7: a `!` names its next step. A JS render already spent, `thin` is a COUNT (`thin 10 of
-    /// ~2.5k visible`) and an og card is `og` + `(card only)` with no `! js_shell`; while the render is left, both
-    /// keep their `!` and its `→`.
+    /// A `!` names its next step. A JS render already spent, `thin` is a COUNT (`thin 10 of ~2.5k visible`) and an og
+    /// card is `og` + `(card only)` with no `! js_shell`; while the render is left, both keep their `!` and its `→`.
     #[test]
     fn no_bang_without_a_next_step() {
         let hop = |p: &str| crate::cache::HopRow { provider: p.into(), code: "js_shell".into(), ..Default::default() };
@@ -1383,8 +1434,8 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("(card only)")) && !lines[0].contains('!'), "{lines:?}");
     }
 
-    /// Review 2026-10-14 #8: `(whole page shown)` only when the page has no flag at all: an HTML parse cut short, a
-    /// failed fetch's best copy and a redirect never claim it.
+    /// `(whole page shown)` only when the page has no flag at all: an HTML parse cut short, a failed fetch's best copy
+    /// and a redirect never claim it.
     #[test]
     fn whole_page_claim_needs_no_flag() {
         let t = crate::html::parse("<title>T</title><p>text</p>");
@@ -1400,7 +1451,7 @@ mod tests {
             &ok
         ));
         assert!(!claims(&doc, &Meta { code: "thin_content".into(), ..Meta::default() }));
-        let moved = crate::clean::build_doc(&t, "https://x.io/a", "https://x.io/login", false);
+        let moved = crate::clean::build_doc(&t, "https://x.io/a-long-slug", "https://x.io/login", false);
         assert!(!claims(&moved, &ok));
     }
 

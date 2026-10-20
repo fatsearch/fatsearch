@@ -1,21 +1,30 @@
 //! CACHE: root, session, ids, cursor, URL index, global jobs, page snapshots.
+//! ```text
 //!   <root>/index.json                url → {dir, t}          (shared, flock)
 //!   <root>/jobs.json                 [{session, cmd, t}]     j<N> = N-th row, global monotonic (flock)
 //!   <root>/account.json              last `fats account` read: {t, rows: [Account]} (parsed numbers, no answers)
 //!   <root>/swept                     its mtime = the last sweep of every session (`sweep`)
+//!   <root>/pace/<host>               the home-IP brake: the last plain start to that host (`provider::pace`)
+//!   <root>/telemetry/                `ping/` day and week stamps · `days/` day marks · `week/` the weekly tally
+//!                                    (`bump`) · `latest.json` · `sent.jsonl` (`telemetry::at`); not in `usage`
 //!   <root>/<session>/state.json      {u: [{url, dir, alias?, job, serp?}], cursor}
 //!   <root>/<session>/u<N>/           raw.html · meta.json · doc.json (rebuilt from raw.html when stale)
 //!                                    · error.txt (0600): the providers' error answers, masked, never printed
-//!   <root>/<session>/u<N>/assets/   m<K>.<ext> + m<K>.json: picture K of the page, fetched on demand (`Asset`)
+//!   <root>/<session>/u<N>/assets/    m<K>.<ext> + m<K>.json: picture K of the page, fetched on demand (`Asset`)
 //!   <root>/<session>/j<N>/           meta.json of web search j<N> (hits inside) · error.txt; its results are `serp`
 //!                                    entries with no dir until a command fetches them into the same id
 //!   <root>/<session>/run/u<N>.*      a fetch that outlives its call (`Detached`): .json the run, .lock held by
 //!                                    its process, .log that process's stdout + stderr
+//!   <root>/<session>/run/setup-<p>.* the key form for provider p (`setup::run_file`): .json token, port, deadline;
+//!                                    .log its output
+//! ```
 
 use crate::clean::{DOC_V, Doc, build_doc};
 use crate::settings::limit;
+use chrono::Datelike;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -49,7 +58,7 @@ fn keep_error(dir: &Path, body: &[u8]) -> Result<(), String> {
 }
 
 /// The numbers in `dir`'s entries named `<prefix><N><suffix>` (`u3.json`, `j4`), smallest first; none when `dir`
-/// cannot be read. Replaces the two read-and-sort loops `runs` and `serps` had.
+/// cannot be read.
 fn numbered(dir: &Path, prefix: char, suffix: &str) -> Vec<usize> {
     let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
     let name = |e: fs::DirEntry| e.file_name().to_str()?.strip_prefix(prefix)?.strip_suffix(suffix)?.parse().ok();
@@ -71,10 +80,19 @@ pub fn jsave<T: Serialize>(p: &Path, v: &T) -> Result<(), String> {
 }
 
 /// Read-modify-write a shared root file under an exclusive lock.
-fn locked<T: DeserializeOwned + Serialize + Default, R>(p: &Path, f: impl FnOnce(&mut T) -> R) -> Result<R, String> {
+pub fn edit<T: DeserializeOwned + Serialize + Default, R>(p: &Path, f: impl FnOnce(&mut T) -> R) -> Result<R, String> {
+    edit_when(p, File::lock, f)
+}
+
+/// `edit` once `lock` takes the lock: `File::lock` waits for it, a `try_lock` gives up while another holds it.
+fn edit_when<T: DeserializeOwned + Serialize + Default, R>(
+    p: &Path,
+    lock: impl Fn(&File) -> std::io::Result<()>,
+    f: impl FnOnce(&mut T) -> R,
+) -> Result<R, String> {
     fs::create_dir_all(p.parent().ok_or("no parent dir")?).map_err(|e| format!("{}: {e}", p.display()))?;
-    let lock = File::create(p.with_extension("lock")).map_err(|e| e.to_string())?;
-    lock.lock().map_err(|e| e.to_string())?;
+    let file = File::create(p.with_extension("lock")).map_err(|e| e.to_string())?;
+    lock(&file).map_err(|e| e.to_string())?;
     let mut v: T = jload(p).unwrap_or_default();
     let r = f(&mut v);
     jsave(p, &v)?;
@@ -104,6 +122,13 @@ pub struct Entry {
     /// The parts of it read in this session (`#5`, `#5b`) and their text's keys (`=1f…`, read under any copy of the
     /// URL): a next move never points back at one.
     pub read: Vec<String>,
+}
+
+impl Entry {
+    /// Page `u`'s `=` line id read in its own session: `j3.u2` (the job that fetched it), else `u2`.
+    pub fn eq(&self, u: usize) -> String {
+        self.job.map_or_else(|| format!("u{u}"), |j| format!("j{j}.u{u}"))
+    }
 }
 
 /// Put `e` in slot `n` when it is a reserved id (`State::result`; keeping its job and `serp`), else append it:
@@ -153,8 +178,8 @@ pub struct Detached {
     /// The `← u3 l4` label of the page it fills.
     pub prov: Option<String>,
     pub job: usize,
-    /// What the command's earlier inputs spent (`cost:` caps the command).
-    pub spent: f64,
+    /// Its batch's `cost:` pool (`fetch::pooled`); None = a run alone.
+    pub pool: Option<PathBuf>,
     /// Queued behind run `by` of its lane: that run's process takes it after its own (`cli::launch`); 0 = none.
     pub by: usize,
     pub t: f64,
@@ -209,6 +234,10 @@ pub struct Meta {
     /// Where a bd ask landed by the page's same-site canonical link (`fetch::canonical`): `outline::lost_page`
     /// judges it; the links' base stays `final_url`.
     pub landed: Option<String>,
+    /// The page whose meta refresh plain followed (`provider::refresh`): the outline's `uN#0 info | refreshed
+    /// from: <url>` row, never judged; `lost_page` judges the target (`final_url`) as any landing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refreshed_from: Option<String>,
     pub provider: String,
     pub ms: u64,
     pub cost: f64,
@@ -251,6 +280,9 @@ pub struct HopRow {
     pub timeout_s: u64,
     pub limit: Option<u32>,
     pub remaining: Option<u32>,
+    /// Ms plain waited for its turn (the home-IP brake), apart from `ms`; none = no wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_ms: Option<u64>,
 }
 
 impl Meta {
@@ -259,10 +291,8 @@ impl Meta {
     /// view prints.
     /// `·fr` beside the serving tier when its exit country is not the default one (`oxyjs·fr`), else empty.
     pub fn geo(&self) -> String {
-        match self.country.to_uppercase() {
-            c if c.is_empty() || c == crate::provider::home() => String::new(),
-            c => format!("·{}", c.to_lowercase()),
-        }
+        let c = self.country.to_uppercase();
+        if c.is_empty() || c == crate::provider::home() { String::new() } else { format!("·{}", c.to_lowercase()) }
     }
 
     pub fn tried(&self) -> String {
@@ -275,29 +305,32 @@ impl Meta {
         // site block with no cost is one bd relayed (`provider::bd_refused`), a billed one shows its `$` above
         let unbilled = |c: &str| crate::provider::REFUSED.contains(&c) || matches!(c, "provider_timeout" | "abandoned");
         let geo = if shape { String::new() } else { self.geo() };
-        let hops: Vec<String> = self
-            .hops
-            .iter()
-            .map(|h| {
-                let (p, s) = (crate::provider::short(&h.provider), h.timeout_s);
-                let cc = if h.country.is_empty() { String::new() } else { format!("@{}", h.country) };
-                let p = if shape && s > 0 && p != "plain" { format!("{p}{cc}/{s}s") } else { p.to_string() };
-                match h.code.as_str() {
-                    // the exit country beside the tier only when it is not the default one (`oxyjs·fr✓`)
-                    "ok" => format!("{p}{geo}✓{}", h.why),
-                    // a site's 5xx Oxylabs relayed: billed by assumption (`provider::charged`, none reconciled)
-                    c if h.cost > 0.0 && c.starts_with("http_5") => format!("{p}:{c}✗${:.4} (assumed)", h.cost),
-                    // every billed hop shows its bill; a paid tier's unbilled failure says it cost nothing
-                    _ if h.cost > 0.0 => format!("{p}:{}✗${:.4}", h.code, h.cost),
-                    // a call we cut: the provider may finish and bill it (bd billed 15 s search cuts)
-                    _ if h.upto > 0.0 => format!("{p}:{}✗≤${:.4} (unverified)", h.code, h.upto),
-                    c if p != "plain" && (unbilled(c) || c.starts_with("http_5") || c.starts_with("blocked_")) => {
-                        format!("{p}:{c}✗$0 (not charged)")
-                    }
-                    _ => format!("{p}:{}✗", h.code),
+        let hop = |h: &HopRow| {
+            let (p, s) = (crate::provider::short(&h.provider), h.timeout_s);
+            let cc = if h.country.is_empty() { String::new() } else { format!("@{}", h.country) };
+            let p = if shape && s > 0 && p != "plain" { format!("{p}{cc}/{s}s") } else { p.to_string() };
+            match h.code.as_str() {
+                // the exit country beside the tier only when it is not the default one (`oxyjs·fr✓`)
+                "ok" => format!("{p}{geo}✓{}", h.why),
+                // a site's 5xx Oxylabs relayed: billed by assumption (`provider::charged`, none reconciled)
+                c if h.cost > 0.0 && c.starts_with("http_5") => format!("{p}:{c}✗${:.4} (assumed)", h.cost),
+                // every billed hop shows its bill; a paid tier's unbilled failure says it cost nothing
+                _ if h.cost > 0.0 => format!("{p}:{}✗${:.4}", h.code, h.cost),
+                // a call we cut: the provider may finish and bill it (bd billed 15 s search cuts)
+                _ if h.upto > 0.0 => format!("{p}:{}✗≤${:.4} (unverified)", h.code, h.upto),
+                // `stats` adds the provider's own reason (`provider::reason`, ≤ 50 chars, no body text)
+                c if p != "plain" && (unbilled(c) || c.starts_with("http_5") || c.starts_with("blocked_")) => {
+                    let why = if shape && c == "provider_error" && !h.why.is_empty() {
+                        format!(", {}", h.why)
+                    } else {
+                        String::new()
+                    };
+                    format!("{p}:{c}✗$0 (not charged{why})")
                 }
-            })
-            .collect();
+                _ => format!("{p}:{}✗", h.code),
+            }
+        };
+        let hops: Vec<String> = self.hops.iter().map(hop).collect();
         if hops.is_empty() { "-".into() } else { hops.join(" ") }
     }
 
@@ -306,10 +339,12 @@ impl Meta {
         crate::provider::spend(self.hops.iter().map(|h| h.upto))
     }
 
-    /// ` · hedge:off` when a paid ask ran one provider at a time (`fetch::Plan::hedged`): the one format `=` and
-    /// `stats` print.
-    pub fn hedge_off(&self) -> &'static str {
-        if self.hedge == "off" { " · hedge:off" } else { "" }
+    /// How the run went besides its tiers, the one format `=` and `stats` print: ` · hedge:off` when a paid ask
+    /// ran one provider at a time (`fetch::Plan::hedged`), ` · waited 7.6s` when plain waited for its turn.
+    pub fn how(&self) -> String {
+        let waited = self.hops.iter().filter_map(|h| h.waited_ms).sum::<u64>() as f64 / 1e3;
+        let waited = if waited > 0.0 { format!(" · waited {waited:.1}s") } else { String::new() };
+        if self.hedge == "off" { " · hedge:off" } else { "" }.to_string() + &waited
     }
 }
 
@@ -439,8 +474,8 @@ pub fn sweep() {
     let gone = |d: &str| inside(d).is_none_or(|d| expired(&root.join(d)));
     let jobs = all.then(|| {
         let idx = |i: &mut Map<String, Value>| i.retain(|_, r| !gone(r["dir"].as_str().unwrap_or_default()));
-        locked(&root.join("index.json"), idx).ok();
-        locked(&root.join("jobs.json"), |js: &mut Vec<Job>| {
+        edit(&root.join("index.json"), idx).ok();
+        edit(&root.join("jobs.json"), |js: &mut Vec<Job>| {
             js.iter_mut().filter(|j| now() - j.t >= limit::<f64>("cache_ttl_s")).for_each(|j| j.cmd.clear());
             js.iter().map(|j| j.cmd.is_empty()).collect::<Vec<_>>()
         })
@@ -465,7 +500,7 @@ pub fn sweep() {
         }
         if let Some(Ok(js)) = &jobs {
             let old = |e: &&mut Entry| e.job.and_then(|j| js.get(j.checked_sub(1)?)) != Some(&false) && gone(&e.dir);
-            locked(&session.join("state.json"), |st: &mut State| st.u.iter_mut().filter(old).for_each(forget)).ok();
+            edit(&session.join("state.json"), |st: &mut State| st.u.iter_mut().filter(old).for_each(forget)).ok();
         }
     }
 }
@@ -473,6 +508,20 @@ pub fn sweep() {
 pub fn url_key(url: &str) -> &str {
     let u = crate::html::py_strip(url);
     u.split('#').next().unwrap_or(u)
+}
+
+/// The detached run in file `json` (`Cache::run_file`) and whether it lives, THE liveness rule (a pending id,
+/// status, a batch pool's floor): its lock is held. The launcher takes it before the run file exists and hands it
+/// to the run's process (`Cache::run_claim`), so a run not scheduled yet lives too (a 2 s pid-0 window read
+/// `! abandoned` under load). The lock is probed BEFORE the file is read: a process that wrote `done` and let go
+/// reads as ended with it. A queued run lives while its lane's process does (the lock of the run it is queued
+/// behind, `by`).
+pub fn run_at(json: &Path) -> Option<(Detached, bool)> {
+    let held = |at: PathBuf| matches!(File::open(at).map(|f| f.try_lock()), Ok(Err(fs::TryLockError::WouldBlock)));
+    let own = held(json.with_extension("lock"));
+    let r: Detached = jload(json)?;
+    let alive = own || (r.by > 0 && r.done.is_none() && held(json.with_file_name(format!("u{}.lock", r.by))));
+    Some((r, alive))
 }
 
 impl Cache {
@@ -498,7 +547,7 @@ impl Cache {
     /// A cursor this command moved is kept (a search's list, then its prefetch's `alloc`), else the file's.
     fn with_state<R>(&mut self, f: impl FnOnce(&mut State) -> R) -> Result<R, String> {
         let moved = (self.st.cursor != self.cursor0).then(|| self.st.cursor.clone());
-        let (r, st) = locked(&self.root.join(&self.session).join("state.json"), |st: &mut State| {
+        let (r, st) = edit(&self.root.join(&self.session).join("state.json"), |st: &mut State| {
             st.cursor = moved.unwrap_or_else(|| st.cursor.take());
             st.t = st.t.or(Some(now())); // the session's start: its first write, before anything it spends is stored
             let r = f(st);
@@ -517,22 +566,13 @@ impl Cache {
         self.root.join(&self.session).join("run").join(format!("u{n}.{ext}"))
     }
 
-    pub fn run_put(&self, n: usize, r: &Detached) -> Result<(), String> {
-        jsave(&self.run_file(n, "json"), r)
+    /// Detached run `n` and whether it lives (`run_at`).
+    pub fn run(&self, n: usize) -> Option<(Detached, bool)> {
+        run_at(&self.run_file(n, "json"))
     }
 
-    /// Detached run `n` and whether it lives, THE liveness rule (a pending id, status): its lock is held. The
-    /// launcher takes it before the run file exists and hands it to the run's process (`run_claim`), so a run not
-    /// scheduled yet lives too (a 2 s pid-0 window read `! abandoned` under load).
-    /// The lock is probed BEFORE the file is read: a process that wrote `done` and let go reads as ended with it.
-    /// A queued run lives while its lane's process does (the lock of the run it is queued behind, `by`).
-    pub fn run(&self, n: usize) -> Option<(Detached, bool)> {
-        use fs::TryLockError::WouldBlock;
-        let held = |n| matches!(File::open(self.run_file(n, "lock")).map(|f| f.try_lock()), Ok(Err(WouldBlock)));
-        let own = held(n);
-        let r: Detached = jload(&self.run_file(n, "json"))?;
-        let alive = own || (r.by > 0 && r.done.is_none() && held(r.by));
-        Some((r, alive))
+    pub fn run_put(&self, n: usize, r: &Detached) -> Result<(), String> {
+        jsave(&self.run_file(n, "json"), r)
     }
 
     /// Run `n`'s end was shown (`cli::footer`): written under its lock, read again there; a busy lock = it runs
@@ -550,9 +590,9 @@ impl Cache {
         found.into_iter().filter_map(|n| self.run(n).map(|(r, a)| (n, r, a))).collect()
     }
 
-    /// Run `n`'s lock, taken by its launcher (`cli::launch`) and handed to the run (`cli::detach`: the process's
-    /// stdin, so held until it ends; a reader's probe only delays it). Its log (`run_file(n, "log")`) takes the
-    /// process's stdout + stderr.
+    /// Run `n`'s lock, taken by its launcher (`cli::launch`) and handed to the run (`cli::detach`: the process's stdin,
+    /// so held until it ends; on Windows the launcher keeps it and the run takes it again; a reader's probe only delays
+    /// it). Its log (`run_file(n, "log")`) takes the process's stdout + stderr.
     pub fn run_claim(&self, n: usize) -> Option<File> {
         let p = self.run_file(n, "lock");
         fs::create_dir_all(p.parent()?).ok()?;
@@ -563,17 +603,13 @@ impl Cache {
 
     /// Persist the cursor if this command moved it (read-only commands write nothing).
     pub fn save(&mut self) -> Result<(), String> {
-        if self.st.cursor == self.cursor0 {
-            return Ok(());
-        }
-        self.with_state(|_| ())
+        if self.st.cursor == self.cursor0 { Ok(()) } else { self.with_state(|_| ()) }
     }
 
     /// Log a part of `u<n>` as read (`Entry::read`): its id tail (`#2ft`) and its text's key (`outline::part_key`).
     pub fn read_mark(&mut self, n: usize, read: &[String]) -> Result<(), String> {
         let new = |e: &Entry| read.iter().filter(|t| !e.read.contains(t)).cloned().collect::<Vec<_>>();
-        self.with_state(|st| st.u.get_mut(n - 1).map(|e| e.read.extend(new(e))))?;
-        Ok(())
+        self.with_state(|st| st.u.get_mut(n - 1).map(|e| e.read.extend(new(e)))).map(|_| ())
     }
 
     /// Append entries (or fill `slot`, see `place`): the first one's 1-based u number, unique even with parallel
@@ -590,8 +626,9 @@ impl Cache {
     pub fn serp_put(&self, job: usize, meta: &Meta, error: Option<&[u8]>) -> Result<(), String> {
         let dir = self.root.join(&self.session).join(format!("j{job}"));
         jsave(&dir.join("meta.json"), meta)?; // a failed search stores no ids: it starts the session (`State::t`)
-        locked(&self.root.join(&self.session).join("state.json"), |st: &mut State| st.t = st.t.or(Some(now())))?;
+        edit(&self.root.join(&self.session).join("state.json"), |st: &mut State| st.t = st.t.or(Some(now())))?;
         spend_log([meta.cost, meta.upto()], &dir);
+        tally(&self.root, meta, None);
         error.map_or(Ok(()), |e| keep_error(&dir, e))
     }
 
@@ -630,7 +667,7 @@ impl Cache {
             return Ok(j);
         }
         let (session, cmd) = (self.session.clone(), cmd.to_string());
-        let j = locked(&self.root.join("jobs.json"), |jobs: &mut Vec<Job>| {
+        let j = edit(&self.root.join("jobs.json"), |jobs: &mut Vec<Job>| {
             jobs.push(Job { session, cmd, t: now() });
             jobs.len()
         })?;
@@ -660,7 +697,8 @@ impl Cache {
         let Some(d) = self.dir(e) else {
             return (Meta { url: e.url.clone(), ok: true, ..Meta::default() }, Err(NoDoc::Missing));
         };
-        File::open(&d).and_then(|f| f.set_modified(SystemTime::now())).ok(); // a read keeps it (`expired`)
+        // a read keeps it (`expired`); by path: Windows sets a folder's time only through a handle `File::open` lacks
+        fs::set_times(&d, fs::FileTimes::new().set_modified(SystemTime::now())).ok();
         let meta: Meta = jload(&d.join("meta.json")).unwrap_or_default();
         let current = |x: &Doc| x.v == DOC_V && x.chunk == crate::settings::get().chunk.value;
         if let Some(doc) = jload::<Doc>(&d.join("doc.json")).filter(current) {
@@ -674,13 +712,9 @@ impl Cache {
         let url = if meta.url.is_empty() { e.url.clone() } else { meta.url.clone() };
         let fin = meta.final_url.clone().unwrap_or_else(|| url.clone());
         let kind = crate::clean::sniff(&raw).unwrap_or(&meta.kind);
-        match build(&raw, &url, &fin, meta.render == Some(true), kind) {
-            Ok(doc) => {
-                jsave(&d.join("doc.json"), &doc).ok(); // a read-only cache still serves the page
-                (meta, Ok(doc))
-            }
-            Err(x) => (meta, Err(NoDoc::Parse(x))),
-        }
+        // a read-only cache still serves the page
+        let doc = build(&raw, &url, &fin, meta.render == Some(true), kind).map_err(NoDoc::Parse);
+        (meta, doc.inspect(|x| drop(jsave(&d.join("doc.json"), x))))
     }
 
     /// Store a fetched/local body as the next u of this session (or in `Snap::slot`). The snapshot is written to a
@@ -700,43 +734,31 @@ impl Cache {
         let tmp = sdir.join(format!(".tmp-{}-{job}-{seq}", std::process::id()));
         fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
         let staged = (|| {
-            if let Some((name, raw)) = file {
-                fs::write(tmp.join(name), raw).map_err(|e| e.to_string())?;
-            }
-            if let Some(e) = error {
-                keep_error(&tmp, e)?;
-            }
-            if let Some(doc) = doc {
-                jsave(&tmp.join("doc.json"), doc)?;
-            }
+            file.map_or(Ok(()), |(name, raw)| fs::write(tmp.join(name), raw).map_err(|e| e.to_string()))?;
+            error.map_or(Ok(()), |e| keep_error(&tmp, e))?;
+            doc.map_or(Ok(()), |doc| jsave(&tmp.join("doc.json"), doc))?;
             // a time no one measured (a hop's, the fetch's) = the time since the command started
             let ms = t0.elapsed().as_millis() as u64;
             let times = meta.hops.iter_mut().map(|h| &mut h.ms).chain([&mut meta.ms]);
             times.filter(|m| **m == 0).for_each(|m| *m = ms);
             jsave(&tmp.join("meta.json"), &meta)
         })();
-        if let Err(e) = staged {
-            fs::remove_dir_all(&tmp).ok(); // our own temp dir, never a snapshot
-            return Err(e);
-        }
+        staged.inspect_err(|_| drop(fs::remove_dir_all(&tmp)))?; // our own temp dir, never a snapshot
         let (session, url, root) = (self.session.clone(), meta.url.clone(), self.root.clone());
         let placed = self.with_state(|st| -> Result<(usize, String), String> {
             let free = slot.filter(|&n| st.result(n).is_some());
             let n = free.unwrap_or(st.u.len() + 1);
-            let rel = (1..)
-                .map(|k| if k == 1 { format!("{session}/u{n}") } else { format!("{session}/u{n}-{k}") })
-                .find(|r| !root.join(r).exists())
-                .unwrap_or_default();
+            let name = |k| if k == 1 { format!("{session}/u{n}") } else { format!("{session}/u{n}-{k}") };
+            let rel = (1..).map(name).find(|r| !root.join(r).exists()).unwrap_or_default();
             fs::rename(&tmp, root.join(&rel)).map_err(|e| e.to_string())?;
             place(st, Entry { url, dir: rel.clone(), job: Some(job), ..Entry::default() }, free);
             Ok((n, rel))
         })?;
-        let (n, rel) = placed.inspect_err(|_| {
-            fs::remove_dir_all(&tmp).ok();
-        })?;
+        let (n, rel) = placed.inspect_err(|_| drop(fs::remove_dir_all(&tmp)))?;
         spend_log([meta.cost, meta.upto()], &self.root.join(&rel));
+        tally(&self.root, &meta, doc.map(|d| d.tokens.clean));
         if let Some(key) = index {
-            locked(&self.root.join("index.json"), |idx: &mut Map<String, Value>| {
+            edit(&self.root.join("index.json"), |idx: &mut Map<String, Value>| {
                 idx.insert(url_key(key).into(), serde_json::json!({"dir": rel, "t": now()}));
             })?;
         }
@@ -774,13 +796,15 @@ pub fn guarded(run: impl FnOnce() -> Result<Doc, String>) -> Result<Doc, String>
 
 /// Bytes under the root, the pictures among them (`assets/`), every live snapshot's meta.json path (`expired`:
 /// the sweep's rule, so a dead copy counts in no health row), all sessions (status: size, pages, provider health).
+/// Telemetry's `telemetry/` (its stamps, day marks and the weekly tally `Week`) is no cached page: a command's own
+/// count never changes the next's status.
 pub fn usage(root: &Path) -> (u64, u64, Vec<PathBuf>) {
-    fn walk(p: &Path, acc: &mut (u64, u64, Vec<PathBuf>)) {
+    fn walk(p: &Path, acc: &mut (u64, u64, Vec<PathBuf>), top: bool) {
         let Ok(rd) = fs::read_dir(p) else { return };
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
-                walk(&e.path(), acc);
+                (!top || e.file_name() != "telemetry").then(|| walk(&e.path(), acc, false));
             } else if let Ok(m) = e.metadata() {
                 acc.0 += m.len();
                 acc.1 += if p.ends_with("assets") { m.len() } else { 0 };
@@ -791,8 +815,91 @@ pub fn usage(root: &Path) -> (u64, u64, Vec<PathBuf>) {
         }
     }
     let mut acc = (0, 0, Vec::new());
-    root.join(MINE).is_file().then(|| walk(root, &mut acc)); // never a dir fats did not make (`/`, a home)
+    root.join(MINE).is_file().then(|| walk(root, &mut acc, true)); // never a dir fats did not make (`/`, a home)
     acc
+}
+
+/// The weekly tally the usage summary is built from (`stats::weekly`): counts, codes and fixed names only, one file a
+/// week (`<cache>/telemetry/week/2026-W43.json`, this week's and last week's kept). Sessions are swept within the hour,
+/// so it counts as things happen: a stored fetch or search (`tally`), a command (`stats::tally_run`), a panic
+/// (`stats::crash`).
+/// `n` = each counter by its path in the summary (`tier\toxyjs\tok`), `samples` = the last `week_samples` of each
+/// `tok\tpage` (a stored page's clean tokens), `tok\tread` (a read's answer), `ms\tplain`, `ms\tpaid` (a page call
+/// that served).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct Week {
+    pub n: BTreeMap<String, u64>,
+    pub samples: BTreeMap<String, Vec<u64>>,
+}
+
+impl Week {
+    pub fn add(&mut self, path: &[&str], by: bool) {
+        by.then(|| *self.n.entry(path.join("\t")).or_default() += 1);
+    }
+
+    pub fn sample(&mut self, path: &str, x: u64) {
+        let v = self.samples.entry(path.into()).or_default();
+        v.push(x);
+        v.drain(..v.len().saturating_sub(crate::settings::limit("week_samples")));
+    }
+}
+
+pub const WEEK_S: f64 = 604_800.0;
+/// `2026-W43`: the ISO week of unix time `t`.
+pub fn week_of(t: f64) -> String {
+    let w = chrono::DateTime::from_timestamp(t as i64, 0).unwrap_or_default().date_naive().iso_week();
+    format!("{}-W{:02}", w.year(), w.week())
+}
+
+/// Add to this week's tally (`<root>/telemetry/week/`), at level `full` only (a count made under an opt-out would go
+/// once it is lifted), under its lock as `lock` takes it (`edit_when`); a week's first write drops every older file
+/// but last week's. A count fats cannot write is lost, never a failed command.
+pub fn bump(root: &Path, lock: impl Fn(&File) -> std::io::Result<()>, f: impl FnOnce(&mut Week)) {
+    let full = crate::telemetry::level() == crate::telemetry::Level::Full;
+    let (week, last, dir) = (week_of(now()), week_of(now() - WEEK_S), root.join("telemetry").join("week"));
+    let p = dir.join(format!("{week}.json"));
+    let keep = |e: &std::fs::DirEntry| [&week, &last].iter().any(|w| e.file_name().to_string_lossy().starts_with(*w));
+    let old = std::fs::read_dir(&dir).into_iter().flatten().flatten().filter(|e| full && !p.is_file() && !keep(e));
+    old.for_each(|e| drop(std::fs::remove_file(e.path())));
+    full.then(|| edit_when(&p, lock, f).ok());
+}
+
+/// A code as counted: one errors.json names (`js_shell`; a `*` row's prefix + digits: `http_404`), else `other`.
+pub fn code_of(c: &str) -> String {
+    let digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    let hit = |k: &&str| k.strip_suffix('*').map_or(*k == c, |p| c.strip_prefix(p).is_some_and(digits));
+    crate::lang::FIX.iter().map(|r| r.0).find(hit).map_or("other".into(), |_| c.into())
+}
+
+/// Count a stored fetch or search record (`cache::ingest`, `cache::serp_put`): its calls per tier (a call cut
+/// after the other provider won is neither ok nor failed) and paid provider, each failed call's code and the
+/// record's own when no call ended with it (`no_key`), the serving page call's ms, the page's clean tokens
+/// (`tok`), a PDF. No URL, no query: every name comes from our tables.
+pub fn tally(root: &Path, m: &Meta, tok: Option<usize>) {
+    let serp = m.kind == "serp";
+    bump(root, File::lock, |w| {
+        for h in &m.hops {
+            let t = crate::provider::Tier::parse(&h.provider);
+            let Some(short) = t.map(|t| t.spec().short).or((h.provider == "gh").then_some("gh")) else { continue };
+            let (ok, failed) = (h.code == "ok", !matches!(h.code.as_str(), "ok" | "abandoned"));
+            let tier = if serp { format!("{short}_search") } else { short.into() };
+            for (k, by) in [("ok", ok), ("fail", failed), ("billed", h.cost > 0.0), ("upto", h.upto > 0.0)] {
+                w.add(&["tier", &tier, k], by);
+            }
+            w.add(&["codes", &code_of(&h.code)], failed);
+            let paid = t.filter(|t| *t != crate::provider::Tier::Plain).map(crate::provider::Tier::switch);
+            w.add(&["provider", paid.unwrap_or_default(), if serp { "search" } else { "calls" }], paid.is_some());
+            let ms = if t == Some(crate::provider::Tier::Plain) { "ms\tplain" } else { "ms\tpaid" };
+            (ok && !serp).then(|| w.sample(ms, h.ms));
+        }
+        w.add(&["codes", &code_of(&m.code)], !m.ok && !m.code.is_empty() && !m.hops.iter().any(|h| h.code == m.code));
+        let served =
+            crate::provider::Tier::parse(&m.provider).filter(|t| m.ok && !serp && *t != crate::provider::Tier::Plain);
+        w.add(&["provider", served.map(crate::provider::Tier::switch).unwrap_or_default(), "served"], served.is_some());
+        tok.into_iter().for_each(|n| w.sample("tok\tpage", n as u64));
+        w.add(&["cmd", "pdf"], m.kind == "pdf");
+    });
 }
 
 #[cfg(test)]
@@ -803,8 +910,8 @@ mod tests {
     /// back without `done` (`! abandoned` from then on). `told` is now written under the run's lock, read again.
     #[test]
     fn a_run_is_told_under_its_lock() {
-        let root = std::env::temp_dir().join(format!("fats-tell-{}", std::process::id()));
-        let c = Cache::at(root.clone(), "t".into());
+        let root = crate::scratch::Scratch::new("tell");
+        let c = Cache::at(root.to_path_buf(), "t".into());
         let ended = Detached { url: "https://ex.com/".into(), done: Some(Done::default()), ..Detached::default() };
         c.run_put(1, &ended).expect("run file");
         let lock = c.run_claim(1).expect("the run's lock");
@@ -814,19 +921,17 @@ mod tests {
         drop(lock);
         c.run_tell(1);
         assert!(c.run(1).is_some_and(|r| r.0.told && r.0.done.is_some() && !r.1), "free: told, its done kept");
-        std::fs::remove_dir_all(root).ok();
     }
 
     /// A run queued behind another (`by`) lives while that one's process holds its lock, and ends with it.
     #[test]
     fn a_queued_run_lives_with_its_lane() {
-        let root = std::env::temp_dir().join(format!("fats-lane-{}", std::process::id()));
-        let c = Cache::at(root.clone(), "t".into());
+        let root = crate::scratch::Scratch::new("lane");
+        let c = Cache::at(root.to_path_buf(), "t".into());
         let lock = c.run_claim(1).expect("the lane's lock");
         c.run_put(2, &Detached { url: "https://ex.com/b".into(), by: 1, ..Detached::default() }).expect("run file");
         assert!(c.run(2).is_some_and(|r| r.1), "queued: alive");
         drop(lock);
         assert!(c.run(2).is_some_and(|r| !r.1), "its lane died: abandoned");
-        std::fs::remove_dir_all(root).ok();
     }
 }

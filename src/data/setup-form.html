@@ -1,0 +1,22 @@
+HTTP/1.1 {code}
+Content-Type: text/html; charset=utf-8
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'
+Cache-Control: no-store
+Connection: close
+Content-Length: {len}
+
+<!-- -->
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width"><title>fats setup · {name}</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;background:#f6f6f4;color:#222;margin:0;display:grid;place-items:center;min-height:100vh}
+.c{background:#fff;border-radius:14px;box-shadow:0 2px 20px #0001;padding:32px 36px;max-width:460px;width:90%}
+h1{font-size:20px;margin:0 0 16px}a{color:#0a66c2;word-break:break-all}.f{color:#999;font-size:13px;margin-top:20px}
+input,select{width:100%;box-sizing:border-box;font:inherit;padding:10px 12px;border:1px solid #ccc;border-radius:8px;margin:6px 0 14px}
+button{font:inherit;background:#111;color:#fff;border:0;border-radius:8px;padding:10px 18px}.ok{font-size:40px;color:#1a7f37}
+.bad{color:#c62828;background:#fdecea;padding:10px 12px;border-radius:8px}</style>
+<div class=c><h1>fats setup · {name}</h1>{body}<p class=f>This page runs on your computer only (127.0.0.1) and closes after one key. The key is saved on this machine and never sent to fatsearch.</p></div>
+<!-- -->
+<ol><li>Open <a href="{mint}" target=_blank rel=noreferrer>{mint}</a> (no account yet: <a href="{signup}" target=_blank rel=noreferrer>register</a>)</li>
+<li>{step}.</li><li>Paste it here and press Save.</li></ol>{err}
+<form method=post action="{save}"><input name=key type=password autocomplete=off autofocus placeholder="paste the key"><button>Save</button></form>
+<!-- -->
+<p class=ok>✓</p><p>{what}.</p><p>You can close this tab.</p>

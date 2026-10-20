@@ -1,0 +1,42 @@
+{bold}fats{/} (FATSEARCH) · read any web page, PDF or search result as small clean text for your AI agent.
+
+{bold}USAGE{/}
+  fats <what> [words] [options]
+
+{bold}READ{/}
+  fats <url>               {dim}fetch a page → outline with numbered parts{/}
+  fats <file>              {dim}same for a local PDF, HTML or text file{/}
+  fats u1#3                {dim}read part 3 of page u1{/}
+  fats u1 price            {dim}lines with “price” on page u1{/}
+  fats u1 links            {dim}the page's links (also: media){/}
+  fats stats               {dim}every page you read: provider, time, cost{/}
+
+{bold}SEARCH{/}
+  fats <words>             {dim}web search → results you open by id{/}
+  fats gh <words>          {dim}GitHub repositories by stars{/}
+
+{bold}ACCOUNT{/}
+  fats setup               {dim}add provider keys (Oxylabs, Bright Data, Decodo){/}
+  fats account             {dim}balance and usage at each provider{/}
+  fats config              {dim}every setting and where it comes from{/}
+
+{bold}OPTIONS  (key:value after the command){/}
+  js:true                  {dim}render JavaScript (paid){/}
+  country:de               {dim}fetch as if from Germany{/}
+  fresh:true               {dim}skip the cache{/}
+  wait:30                  {dim}wait up to 30 s, then answer “pending”{/}
+  dry:true                 {dim}show what would run and cost, spend nothing{/}
+
+{bold}FOR AGENTS{/}
+  fats mcp                 {dim}the agent connection (how: fats help mcp){/}
+  fats guide               {dim}how to use it well: the guide agents read{/}
+  fats status              {dim}the technical status{/}
+
+{bold}EXAMPLES{/}
+  $ fats news.ycombinator.com
+  $ fats u1#2
+  $ fats rust async runtime site:github.com
+
+{bold}LEARN MORE{/}
+  fats help <topic>        {dim}setup · mcp · search{/}
+  https://fatsearch.com

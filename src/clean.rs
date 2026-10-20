@@ -235,11 +235,9 @@ pub fn decode(raw: Vec<u8>, header: Option<&str>) -> (Vec<u8>, &'static str) {
         Some(e) if e == X_USER_DEFINED => Some(WINDOWS_1252),
         e => e,
     };
-    let enc = Encoding::for_bom(&raw)
-        .map(|b| b.0)
-        .or_else(|| header.and_then(|h| Encoding::for_label(h.as_bytes())))
-        .or_else(meta)
-        .unwrap_or(UTF_8);
+    let bom = Encoding::for_bom(&raw).map(|b| b.0);
+    let sent = header.and_then(|h| Encoding::for_label(h.as_bytes()));
+    let enc = bom.or(sent).or_else(meta).unwrap_or(UTF_8);
     let name = if enc == UTF_8 { "" } else { enc.name() };
     if enc == UTF_8 && !raw.starts_with(b"\xEF\xBB\xBF") {
         return (raw, name);
@@ -274,17 +272,16 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// (`<!doctype html` or `<html` in its first 1 KB) or a type that says HTML is `html`. Then the text documents:
 /// a JSON type, or a body that parses as JSON, is `json`; an XML type (RSS, Atom), or a body that opens with
 /// `<?xml`, `<rss`, `<feed`, `<urlset`, `<sitemapindex`, is `xml`; a `text/markdown` type is `md` (a server's own
-/// conversion of its page, `text::markdown`); any other `text/*` type (plain, CSV) is `text`. Anything else is `html`, the page path.
+/// conversion of its page, `text::markdown`); any other `text/*` type (plain, CSV) is `text`. Anything else is `html`,
+/// the page path.
 pub fn kind_of(ctype: &str, body: &[u8]) -> &'static str {
-    if let Some(k) = sniff(body) {
-        return k;
-    }
     let ct = ctype.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
     let head = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body).trim_ascii_start();
     let low = head[..head.len().min(1024)].to_ascii_lowercase();
     let opens = |tags: &[&[u8]]| tags.iter().any(|t| low.starts_with(t));
     let bare = ct.is_empty() || ct == "text/plain";
     match () {
+        _ if let Some(k) = sniff(body) => k,
         _ if ct.contains("application/pdf") => "pdf",
         _ if ct.contains("application/zip") || ct.contains("officedocument") => "zip",
         _ if ct.contains("html") || opens(&[b"<!doctype html"]) || find(&low, b"<html").is_some() => "html",
@@ -402,27 +399,21 @@ impl Render<'_> {
         if self.tlen[id] as f64 > 0.5 * self.tlen[0].max(1) as f64 {
             return false;
         }
-        let role = n.attr("role").unwrap_or("").to_lowercase();
-        if matches!(n.tag.as_str(), "nav" | "aside" | "form")
-            || matches!(role.as_str(), "navigation" | "banner" | "contentinfo")
-        {
-            return true;
-        }
-        if (n.tag == "header" || n.tag == "footer") && !scoped {
+        let (role, tag) = (n.attr("role").unwrap_or("").to_lowercase(), n.tag.as_str());
+        let nav = matches!(role.as_str(), "navigation" | "banner" | "contentinfo");
+        if nav || matches!(tag, "nav" | "aside" | "form") || (!scoped && matches!(tag, "header" | "footer")) {
             return true;
         }
         let cid = format!("{} {}", n.attr("id").unwrap_or(""), n.attr("class").unwrap_or("")).to_lowercase();
-        if LISTS.cookie.iter().any(|w| cid.contains(w)) {
-            return true;
-        }
-        self.mode == Mode::Clean && (n.tag == "dialog" || role.ends_with("dialog") || hidden(n, self.tlen[id]))
+        LISTS.cookie.iter().any(|w| cid.contains(w))
+            || self.mode == Mode::Clean && (tag == "dialog" || role.ends_with("dialog") || hidden(n, self.tlen[id]))
     }
 
     /// A nested thread's comments → their depth, by structure. A block = `li`, `article` or a custom element (a `-`
     /// in its tag). The comments' tag = the commonest tag of the blocks that are the nearest block of a paragraph (a
     /// text of their own) above a served `<time>` (a sidebar card, the post: another tag). A comment = the nearest
-    /// ancestor of that tag of a served `<time>`, a short one too; one inside a list item of another tag is that item (the
-    /// replies beside it: `li > article + ol > li`); the top ones share their parent. Its depth = the comments
+    /// ancestor of that tag of a served `<time>`, a short one too; one inside a list item of another tag is that item
+    /// (the replies beside it: `li > article + ol > li`); the top ones share their parent. Its depth = the comments
     /// around it, or a spacer row's (below), clamped at `thread_depth` when rendered (`walk`).
     fn comments(&self) -> HashMap<usize, usize> {
         let t = self.tree;
@@ -490,7 +481,7 @@ impl Render<'_> {
     }
 
     /// Two numbers in two elements stay two: a space between a digit and a digit at an element boundary
-    /// (`$109.72` `0.24%` was served `$109.720.24%`; numbers spike verdict 4).
+    /// (`$109.72` `0.24%`, never `$109.720.24%`).
     fn push(&mut self, s: &str) {
         let gap = self.buf.ends_with(is_digit) && s.starts_with(is_digit);
         self.buf.push_str(if gap { " " } else { "" });
@@ -506,9 +497,7 @@ impl Render<'_> {
         let t = collapse(&self.buf);
         self.buf.clear();
         self.marks.clear();
-        if !t.is_empty() && t != "-" && t != "|" && t != "- |" {
-            self.lines.push(Line::T(t));
-        }
+        self.lines.extend((!t.is_empty() && t != "-" && t != "|" && t != "- |").then_some(Line::T(t)));
     }
 
     fn link(&mut self, href: &str, text: &str) -> Option<usize> {
@@ -648,9 +637,7 @@ impl Render<'_> {
         if self.mode != Mode::Light && self.chrome(id, scoped) {
             return;
         }
-        if matches!(tag, "img" | "video") {
-            self.media.push(id);
-        }
+        self.media.extend(matches!(tag, "img" | "video").then_some(id));
         let role = n.attr("role").unwrap_or("").to_lowercase();
         let scoped = scoped || LISTS.sectioning.contains(&tag) || LISTS.sectioning_roles.contains(&role.as_str());
         let top = self.inline == 0;
@@ -686,9 +673,7 @@ impl Render<'_> {
     fn heading(&mut self, id: usize, scoped: bool, level: usize) {
         self.flush();
         let t = self.text_of(id, scoped);
-        if !t.is_empty() {
-            self.lines.push(Line::H(level, t));
-        }
+        self.lines.extend((!t.is_empty()).then_some(Line::H(level, t)));
     }
 
     /// A table row: `| cell | cell |`. A layout row (a cell holds a table, shown) is its cells' blocks.
@@ -701,20 +686,16 @@ impl Render<'_> {
         let td = |&c: &usize| matches!(tree.nodes[c].tag.as_str(), "td" | "th");
         let td = tree.nodes[id].kids.iter().filter_map(Kid::node).filter(td);
         let cells: Vec<String> = td.map(|c| self.text_of(c, scoped)).collect();
-        if cells.iter().any(|c| !c.is_empty()) {
-            self.lines.push(Line::T(format!("| {} |", cells.join(" | "))));
-        }
+        self.lines.extend(cells.iter().any(|c| !c.is_empty()).then(|| Line::T(format!("| {} |", cells.join(" | ")))));
     }
 
     /// Preformatted text: its own lines, trailing space dropped.
     fn pre(&mut self, id: usize) {
         self.flush();
         let t: String = self.tree.texts(id, &LISTS.drop_always).collect();
-        for ln in t.replace("\r\n", "\n").split(PY_NEWLINE) {
-            if !py_strip(ln).is_empty() {
-                self.lines.push(Line::T(ln.trim_end_matches(py_space).to_string()));
-            }
-        }
+        let text = t.replace("\r\n", "\n");
+        let kept = text.split(PY_NEWLINE).filter(|ln| !py_strip(ln).is_empty());
+        self.lines.extend(kept.map(|ln| Line::T(ln.trim_end_matches(py_space).to_string())));
     }
 
     /// A link's text, then its `[lN]` when it has text and an href worth listing. A link around blocks (a card's
@@ -880,6 +861,11 @@ pub fn card(d: Doc) -> Doc {
     Doc { mode: "og".into(), sections: Vec::new(), tokens: Tokens { clean }, ..d }
 }
 
+/// Text as HTML text or a quoted attribute value: `&` `"` `<` `>` escaped.
+pub fn esc(v: &str) -> String {
+    v.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// A server's Markdown (`kind_of` md: its own conversion of the page) → HTML (CommonMark, tables) cleaned like any
 /// page (`build_doc`: sections, `[lN]` links, media, the loss guard), `mode` md. The frontmatter's `title`
 /// `description` `image` become og tags, as the page's head has them; with no title there, the first `# ` heading.
@@ -890,7 +876,6 @@ pub fn markdown(raw: &[u8], url: &str, fin: &str) -> Doc {
     let front = text.strip_prefix("---").and_then(|r| r.split_once("\n---")).map_or("", |(f, _)| f);
     let og =
         front.lines().filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim(), v.trim().trim_matches(['"', '\''])));
-    let esc = |v: &str| v.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
     let og = og.filter(|(k, _)| matches!(*k, "title" | "description" | "image"));
     // the title: the frontmatter's, else the first `# ` heading
     let h1 = text.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or_default();
@@ -1001,9 +986,7 @@ fn page_info(t: &Tree, base: &str) -> (Info, Vec<Media>, usize) {
     for n in t.nodes.iter().filter(|n| n.tag == "link").filter(rel) {
         add(&mut media, base, Media { src: n.attr("href").unwrap_or_default().into(), ..Media::default() });
     }
-    if let Some(site) = t.meta("og:site_name") {
-        info.insert("site".into(), site.to_string());
-    }
+    info.extend(t.meta("og:site_name").map(|s| ("site".to_string(), s.to_string())));
     let info = info.into_iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k, collapse(&unescape(&v))));
     (info.collect(), media, og)
 }
@@ -1125,8 +1108,8 @@ static NAME_END: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 /// One picture's identity and size by its URL (one picture at several sizes is one row): the file's own name
 /// (`NAME_END`) without size words (`SIZE`), never its folders or query, where CDNs put sizes and crops, but with
-/// a proxied original (a query value with a `/` and a `.`: `_next/image?url=`, an image proxy's `?url=`); a name under 8
-/// chars or of one word with no digit (`image`, `hqdefault`) keeps its folders. Two different file names are
+/// a proxied original (a query value with a `/` and a `.`: `_next/image?url=`, an image proxy's `?url=`); a name under
+/// 8 chars or of one word with no digit (`image`, `hqdefault`) keeps its folders. Two different file names are
 /// never one picture (`IMG_2026.10.11.jpg`, `.12.jpg`). The size: the largest number of its size words, or a `w`
 /// or `width` query.
 fn key_of(u: &url::Url) -> (String, u32) {
@@ -1205,9 +1188,9 @@ fn unjson(s: &str) -> String {
 /// and the served pictures (`body_media`, after the chrome prune) by alt length, then declared size, then
 /// document order, one row per picture (`add`); the `demoted` go last: avatars (both sides ≤ `AVATAR`, square
 /// within 0.8-1.25), a bare `@handle` alt, an alt that is the author's or the site's name (`info`), a logo or an
-/// icon by its URL or an alt of ≤ 3 words (`has_word`: `/brand/site_logo.png`, an `avatars.` host). Never the title: a shop or a
-/// listing alts its main photo with it, so that photo stays content, its alt dropped (`(no alt)`: the title says
-/// nothing about the picture).
+/// icon by its URL or an alt of ≤ 3 words (`has_word`: `/brand/site_logo.png`, an `avatars.` host). Never the title: a
+/// shop or a listing alts its main photo with it, so that photo stays content, its alt dropped (`(no alt)`: the title
+/// says nothing about the picture).
 fn rank(cards: (Vec<Media>, usize), t: &Tree, body: &[usize], base: &str, info: &Info) -> Vec<Media> {
     let (mut out, head) = cards;
     body.iter().filter_map(|&id| body_media(t, id, base)).for_each(|m| add(&mut out, base, m));
@@ -1320,20 +1303,19 @@ fn render<'a>(t: &'a Tree, tlen: &'a [usize], base: &str, mode: Mode, js: bool) 
 /// JSON one value per line, nesting shown by one space (indent costs tokens); not JSON → as it is.
 fn one_space(text: &str) -> Vec<u8> {
     let mut out = serde_json::Serializer::with_formatter(Vec::new(), PrettyFormatter::with_indent(b" "));
-    // keys sorted, as the oracle prints them (`sort_keys=True`)
+    // keys sorted (Python's `sort_keys=True` order)
     let sorted = |mut v: Value| {
         v.sort_all_objects();
         v.serialize(&mut out)
     };
-    match serde_json::from_str::<Value>(text).map(sorted) {
-        Ok(Ok(())) => out.into_inner(),
-        _ => text.as_bytes().to_vec(),
-    }
+    let ok = matches!(serde_json::from_str::<Value>(text).map(sorted), Ok(Ok(())));
+    if ok { out.into_inner() } else { text.as_bytes().to_vec() }
 }
 
-/// Islands (what the served copy hides in templates and data scripts), after the served sections: `<template>`
-/// contents (`measure` put their text in the element's `tlen`) holding ≥ 1/`ISLAND_TEMPLATE` of the page's, rendered by the served render (links numbered
-/// on), then data scripts ≥ `ISLAND_JSON` as text documents (`one_space` JSON, `lN` lines).
+/// Islands (what the served copy hides in templates and data scripts), after the served sections: `<template>` contents
+/// (`measure` put their text in the element's `tlen`) holding ≥ 1 in `island_template_1_in` of the page's, rendered by
+/// the served render (links numbered on), then data scripts ≥ `island_json_bytes` as text documents (`one_space` JSON,
+/// `lN` lines).
 fn islands(tree: &Tree, r: &mut Render, url: &str) -> Vec<Section> {
     let sec = |label: String, bytes: usize, lines| Section {
         level: 0,
@@ -1695,7 +1677,7 @@ mod tests {
     }
 
     /// A page with no digits and 40 nav links: light counted 32 "numbers" (our ids l10..l40), so the guard's
-    /// mode was set by link ids, not by the page (numbers spike 2026-10-14, linkid_repro).
+    /// mode was set by link ids, not by the page.
     #[test]
     fn link_ids_are_not_page_numbers() {
         let nav: String = (0..40).map(|i| format!("<a href='/p{i}'>page</a> ")).collect();
@@ -1892,7 +1874,7 @@ mod tests {
             key("https://x.io/_next/image?url=%2Fa%2Fp2.jpg")
         );
         assert_ne!(key("https://x.io/img/IMG_2026.10.11.jpg"), key("https://x.io/img/IMG_2026.10.12.jpg"));
-        // a `._The_` inside a name is no CDN suffix: two pictures of one series stay two (review 2026-10-14 #16)
+        // a `._The_` inside a name is no CDN suffix: two pictures of one series stay two
         assert_ne!(key("https://up.wiki/c/History._The_warrior.jpg"), key("https://up.wiki/c/History._A_helmet.jpg"));
         assert_eq!(key("https://ae.io/kf/S5501ck.jpg_960x960q75.jpg_.avif"), key("https://ae.io/kf/S5501ck.jpg"));
         let thumbs: String = (1..=3)
@@ -1914,9 +1896,9 @@ mod tests {
         assert_eq!(rest.iter().map(|r| r.0).collect::<Vec<_>>(), ["jane.png", "next.jpg", "tile.png", "portfolio"]);
     }
 
-    /// A share card is named by whole generic words of its own file name or its host's first label (review
-    /// 2026-10-14 #16): never a folder (`/product-card-image/1.jpg` is a product photo), never a brand word; a
-    /// host only by an Open Graph label (`share_host`), never `social.` or `cards.` (a site's own pictures).
+    /// A share card is named by whole generic words of its own file name or its host's first label: never a folder
+    /// (`/product-card-image/1.jpg` is a product photo), never a brand word; a host only by an Open Graph label
+    /// (`share_host`), never `social.` or `cards.` (a site's own pictures).
     #[test]
     fn share_cards_by_whole_words() {
         let card = |src: &str| {
@@ -1941,7 +1923,7 @@ mod tests {
         }
     }
 
-    /// A size in the file name filters (a strip, an icon) but is never stored as declared (review 2026-10-14 #17).
+    /// A size in the file name filters (a strip, an icon) but is never stored as declared.
     #[test]
     fn size_in_name_is_not_declared() {
         let imgs = "<img src='/a/boats-1287x836.jpg' alt='Boats'><img src='/a/rule-1500x40.jpg' alt='a rule'>\
@@ -1952,8 +1934,8 @@ mod tests {
         assert_eq!(rows, [("Boats", 0, 0), ("X", 640, 480)]);
     }
 
-    /// The site's name demotes a picture only as whole words (review 2026-10-14 #1): site "X" substring-matched
-    /// every short alt with an x in it, so a fox photo on x.com printed `0 photos`.
+    /// The site's name demotes a picture only as whole words: site "X" substring-matched every short alt with an x in
+    /// it, so a fox photo on x.com printed `0 photos`.
     #[test]
     fn site_name_by_whole_words() {
         let demoted = |site: &str, alt: &str| {
