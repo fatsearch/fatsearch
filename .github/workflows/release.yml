@@ -131,9 +131,6 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "C++ compiler for the x86_64 musl target"
-        if: "runner.os == 'Linux'"
-        run: "echo \"CXX_x86_64_unknown_linux_musl=g++\" >> \"$GITHUB_ENV\""
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

@@ -190,13 +190,17 @@ MCP Registry: `mcp-name: io.github.fatsearch/fats`</sub>
 
 ## For agents
 
-An agent that can read a URL sets itself up: **`Read and execute https://fatsearch.com/agent-setup/SKILL.md`**.
-The usage skill (how to navigate pages without flooding context, the rules learned the hard way) ships in this repo:
+The agent skill is versioned in this repo ([skills/fatsearch/SKILL.md](skills/fatsearch/SKILL.md)): how to read
+pages without flooding context, and how to install, connect and verify `fats` when it is missing.
 
 ```sh
 npx skills add fatsearch/fatsearch        # Agent Skills standard: Claude Code, Codex, Cursor, Copilot, Gemini CLI, …
 gh skill install fatsearch/fatsearch      # the same through GitHub CLI ≥ 2.90
 ```
+
+An agent without either CLI reads it pinned to a release:
+`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.1/skills/fatsearch/SKILL.md`.
+That way the agent sees versioned text it can review, and nothing it runs comes from a website.
 
 Docs as plain Markdown for agents: [fatsearch.com/llms.txt](https://fatsearch.com/llms.txt).
 

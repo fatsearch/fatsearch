@@ -1,7 +1,7 @@
 # fatsearch (`fats`): read pages without flooding context
 
 `fats` (package fatsearch): CLI + MCP server (`fats mcp`, one tool `fats(cmd)`, same command line).
-Not installed? `Read and execute https://fatsearch.com/agent-setup/SKILL.md`. One screen: `fats help`.
+One screen: `fats help`.
 Reference: github.com/fatsearch/fatsearch docs/reference.md.
 
 ## Rules (each one an agent mistake)

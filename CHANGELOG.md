@@ -5,6 +5,19 @@ versions: [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Numbers co
 Silicon Mac, one run each unless a range is given; provider results move run to run.
 Method: [docs/benchmarks.md](docs/benchmarks.md).
 
+## 0.2.1 - 2026-10-21
+
+### Changed
+
+- No musl (static Linux) binaries: the 0.2.0 release build failed on both musl targets (BoringSSL built with the
+  host compiler links glibc symbols musl lacks). The five 0.1.3 targets ship; musl returns with a proper cross toolchain.
+- The dependency cooldown gate reads its waivers from `scripts/cooldown-waivers.txt` as well as commit lines, so a
+  release squashed to one commit keeps them. The release export runs the gate before the preview push. No change to
+  the binary.
+- The agent setup skill lives in this repo at a release tag and installs through the Agent Skills CLI
+  (`npx skills add fatsearch/fatsearch`); the website no longer serves executable instructions. `fats guide`
+  drops its install pointer, and the line that points at it now reads `agents: fats guide = the manual`.
+
 ## 0.2.0 - 2026-10-20
 
 ### In short

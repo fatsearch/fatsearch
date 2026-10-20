@@ -7,8 +7,10 @@ check did not exist.
     python3 scripts/cooldown.py            # base = HEAD~1 (the previous commit), lock = the working tree's
     COOLDOWN_BASE=main python3 scripts/cooldown.py
 
-A package younger than 7 days fails unless a commit message in base..HEAD has the line
-`cooldown-waiver: <crate> <why>`. The publish time is the registry index's `pubtime` (stable since cargo
+A package younger than 7 days fails unless scripts/cooldown-waivers.txt has a line `<crate> <version> <why>`
+(`#` comments; versioned with the lock, so a squashed commit keeps it) or a commit message in base..HEAD has the
+line `cooldown-waiver: <crate> <why>`. The normal waiver is a version that fixes a `cargo deny check advisories`
+finding. The publish time is the registry index's `pubtime` (stable since cargo
 #16369; not every version has one yet), else crates.io's `created_at`. An HTTP error (429, 5xx, 404) fails
 the package like a young one: the gate fails closed. No network, or no base commit: a notice and exit 0. Prints one row per new package and a summary line.
 """
@@ -24,6 +26,7 @@ import urllib.request
 
 DAYS = 7
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+WAIVERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cooldown-waivers.txt")
 UA = {"User-Agent": "fats-cooldown (dependency gate, local)"}
 
 
@@ -74,12 +77,16 @@ def main():
     log = git("log", "--format=%B", f"{base}..HEAD") or ""
     waived = {w.split()[0] for w in (l.split("cooldown-waiver:", 1)[1] for l in log.splitlines()
                                      if "cooldown-waiver:" in l) if w.split()}
+    waived_at = set()
+    if os.path.exists(WAIVERS):
+        with open(WAIVERS) as f:
+            waived_at = {tuple(l.split()[:2]) for l in f if l.strip() and not l.lstrip().startswith("#")}
     now, bad = dt.datetime.now(dt.timezone.utc), []
     for name, version in new:
         try:
             when = published(name, version)
         except urllib.error.HTTPError as e:  # crates.io answered: a 429, 5xx or 404 proves no age (fail closed)
-            verdict = "waived" if name in waived else "FAIL"
+            verdict = "waived" if name in waived or (name, version) in waived_at else "FAIL"
             print(f"{verdict:6} {name} {version} crates.io http {e.code} {e.reason}: age unknown")
             bad.extend([f"{name}@{version}"] if verdict == "FAIL" else [])
             continue
@@ -87,12 +94,12 @@ def main():
             print(f"cooldown: offline ({e.__class__.__name__}), {len(new)} new packages since {base}: not checked")
             return 0
         age = (now - when).total_seconds() / 86400
-        verdict = "ok" if age >= DAYS else "waived" if name in waived else "FAIL"
+        verdict = "ok" if age >= DAYS else "waived" if name in waived or (name, version) in waived_at else "FAIL"
         print(f"{verdict:6} {name} {version} published {when:%Y-%m-%d %H:%M}Z, {age:.1f} days ago")
         if verdict == "FAIL":
             bad.append(f"{name}@{version}")
     print(f"cooldown: {len(new)} new packages since {base}, {len(bad)} younger than {DAYS} days or of unknown age"
-          + (f": {' '.join(bad)} (or a commit line `cooldown-waiver: <crate> <why>`)" if bad else ""))
+          + (f": {' '.join(bad)} (or a line `<crate> <version> <why>` in scripts/cooldown-waivers.txt)" if bad else ""))
     return 1 if bad else 0
 
 

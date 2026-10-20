@@ -1,6 +1,6 @@
 [package]
 name = "fatsearch"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 # pinned to rust-toolchain.toml; the oldest toolchain that builds this tree has not been measured yet
 rust-version = "1.99"

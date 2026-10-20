@@ -241,7 +241,7 @@ fn file_names_do_not_steal_words() {
 
 /// The pointer every first door ends with, as the `fats` binary prints it.
 fn to_guide() -> String {
-    format!("agents: fats guide = the skill (~{} tok)", fats::lang::ksize(fats::clean::tok(fats::lang::GUIDE)))
+    format!("agents: fats guide = the manual (~{} tok)", fats::lang::ksize(fats::clean::tok(fats::lang::GUIDE)))
 }
 
 /// `fats guide` = the guide file byte for byte (one source, the binary's own version); the installed skill only

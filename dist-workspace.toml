@@ -10,10 +10,9 @@ cargo-dist-version = "0.33.0"
 ci = "github"
 hosting = "github"
 installers = ["shell", "powershell", "homebrew", "npm"]
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
-# musl = static binaries (alpine, glibc < 2.35). BoringSSL needs a C++ compiler for the x86_64 musl target and
-# musl-tools ships none: build-setup.yml points CXX at the host g++ (static link, glibc headers; the first tag CI proves it).
-github-build-setup = "../build-setup.yml"
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# No musl targets: BoringSSL built with the host g++ links glibc fortify symbols (`__memcpy_chk`) that musl lacks;
+# a static build needs a musl cross toolchain, not an env override. The five targets below are the shipped set.
 # Installers put `fats` where `cargo install` does (~/.cargo/bin), so `cargo uninstall fatsearch` and the docs agree
 install-path = "CARGO_HOME"
 # No self-updater binary next to `fats`: one binary, nothing running in the background

@@ -88,7 +88,7 @@ Other ways, same release archives:
   `gh attestation verify fatsearch-<target>.tar.xz --repo fatsearch/fatsearch`.
   The archive holds `fats` (`fats.exe`) in a `fatsearch-<target>/` folder; put it anywhere on `PATH`.
 
-Check: `fats --version` prints `= fats <version> · status: fats · agents: fats guide = the skill (~2.0k tok)`.
+Check: `fats --version` prints `= fats <version> · status: fats · agents: fats guide = the manual (~2.0k tok)`.
 
 ## 3. Build from source
 
@@ -102,7 +102,7 @@ cargo install --locked --path .
 Or straight from crates.io, no clone: `cargo install --locked fatsearch`.
 Either compiles BoringSSL once (a few minutes) and installs `fats` (the package is named `fatsearch`).
 If `fats` is not found afterwards, add `~/.cargo/bin` to `PATH` (`. "$HOME/.cargo/env"`).
-Check: `fats --version` prints `= fats <version> · status: fats · agents: fats guide = the skill (~2.0k tok)`;
+Check: `fats --version` prints `= fats <version> · status: fats · agents: fats guide = the manual (~2.0k tok)`;
 `fats help` = the one-screen cheat sheet, `fats guide` = how to use it well.
 
 ## 4. Keys (optional)

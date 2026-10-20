@@ -1,5 +1,0 @@
-# Extra steps dist inserts into every build job (dist-workspace.toml `github-build-setup`).
-# musl-tools has no C++ compiler; BoringSSL (wreq) needs one for x86_64-unknown-linux-musl.
-- name: C++ compiler for the x86_64 musl target
-  if: runner.os == 'Linux'
-  run: echo "CXX_x86_64_unknown_linux_musl=g++" >> "$GITHUB_ENV"

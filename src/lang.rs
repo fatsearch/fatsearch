@@ -67,7 +67,7 @@ pub const GUIDE: &str = include_str!("data/guide.md");
 /// The line every first door ends with (`help`, `version`, the status, `setup`, a word that is no command): where
 /// the guide is and what reading it costs.
 pub fn to_guide() -> String {
-    format!("agents: {} guide = the skill (~{} tok)", bin(), ksize(crate::clean::tok(GUIDE)))
+    format!("agents: {} guide = the manual (~{} tok)", bin(), ksize(crate::clean::tok(GUIDE)))
 }
 
 /// `--help` anywhere (an en or em dash for `--`: smart punctuation), or `-h`.

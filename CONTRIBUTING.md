@@ -30,6 +30,8 @@ points at that reference's output. You do not need it to contribute.
 A new dependency (or a new direct use of one already in the tree) needs a maintainer's explicit go-ahead
 before the pull request: open an issue with the crate name, version, licence and why it is needed.
 `Cargo.lock` is committed; build with `--locked`.
+CI's cooldown job (`scripts/cooldown.py`) fails on a crate version under 7 days old unless it has a line in
+`scripts/cooldown-waivers.txt` (`<crate> <version> <why>`; normally a version that fixes a security advisory).
 
 ## Commits
 

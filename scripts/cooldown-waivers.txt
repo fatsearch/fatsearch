@@ -1,0 +1,3 @@
+# Crate versions allowed in Cargo.lock before they are 7 days old (scripts/cooldown.py).
+# One line each: <crate> <version> <why>. Normally a version that fixes a `cargo deny check advisories` finding.
+webpki-root-certs 1.0.10 RUSTSEC-2026-0383 fix, emSign ECC Root CA - G3 removed
