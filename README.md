@@ -92,11 +92,11 @@ u2 en.wikipedia.org · Rust (programming language… · plain 558ms $0.0000 · 4
 
 <sub>FATSEARCH reads more of the hard pages; Firecrawl and Tavily are faster on the pages they do read (same pages, medians: 23.7 s vs 4.9 s, 23.7 s vs 1.0 s). Readers ran on different days. [Method and every row →](docs/benchmarks.md#results-hard-pages-time-to-an-answer) · the table above: [one page, six readers →](docs/benchmarks.md#one-page-six-readers)</sub>
 
-**Tested in agents** <sub>Claude Code 2.1.280, one run each, 2026-10-19</sub>
+**Tested in agents** <sub>FATSEARCH 0.1.3 · Claude Code 2.1.280, one run each, 2026-10-19</sub>
 
 - 51 tasks, FATSEARCH MCP vs Firecrawl MCP: 50/51 vs 51/51 right · $15.06 vs $53.48 per 1k tasks · median 5.3 s vs 6.7 s · slowest tenth 43.8 s vs 21.5 s. [Details →](https://fatsearch.com/benchmarks/)
 - Claude Code's WebFetch got 403 on npm, Medium and G2; FATSEARCH read all three. [Details →](https://fatsearch.com/benchmarks/)
-- One Wikipedia page, open-source readers: FATSEARCH 1,384 tokens to the answer; mcp-server-fetch, Crawl4AI, mcp-searxng and self-hosted Firecrawl 76k–117k for the whole page. [Details →](https://fatsearch.com/benchmarks/)
+- One Wikipedia page, open-source readers: FATSEARCH 1,384 tokens to the answer; mcp-server-fetch, Crawl4AI, mcp-searxng and self-hosted Firecrawl 75k–117k for the whole page. [Details →](https://fatsearch.com/benchmarks/)
 - Full tables, losses included: [docs/benchmarks.md](docs/benchmarks.md#tested-in-agents-claude-code-51-tasks-fatsearch-mcp-vs-firecrawl-mcp-2026-10-19)
 
 <br>
@@ -107,16 +107,16 @@ u2 en.wikipedia.org · Rust (programming language… · plain 558ms $0.0000 · 4
 
 | <sub>1 · INSTALL</sub> | <sub>2 · KEYS <i>(optional)</i></sub> | <sub>3 · PLUG IN</sub> |
 |:-:|:-:|:-:|
-| `brew install fatsearch/tap/fatsearch` | `fats setup` | `claude mcp add fats -- fats mcp` |
+| `brew install fatsearch/tap/fatsearch` | `fats setup` | `claude mcp add --scope user fats -- fats mcp` |
 
-<sub>or &nbsp;`curl -fsSL https://fatsearch.com/install.sh | sh`&nbsp; · &nbsp;`npm i -g fatsearch`&nbsp; · &nbsp;`cargo install --locked fatsearch`&nbsp; · &nbsp;[every host →](docs/installation.md)</sub>
+<sub>or &nbsp;`curl -fsSL https://fatsearch.com/install.sh | sh`&nbsp; · &nbsp;Windows: `npm i -g fatsearch`&nbsp; · &nbsp;`cargo install --locked fatsearch`&nbsp; · &nbsp;[every host →](docs/installation.md)</sub>
 
 </div>
 
 > [!NOTE]
 > The package is `fatsearch`; the command is `fats` (like `ripgrep` → `rg`). Homebrew, npm and the install
-> scripts also add `fatsearch` as a second name for it; `cargo install` adds only `fats`.
-> **No account needed.** Without a provider key, `fats` reads what a plain request gets.
+> script also add `fatsearch` as a second name for it; `cargo install` adds only `fats`.
+> **No account needed.** Without a provider key, `fats` reads what a plain request gets; web search needs an Oxylabs or Bright Data key.
 > With **any one key** ([Oxylabs](https://dashboard.oxylabs.io/en/registration), [Bright Data](https://brightdata.com/cp/start) or [Decodo](https://dashboard.decodo.com/register)) it renders and unblocks pages through that provider.
 
 <br>
@@ -160,7 +160,7 @@ second; a page waits its turn rather than buying a provider call. Providers use 
 **One tool. One string. Same commands.**
 
 ```sh
-claude mcp add fats -- fats mcp                                   # Claude Code
+claude mcp add --scope user fats -- fats mcp                      # Claude Code
 codex mcp add fats -- fats mcp                                    # Codex
 {"mcpServers": {"fats": {"command": "fats", "args": ["mcp"]}}}   # Cursor, Desktop, …
 ```
@@ -199,7 +199,7 @@ gh skill install fatsearch/fatsearch      # the same through GitHub CLI ≥ 2.90
 ```
 
 An agent without either CLI reads it pinned to a release:
-`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.1/skills/fatsearch/SKILL.md`.
+`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.2/skills/fatsearch/SKILL.md`.
 That way the agent sees versioned text it can review, and nothing it runs comes from a website.
 
 Docs as plain Markdown for agents: [fatsearch.com/llms.txt](https://fatsearch.com/llms.txt).

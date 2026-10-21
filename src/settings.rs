@@ -150,8 +150,7 @@ pub fn env_of(name: &str) -> &'static str {
 /// THE key read (fetches, setup, config): env first, then `auth.json`, read at each call (a long `fats mcp` sees a
 /// key `fats setup` saved). (value, source `env` | `auth.json`); never printed or logged.
 pub fn key(name: &str) -> Option<(String, &'static str)> {
-    let env = env_of(name);
-    let from_env = Some(env).filter(|e| !e.is_empty()).and_then(self::env).map(|v| (v, "env"));
+    let from_env = Some(env_of(name)).filter(|e| !e.is_empty()).and_then(env).map(|v| (v, "env"));
     let file = || saved(AUTH).keys.get(name).map(|v| (v.clone(), AUTH));
     from_env.into_iter().chain(file()).map(|(v, at)| (v.trim().to_string(), at)).find(|k| !k.0.is_empty())
 }
@@ -259,9 +258,8 @@ pub fn save_in(dir: &Path, file: &str, bytes: &[u8], append: bool) -> std::io::R
 /// `auth.json`). `lang::emit` masks them in everything it prints, a provider's error body is masked before it is
 /// kept. A new credential goes in here.
 pub fn secrets() -> Vec<String> {
-    let envs = crate::provider::PROVIDERS.specs.iter().map(|s| s.env).chain(["GH_TOKEN"]);
-    let all =
-        envs.filter(|e| !e.is_empty()).filter_map(|e| std::env::var(e).ok()).chain(saved(AUTH).keys.into_values());
+    let envs = crate::provider::PROVIDERS.specs.iter().map(|s| s.env).chain(["GH_TOKEN"]).filter(|e| !e.is_empty());
+    let all = envs.filter_map(|e| std::env::var(e).ok()).chain(saved(AUTH).keys.into_values());
     let all = all.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     all.collect::<std::collections::BTreeSet<_>>().into_iter().collect()
 }
@@ -349,16 +347,23 @@ pub fn boolean(v: &str) -> Option<bool> {
     }
 }
 
+/// A system folder: on Windows the variable the install guide names (`%APPDATA%`, `%LOCALAPPDATA%`) when it holds
+/// an absolute path, else the OS's own folder (`dirs`: Windows' known folder, which ignores the variable); in a unit
+/// test a scratch home's, never the developer's.
+pub fn system_dir(env: &dyn Fn(&str) -> Option<String>, var: &str, os: fn() -> Option<PathBuf>) -> Option<PathBuf> {
+    let os = if cfg!(test) { || Some(std::env::temp_dir().join("fats-unit")) } else { os };
+    env(var).map(PathBuf::from).filter(|p| cfg!(windows) && p.is_absolute()).or_else(os)
+}
+
 fn load(env: &dyn Fn(&str) -> Option<String>) -> Settings {
     let mut r = Reader { env, rejects: Vec::new(), file: BTreeMap::new() };
-    let home = |d: Option<PathBuf>| if cfg!(test) { Some(std::env::temp_dir().join("fats-unit")) } else { d };
-    let key_dir = home(dirs::config_dir()).unwrap_or_default().join("fatsearch");
+    let key_dir = system_dir(env, "APPDATA", dirs::config_dir).unwrap_or_default().join("fatsearch");
     let key_dir = r.read("env FATS_KEY_DIR", key_dir, "", |v| Some(v.into()));
     migrate(&key_dir.value);
     let saved = saved_in(&key_dir.value, PREFS);
     r.file.clone_from(&saved.set);
     let session = r.session();
-    let cache = home(dirs::cache_dir()).unwrap_or_else(std::env::temp_dir).join("fatsearch");
+    let cache = system_dir(env, "LOCALAPPDATA", dirs::cache_dir).unwrap_or_else(std::env::temp_dir).join("fatsearch");
     // made absolute once (a relative dir is the cwd's at start); `~/…` no shell expanded, a dir fats can't make
     // (a host started in `/`) and one holding the keys (a sweep deletes in it) are refused for the default
     let safe = |v: &str, p: &PathBuf| !v.starts_with('~') && p.parent().is_some() && dirs::home_dir() != Some(p.into());
@@ -463,12 +468,11 @@ impl Reader<'_> {
         want: &str,
         parse: impl Fn(&str) -> Option<T>,
     ) -> Set<T> {
-        let k = src.trim_start_matches("env ");
-        let Some((v, src)) = self.raw(src) else { return Set { value: default, src: "default" } };
+        let Some((v, from)) = self.raw(src) else { return Set { value: default, src: "default" } };
         if let Some(value) = parse(&v) {
-            return Set { value, src };
+            return Set { value, src: from };
         }
-        self.refuse(k, src, &v, want, &format!("{default:?}"));
+        self.refuse(src.trim_start_matches("env "), from, &v, want, &format!("{default:?}"));
         Set { value: default, src: "default" }
     }
 }
@@ -523,6 +527,18 @@ mod tests {
         assert_eq!((limit::<usize>("max_depth"), limit::<f64>("loss_max")), (512, 0.30));
     }
 
+    /// `%APPDATA%` and `%LOCALAPPDATA%` count on Windows when absolute; elsewhere, and relative, the OS's folder
+    /// (a unit test's: the scratch home).
+    #[test]
+    fn a_system_dir_takes_an_absolute_variable_on_windows() {
+        let os = Some(std::env::temp_dir().join("fats-unit"));
+        let abs = if cfg!(windows) { r"D:\Users\a\AppData\Local" } else { "/home/a/local" };
+        let want = if cfg!(windows) { Some(abs.into()) } else { os.clone() };
+        assert_eq!(system_dir(&|_| Some(abs.into()), "LOCALAPPDATA", dirs::cache_dir), want);
+        assert_eq!(system_dir(&|_| Some("AppData".into()), "APPDATA", dirs::config_dir), os, "relative: the OS's");
+        assert_eq!(system_dir(&|_| None, "APPDATA", dirs::config_dir), os);
+    }
+
     /// Every built-in table parses into its owner's type, with its row count and a sample row (a JSON typo, an
     /// unknown field or a lost row fails here, not in front of an agent).
     #[test]
@@ -539,7 +555,7 @@ mod tests {
                 ("clean", 167),
                 ("words", 1605),
                 ("limits", 52),
-                ("telemetry", 11)
+                ("telemetry", 10)
             ]
         );
         let words = &crate::lang::WORDS;

@@ -415,9 +415,11 @@ pub struct Cache {
 }
 
 /// A path read from a cache file stays inside the cache: relative, no `..`, no root (`"dir": "/etc"` is refused).
-fn inside(rel: &str) -> Option<&str> {
-    let p = Path::new(rel);
-    (!rel.is_empty() && p.components().all(|c| matches!(c, std::path::Component::Normal(_)))).then_some(rel)
+/// Rebuilt from its parts: the stored `t/u1` joins with the OS separator (`…\cache\t\u1` on Windows). The
+/// rebuilt path is judged, not the stored one: on Windows a part with a drive (`t/C:x`) replaces what came before.
+fn inside(rel: &str) -> Option<PathBuf> {
+    let p: PathBuf = Path::new(rel).components().collect();
+    (!rel.is_empty() && p.components().all(|c| matches!(c, std::path::Component::Normal(_)))).then_some(p)
 }
 
 /// fats made this root (`private_root` writes it): the sweep deletes only under a root holding it.
@@ -905,6 +907,16 @@ pub fn tally(root: &Path, m: &Meta, tok: Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stored dir is a path under the cache root or nothing; on Windows `push("C:x")` replaces the path.
+    #[test]
+    fn a_stored_dir_stays_inside() {
+        assert_eq!(inside("t/u1"), Some(Path::new("t").join("u1")));
+        for bad in ["", "/etc", "../x", "t/../x", "./t"] {
+            assert_eq!(inside(bad), None, "{bad}");
+        }
+        assert_eq!(inside("t/C:x").is_none(), cfg!(windows), "a drive on Windows, a plain name elsewhere");
+    }
 
     /// The footer read a run, the run's process wrote `done` and let go, the footer wrote its stale copy
     /// back without `done` (`! abandoned` from then on). `told` is now written under the run's lock, read again.

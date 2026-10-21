@@ -1,14 +1,7 @@
-# THE gate, `./check.sh full` (fmt, clippy both feature sets, nextest, line budget, cargo deny, the release build, no
-# fake hook, binary size), on every push and pull request. The cooldown check needs crates.io, so check.sh skips it
-# offline and the `cooldown` job below runs it with the network. Actions are pinned by commit SHA (tag in
-# the comment). The tools come prebuilt (install-action) and the build is cached (rust-cache): compiling
-# cargo-deny and nextest from source cost 5 min per run. Everything is fetched first (crates, the advisory
-# database); then the gate runs with
-# CARGO_NET_OFFLINE (cargo itself fetches nothing) AND inside scripts/nonet.sh (no network but loopback), because
-# offline cargo alone does not stop a build script or proc-macro from opening a socket.
-# nonet.sh: macOS = sandbox-exec (verified locally); Linux = a root network namespace (untested until this runs).
-# Windows (the release ships a Windows binary): nonet.sh and check.sh are Unix shell, so that job runs the test
-# suite alone (nextest with the fake providers), offline; fmt, clippy, deny and the gates run on the other two.
+# One job: the test suite on Linux, offline (`cargo fetch --locked` first, then no network but loopback inside
+# scripts/nonet.sh). The full gate (`./check.sh full`: fmt, clippy, line budget, cargo deny, cooldown, the release
+# build, binary size) and the macOS and Windows runs happen on the maintainer's machines before every release
+# (CONTRIBUTING.md); the release workflow builds every shipped target. Actions are pinned by commit SHA.
 name: ci
 on:
   push:
@@ -19,66 +12,18 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 jobs:
-  check:
-    runs-on: ${{ matrix.os }}
-    # first Windows run 2026-10-20: 71/355 red; reports, does not block the cut until the Windows pass lands
-    # (a job-level continue-on-error: the Windows job still shows red, the workflow run passes; GitHub docs,
-    # workflow syntax, jobs.<job_id>.continue-on-error)
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
-    strategy:
-      fail-fast: false # every OS reports; one red must not cancel another's verdict
-      matrix:
-        # macOS and Windows only on the public repository (a private repository's free minutes count macOS 10×,
-        # Windows 2×); elsewhere those jobs are never created. They are gated locally (check.sh full on a Mac;
-        # scripts/ci-linux.sh replays the ubuntu job) and by the public release workflow. `github` is readable in
-        # `strategy` (GitHub docs, contexts, context availability)
-        os: ${{ github.repository == 'fatsearch/fatsearch' && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') || fromJSON('["ubuntu-latest"]') }}
+  test:
+    runs-on: ubuntu-latest
     steps:
-      - if: runner.os == 'Windows'
-        # the fixtures are compared byte for byte: no CRLF conversion; deep target paths need long paths
-        run: |
-          git config --global core.autocrlf false
-          git config --global core.longpaths true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: 1.99.0 # = rust-toolchain.toml
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28, prebuilt binaries
         with:
-          tool: cargo-nextest@0.9.148,cargo-deny@0.20.2
-      - if: runner.os != 'Windows'
-        run: cargo fetch --locked && cargo deny fetch
-      - if: runner.os != 'Windows'
-        run: scripts/nonet.sh ./check.sh full
+          tool: cargo-nextest@0.9.148
+      - run: cargo fetch --locked
+      - run: scripts/nonet.sh cargo nextest run --locked --offline --features fake --no-fail-fast
         env:
           CARGO_NET_OFFLINE: "true"
-      - if: runner.os == 'Windows'
-        # BoringSSL's x86_64 assembly needs NASM (CMake finds it in %ProgramFiles%\NASM); CMake and LLVM
-        # (libclang, for bindgen) are on the image, as in dist-workspace.toml's chocolatey row
-        run: choco install nasm --no-progress -y
-      - if: runner.os == 'Windows'
-        run: cargo fetch --locked
-      - if: runner.os == 'Windows'
-        run: cargo nextest run --locked --offline --features fake --no-fail-fast
-        env:
-          CARGO_NET_OFFLINE: "true"
-  cooldown:
-    # every crate Cargo.lock gained must be ≥ 7 days on crates.io (scripts/cooldown.py), unless waived in a commit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: cooldown, with the network
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          # a push that creates the branch has no `before` (all zeros): compare with the repository's first commit
-          if [ -z "${BASE//0/}" ]; then BASE=$(git rev-list --max-parents=0 HEAD | tail -n 1); fi
-          if [ "$BASE" = "$(git rev-parse HEAD)" ]; then
-            echo "::notice::cooldown not checked: the first commit has no earlier Cargo.lock to compare with"
-            exit 0
-          fi
-          COOLDOWN_BASE=$BASE python3 scripts/cooldown.py

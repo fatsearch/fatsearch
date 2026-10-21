@@ -249,22 +249,21 @@ fn checked(r: &mut Value) {
 }
 
 /// The install package, by where this binary is: npm (its package's `node_modules`), Homebrew (`Cellar`), the
-/// shell or PowerShell installer (`$CARGO_HOME/bin` with the installer's receipt), cargo (`$CARGO_HOME/bin`
-/// without it), else unknown.
+/// shell installer (`$CARGO_HOME/bin` with the installer's receipt), cargo (`$CARGO_HOME/bin` without it), else
+/// unknown. Every answer has an upgrade command in the table.
 fn via() -> &'static str {
     let exe = std::env::current_exe().and_then(std::fs::canonicalize).unwrap_or_default();
     let has = |part: &str| exe.components().any(|c| c.as_os_str() == part);
     let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     let cargo = var("CARGO_HOME").or_else(|| dirs::home_dir().map(|h| h.join(".cargo"))).unwrap_or_default();
     let in_cargo = std::fs::canonicalize(cargo.join("bin")).is_ok_and(|b| exe.parent() == Some(b.as_path()));
-    // where cargo-dist 0.33's installers write it: `$XDG_CONFIG_HOME`, else `%LOCALAPPDATA%` / `~/.config`
-    let home = || if cfg!(windows) { dirs::data_local_dir() } else { dirs::home_dir().map(|h| h.join(".config")) };
-    let conf = var("XDG_CONFIG_HOME").or_else(home).unwrap_or_default();
+    // where the shell installer writes it: `$XDG_CONFIG_HOME`, else `~/.config`
+    let conf = var("XDG_CONFIG_HOME").or_else(|| dirs::home_dir().map(|h| h.join(".config"))).unwrap_or_default();
     let receipt = conf.join("fatsearch").join("fatsearch-receipt.json").is_file();
     match () {
         _ if has("node_modules") => "npm",
         _ if has("Cellar") => "brew",
-        _ if in_cargo && receipt => ["sh", "ps1"][usize::from(cfg!(windows))],
+        _ if in_cargo && receipt => "sh",
         _ if in_cargo => "cargo",
         _ => "unknown",
     }
@@ -433,7 +432,11 @@ mod tests {
         assert_eq!(format!("{:?}", Level::Minimal), "minimal", "a refused value's `using` names the level");
         assert_eq!(page("notice"), "~ anonymous usage stats on · what's sent: fats telemetry show · off: fats setup\n");
         assert_eq!(row().len(), 5, "the setup row: the level line and four more");
-        assert!(TABLE.upgrade.contains_key("brew") && TABLE.upgrade.len() == 6);
+        let via = ["npm", "brew", "sh", "cargo", "unknown"];
+        assert!(
+            via.iter().all(|v| TABLE.upgrade.contains_key(*v)) && TABLE.upgrade.len() == via.len(),
+            "what via names"
+        );
     }
 
     /// A reply as kept: `latest` only as `1.2.3`; `notes` and `warn` one printable line of at most 200 chars.

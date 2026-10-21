@@ -6,7 +6,7 @@ the most useful thing you can send.
 ## Before you open a pull request
 
 Every commit must pass `./check.sh` (fmt, clippy, tests, line budget; needs `cargo install --locked cargo-nextest`).
-Before a pull request run `./check.sh full`, which CI runs: it adds `cargo deny check`, the release build and its
+Before a pull request run `./check.sh full` (CI runs the test suite on Linux; the full gate runs here): it adds `cargo deny check`, the release build and its
 size check. The toolchain is pinned in `rust-toolchain.toml`; any warning fails (`CARGO_BUILD_WARNINGS=deny`).
 The line budget is the maintainer's gate, not a bar for contributors: a pull request that goes over it gets a
 delete pass together with you, not a rejection.
@@ -30,7 +30,7 @@ points at that reference's output. You do not need it to contribute.
 A new dependency (or a new direct use of one already in the tree) needs a maintainer's explicit go-ahead
 before the pull request: open an issue with the crate name, version, licence and why it is needed.
 `Cargo.lock` is committed; build with `--locked`.
-CI's cooldown job (`scripts/cooldown.py`) fails on a crate version under 7 days old unless it has a line in
+The cooldown check in `./check.sh full` (`scripts/cooldown.py`) fails on a crate version under 7 days old unless it has a line in
 `scripts/cooldown-waivers.txt` (`<crate> <version> <why>`; normally a version that fixes a security advisory).
 
 ## Commits

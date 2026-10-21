@@ -4,4 +4,4 @@ fats <words>                     search the web; results get ids you open: fats 
 fats <words> site:github.com     only that site    ·    since:7d   only the last 7 days
 fats gh <words>                  GitHub repositories by stars (no key needed)
 
-Web search needs a provider key: fats setup
+Web search needs an Oxylabs or Bright Data key: fats setup

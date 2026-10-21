@@ -51,7 +51,12 @@ fn scratch(name: &str) -> PathBuf {
 /// `fats <args>` in a fresh environment under `dir`, never offline unless `env` says so, and printing instead of
 /// sending (`FATS_TELEMETRY_DEBUG=1`): (stdout, stderr).
 fn fats(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String) {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_fats"));
+    fats_at(Path::new(env!("CARGO_BIN_EXE_fats")), dir, args, env)
+}
+
+/// `fats` as above, run from the binary at `bin`.
+fn fats_at(bin: &Path, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String) {
+    let mut c = Command::new(bin);
     c.env_clear().env("PATH", "/usr/bin:/bin").env("HOME", dir.join("home"));
     c.env("FATS_CACHE", dir.join("cache")).env("FATS_KEY_DIR", dir.join("keys")).env("FATS_SESSION", "t");
     c.env("FATS_TELEMETRY_DEBUG", "1").envs(env.iter().copied()).args(args);
@@ -67,6 +72,9 @@ fn notice_first_then_the_check() {
     let (out, err) = fats(&d, &["version"], &[]);
     assert!(err.contains(NOTICE) && !out.contains("usage stats"), "notice on stderr only: {out} | {err}");
     assert!(!err.contains("[telemetry]"), "the notice run sends nothing: {err}");
+    // the notice's own second, pinned: the run may start a second boundary after the first one wrote it
+    let notice = std::fs::File::options().write(true).open(d.join("keys/telemetry-notice")).expect("notice");
+    notice.set_modified(std::time::SystemTime::now() + Duration::from_secs(1)).expect("mtime");
     let (_, err) = fats(&d, &["version"], &[]);
     assert!(!err.contains(NOTICE) && !err.contains("[telemetry]"), "nor a run of the notice's second: {err}");
     age(&d.join("keys/telemetry-notice"), 2);
@@ -86,6 +94,29 @@ fn notice_first_then_the_check() {
     assert!(err.contains("[telemetry] GET ") && !err.contains("&first="), "{err}");
     let (out, _) = fats(&d, &["config"], &[]);
     assert!(out.contains("\ntelemetry full · default\n") && out.contains("\ntelemetry_debug true · env "), "{out}");
+}
+
+/// `via` by the binary's place: in `$CARGO_HOME/bin` it is `cargo` on every OS, `sh` only beside the shell
+/// installer's receipt (`$XDG_CONFIG_HOME/fatsearch/fatsearch-receipt.json`).
+#[test]
+fn via_names_the_install_by_the_binary_place() {
+    let d = scratch("via");
+    let bin = d.join("cargo/bin").join(Path::new(env!("CARGO_BIN_EXE_fats")).file_name().expect("name"));
+    std::fs::create_dir_all(bin.parent().expect("bin dir")).expect("cargo bin");
+    std::fs::hard_link(env!("CARGO_BIN_EXE_fats"), &bin)
+        .or_else(|_| std::fs::copy(env!("CARGO_BIN_EXE_fats"), &bin).map(drop))
+        .expect("the binary in cargo/bin");
+    let (cargo, conf) = (d.join("cargo"), d.join("conf"));
+    let env = [("CARGO_HOME", cargo.to_str().expect("utf-8")), ("XDG_CONFIG_HOME", conf.to_str().expect("utf-8"))];
+    fats_at(&bin, &d, &["version"], &env);
+    age(&d.join("keys/telemetry-notice"), 2);
+    let get = |err: String| err.lines().find(|l| l.contains("/v1/latest?")).map(str::to_owned).unwrap_or(err);
+    assert!(get(fats_at(&bin, &d, &["version"], &env).1).contains("&via=cargo&"), "no receipt: cargo");
+    std::fs::create_dir_all(conf.join("fatsearch")).expect("conf");
+    std::fs::write(conf.join("fatsearch/fatsearch-receipt.json"), "{}").expect("receipt");
+    let got = get(fats_at(&bin, &d, &["version"], &env).1);
+    assert!(got.contains("&via=sh&"), "the receipt: sh: {got}");
+    std::fs::remove_dir_all(&d).ok();
 }
 
 /// Every off switch: no notice, no check printed, no stamp, no day mark; `config` names the switch.

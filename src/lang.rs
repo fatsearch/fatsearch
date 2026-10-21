@@ -889,9 +889,10 @@ fn class_of(t: &str, has_id: bool, any_id: bool, verb: bool) -> Result<Class, St
     }
     if low.starts_with("file:") {
         // a local file (`file:///a/b.pdf` → `/a/b.pdf`, percent-decoded), read like a path (and fenced the same
-        // way under `fats mcp`), never a search
-        let path = url::Url::parse(t).ok().filter(|u| u.scheme() == "file").and_then(|u| u.to_file_path().ok());
-        let path = path.map(|p| Class::File(p.to_string_lossy().into_owned()));
+        // way under `fats mcp`), never a search. A host is another machine on every OS (the URL parser reads
+        // `localhost` as none; url's `to_file_path` turns a host into a `\\host\share` path on Windows only)
+        let path = url::Url::parse(t).ok().filter(|u| u.scheme() == "file" && u.host().is_none());
+        let path = path.and_then(|u| u.to_file_path().ok()).map(|p| Class::File(p.to_string_lossy().into_owned()));
         return path.ok_or(format!("? {t}: a file URL names a local path: {} /path/to/file", bin()));
     }
     if let Some((k, v)) = key_value(t) {
@@ -1345,6 +1346,8 @@ mod tests {
         // a file URL decodes to this OS's path: Windows has no rootless `/tmp`, its paths start at a drive
         #[cfg(unix)]
         ("file:///tmp/a%20b.html", "/tmp/a b.html"),
+        #[cfg(unix)]
+        ("file://localhost/tmp/x", "/tmp/x"),
         #[cfg(windows)]
         ("file:///C:/tmp/a%20b.html", "C:\\tmp\\a b.html"),
         // a word people type for a command is that command, mods and `json` aside; with another word it is text
@@ -1410,7 +1413,7 @@ mod tests {
         ("main.rs", "? main.rs: a missing file or a site · type ./main.rs or https://main.rs"),
         ("docs.rs limit:5", "? docs.rs: a missing file or a site"),
         // a directory is no file and no search word
-        ("acme phone /etc", "? /etc is a directory · name a file in it"),
+        ("acme phone ./src", "? ./src is a directory · name a file in it"),
         ("u1 js:maybe", "? js:maybe · use js:true"),
         ("u1 match:fuzzy", "? match:fuzzy"),
         ("u1 max_bytes:65m", "? max_bytes:65m · 1k to 64m"),
@@ -1437,6 +1440,7 @@ mod tests {
         ("acont u1", "? acont: a command? fats account u1 "),
         ("hlep u1", "? hlep: a command? fats help u1 "),
         ("stts json:true", "? stts: a command? fats stats json:true "),
+        // a file URL on another machine: fats reads local files only
         ("file://host/x", "? file://host/x: a file URL names a local path"),
         ("l99999999999999999999", "? l99999999999999999999: out of range"),
         ("u1 u99999999999999999999", "? u99999999999999999999: out of range"),

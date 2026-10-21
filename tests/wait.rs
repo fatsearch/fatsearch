@@ -103,13 +103,25 @@ fn search_hedge_answers_by_wait() {
 }
 
 /// Both keys, `timeout:8` (bd cut at 8 s, oxyjs hedged at 5 s and cut 8 s later: 13.3 s): the
-/// agent's `timeout:` is the renders' ONE wall: one cut call, done by `timeout:` + 1 s (plain refused at once: a
-/// closed local port).
+/// agent's `timeout:` is the renders' ONE wall: one cut call, done by `timeout:` + 1 s. Plain fails at once: a
+/// local site's 403 (a closed port is no instant failure everywhere: Windows retries the connect for ~2 s, plain's
+/// own time, which the paid wall never counts).
 #[test]
 fn timeout_is_one_wall_with_both_keys() {
+    use std::io::{Read, Write};
     let _dir = setup_env();
+    let site = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/cut", site.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        for mut c in site.incoming().flatten() {
+            // a request (one small packet) gets the 403
+            if c.read(&mut [0; 4096]).is_ok_and(|n| n > 0) {
+                c.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").ok();
+            }
+        }
+    });
     let t0 = Instant::now();
-    let (out, ..) = fats::cli::run(&["http://127.0.0.1:9/cut", "timeout:2", "hedge:1", "wait:30"].map(String::from));
+    let (out, ..) = fats::cli::run(&[&url, "timeout:2", "hedge:1", "wait:30"].map(String::from));
     let took = t0.elapsed();
     eprintln!("timeout:2: {} ms\n{out}", took.as_millis());
     let eq = out.lines().find(|l| l.starts_with("= ")).unwrap_or_default();

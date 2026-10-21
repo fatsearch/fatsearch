@@ -5,6 +5,7 @@ fats mcp starts the agent connection (an MCP server with one tool, `fats`). Add 
   Claude Code   claude mcp add --scope user fats -- fats mcp
   Codex         codex mcp add fats -- fats mcp
   Cursor        ~/.cursor/mcp.json: { "mcpServers": { "fats": { "command": "fats", "args": ["mcp"] } } }
+  Windows       use cmd /c fats mcp as the command (npm installs fats as fats.cmd)
 
 Then ask your agent: “read example.com with fats”.
 Or do it from the menu: fats setup → Settings → Agent connection.

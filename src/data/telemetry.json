@@ -4,7 +4,6 @@
     "brew": "brew upgrade fatsearch",
     "cargo": "cargo install --locked fatsearch",
     "sh": "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fatsearch/fatsearch/releases/latest/download/fatsearch-installer.sh | sh",
-    "ps1": "powershell -ExecutionPolicy Bypass -c \"irm https://github.com/fatsearch/fatsearch/releases/latest/download/fatsearch-installer.ps1 | iex\"",
     "unknown": "https://github.com/fatsearch/fatsearch/releases/latest"
   },
   "ci_env": ["CI", "BUILD_NUMBER", "TF_BUILD", "TEAMCITY_VERSION", "GITHUB_ACTIONS"]

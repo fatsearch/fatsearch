@@ -5,6 +5,23 @@ versions: [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Numbers co
 Silicon Mac, one run each unless a range is given; provider results move run to run.
 Method: [docs/benchmarks.md](docs/benchmarks.md).
 
+## 0.2.2 - 2026-10-21
+
+### Changed
+
+- Windows installs through npm (`npm i -g fatsearch`). The Claude Code, Codex and Gemini CLI agents ship npm
+  packages, so most Windows setups already have npm. Without Node: the `fatsearch-x86_64-pc-windows-msvc.zip`
+  from the releases page.
+- Telemetry: on Windows a binary in `%USERPROFILE%\.cargo\bin` reports `via=cargo`.
+
+### Fixed
+
+- Windows: a page's cache path in a record and in `fats stats` uses one separator (`…\cache\t\u1`, was
+  `…\cache\t/u1`), and the default key dir and cache follow `%APPDATA%` and `%LOCALAPPDATA%` as the install
+  guide says (the system's known folder when one is unset or not an absolute path).
+- Windows: a stored cache entry that names a drive (`t/C:x`) can no longer point a read outside the cache.
+- Windows: a `file://host/path` URL is refused (it opened a network share); `fats` reads local files only.
+
 ## 0.2.1 - 2026-10-21
 
 ### Changed

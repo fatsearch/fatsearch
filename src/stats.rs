@@ -14,7 +14,7 @@ use std::time::Duration;
 const HEALTH: usize = 10;
 
 /// A path's permission bits (`0o700`); None = missing, or not a unix system (Windows: ACLs, not mode bits).
-fn mode(p: &std::path::Path) -> Option<u32> {
+fn mode(#[cfg_attr(not(unix), expect(unused_variables, reason = "no mode bits to read"))] p: &Path) -> Option<u32> {
     #[cfg(unix)]
     return std::fs::metadata(p).ok().map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777);
     #[cfg(not(unix))]

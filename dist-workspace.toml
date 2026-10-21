@@ -9,18 +9,19 @@ members = ["cargo:."]
 cargo-dist-version = "0.33.0"
 ci = "github"
 hosting = "github"
-installers = ["shell", "powershell", "homebrew", "npm"]
+# Windows installs through npm (`npm i -g fatsearch`); the shell installer is for macOS and Linux.
+installers = ["shell", "homebrew", "npm"]
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # No musl targets: BoringSSL built with the host g++ links glibc fortify symbols (`__memcpy_chk`) that musl lacks;
-# a static build needs a musl cross toolchain, not an env override. The five targets below are the shipped set.
+# a static build needs a musl cross toolchain, not an env override. The five targets above are the shipped set.
 # Installers put `fats` where `cargo install` does (~/.cargo/bin), so `cargo uninstall fatsearch` and the docs agree
 install-path = "CARGO_HOME"
 # No self-updater binary next to `fats`: one binary, nothing running in the background
 install-updater = false
 # A second name for the command: people say "use fatsearch", so agents type `fatsearch …`. The shell installer adds
-# a symlink, PowerShell a hardlink, npm a second `bin`, Homebrew `bin.install_symlink`; `cargo install` has no alias.
+# a symlink, npm a second `bin`, Homebrew `bin.install_symlink`; `cargo install` has no alias.
 bin-aliases = { fats = ["fatsearch"] }
-# The shell and PowerShell installers' last words (instead of "everything's installed!"): the first command to
+# The shell installer's last words (instead of "everything's installed!"): the first command to
 # run, then the two next ones. dist 0.33 has no such message for Homebrew (no caveats) or npm.
 # No quotes, $, backticks or <> in it: the shell installer prints it inside "…".
 install-success-msg = "Start here (keys, agent, settings):   fats setup\nWorks now, no account needed:         fats example.com\nConnect it to your agent:             fats help mcp"

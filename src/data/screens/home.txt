@@ -12,7 +12,7 @@
   fats example.com                     {dim}read a page: a short outline with numbered parts{/}
   fats u1#2                            {dim}read part 2 of that page{/}
   fats u1 price                        {dim}find lines with “price” on it{/}
-  fats best rust http client           {dim}search the web (needs a provider key){/}
+  fats best rust http client           {dim}search the web (needs an Oxylabs or Bright Data key){/}
   fats ./report.pdf                    {dim}read a local file{/}
 {yours}
 {bold}MORE{/}

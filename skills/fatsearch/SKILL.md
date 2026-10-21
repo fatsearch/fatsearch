@@ -19,7 +19,7 @@ installed version. Over MCP: `fats("guide")`. One screen of commands: `fats help
 1. `fats --version` prints `= fats <version> · …`? Go to 4.
 2. Install one way: `brew install fatsearch/tap/fatsearch` · `npm i -g fatsearch` · `cargo install --locked fatsearch` ·
    `curl -fsSL https://github.com/fatsearch/fatsearch/releases/latest/download/fatsearch-installer.sh | sh`
-   (Windows: `irm https://github.com/fatsearch/fatsearch/releases/latest/download/fatsearch-installer.ps1 | iex`).
+   (Windows: `npm i -g fatsearch`).
 3. Keys are optional (plain pages cost $0). Keys already in the environment work as they are. Never ask for a key
    in chat: `fats setup oxy` (or `bd`, `decodo`) prints a local form; pass its steps to the user.
 4. Connect: `claude mcp add --scope user fats -- fats mcp` · `codex mcp add fats -- fats mcp` · other hosts: a

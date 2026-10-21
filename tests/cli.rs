@@ -22,10 +22,15 @@ impl Sandbox {
     fn cmd(&self, args: &str) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fats"));
         // the caller's environment never leaks in: a provider key exported in the shell running the tests
-        // changes dry routes and hints
+        // changes dry routes and hints; Windows keeps `SystemRoot`: without it Winsock does not start, every
+        // connect fails (`connect_failed` to the local site). The home is the sandbox's, `%APPDATA%` and
+        // `%LOCALAPPDATA%` too: Windows' default key dir and cache, never the runner's own (a refused `FATS_CACHE`
+        // falls back to the cache and sweeps it)
         c.env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(["PATH", "SystemRoot"].into_iter().filter_map(|k| Some((k, std::env::var_os(k)?))))
             .env("HOME", self.dir.join("home"))
+            .env("APPDATA", self.dir.join("home").join("AppData").join("Roaming"))
+            .env("LOCALAPPDATA", self.dir.join("home").join("AppData").join("Local"))
             .args(args.split_whitespace())
             .current_dir(self.dir.join("work"))
             .envs(self.env());
@@ -544,7 +549,7 @@ fn media_words_point_to_media() {
     assert!(s.run("u2 media").0.ends_with(&format!("{more}\n").replace("u1", "u2")), "the other list");
     let next = s.run(&format!("u1 media from:{}", n + 1)).0;
     assert!(next.lines().nth(1).unwrap_or_default().starts_with(&format!("m{} ", n + 1)), "{next}");
-    let last = s.run("u1 media from:200").0;
+    let last = no_drive(&s.run("u1 media from:200").0);
     assert!(
         last.starts_with("= ")
             && last.ends_with("m200 photo jpg | photo 200 → file:///p/photo-200a.jpg\n(end of media, 200)\n"),
@@ -680,7 +685,7 @@ fn ad_slot_photo_is_listed_not_counted() {
     s.file("a.html", &page("Listings", &format!("<p>Some text here</p>{}", cards.concat())));
     let out = s.run("./a.html").0;
     assert!(out.lines().next().unwrap_or_default().contains(" · 2 photos"), "{out}");
-    let media = s.run("u1 media").0;
+    let media = no_drive(&s.run("u1 media").0);
     for f in ["promo", "post"] {
         assert!(media.contains(&format!("(not counted) | {f} photo → file:///p/{f}.jpg")), "{media}");
     }
@@ -945,8 +950,14 @@ fn the_cache_root_is_absolute_or_refused() {
     assert!(out.contains(&format!("\ncache {} · env FATS_CACHE · swept\n", abs.display())), "{out}");
     let status = s.cmd("").env("FATS_CACHE", "c").output().expect("run").stdout;
     assert!(String::from_utf8_lossy(&status).contains(&abs.display().to_string()), "status names it too");
-    let (home, keys) = (s.dir.join("home").display().to_string(), s.dir.join("keys/x").display().to_string());
-    for bad in ["~/x", "/dev/null/c", "/", &home, &keys] {
+    // the home it refuses: `$HOME` on Unix (the sandbox's); on Windows the profile folder, which no env moves (the
+    // runner's own: refused by its name before any write)
+    let home = if cfg!(windows) { dirs::home_dir().expect("home") } else { s.dir.join("home") };
+    let (home, keys) = (home.display().to_string(), s.dir.join("keys/x").display().to_string());
+    // a dir under a file: no OS can make it (Windows makes `/dev/null/c` as `C:\dev\null\c`)
+    s.file("f", "a file");
+    let under_file = s.dir.join("work").join("f").join("c").display().to_string();
+    for bad in ["~/x", &under_file, "/", &home, &keys] {
         let out = config(bad);
         assert!(out.contains(&format!("! bad_setting FATS_CACHE={bad} · want a dir fats can make")), "{out}");
         assert!(out.contains("\ncache ") && out.contains(" · default · swept\n"), "{out}");
@@ -954,33 +965,47 @@ fn the_cache_root_is_absolute_or_refused() {
     assert!(!s.dir.join("work/~").exists(), "no literal ~ dir");
 }
 
-/// A tampered state.json cannot point a read (or the doc.json it writes) outside the cache root.
-#[cfg(unix)]
-#[test]
-fn cache_paths_stay_inside_the_root() {
-    let s = Sandbox::new("escape");
+/// A page dir outside the cache (`<sandbox>/outside`, a stored page) and session `t`'s state.json naming `dirs`.
+fn escape_from(s: &Sandbox, dirs: &[&str]) -> PathBuf {
     let outside = s.dir.join("outside");
     std::fs::create_dir_all(&outside).expect("outside");
     std::fs::write(outside.join("raw.html"), SECTIONS).expect("raw");
     std::fs::write(outside.join("meta.json"), r#"{"url":"https://ex.com/","t":1}"#).expect("meta");
-    let c = s.dir.join("cache/t");
-    std::fs::create_dir_all(&c).expect("session");
-    let st = format!(
-        r#"{{"u":[{{"url":"https://ex.com/","dir":"../outside"}},{{"url":"https://ex.com/","dir":"{}"}}]}}"#,
-        outside.display()
-    );
-    std::fs::write(c.join("state.json"), &st).expect("state");
-    // a symlink inside the cache to a dir outside it
-    std::os::unix::fs::symlink(&outside, c.join("u3")).expect("symlink");
-    let st = st.replace("]}", r#",{"url":"https://ex.com/","dir":"t/u3"}]}"#);
-    std::fs::write(c.join("state.json"), st).expect("state");
-    for id in ["u1", "u2", "u3"] {
+    let u: Vec<_> = dirs.iter().map(|d| serde_json::json!({"url": "https://ex.com/", "dir": d})).collect();
+    std::fs::create_dir_all(s.dir.join("cache/t")).expect("session");
+    std::fs::write(s.dir.join("cache/t/state.json"), serde_json::json!({ "u": u }).to_string()).expect("state");
+    outside
+}
+
+/// Each id reads `snapshot_missing` (rc 1) and nothing is written outside the cache.
+fn refused(s: &Sandbox, outside: &std::path::Path, ids: &[&str]) {
+    for id in ids {
         let (out, rc) = s.run(id);
         assert_eq!(rc, 1, "{out}");
         assert!(out.starts_with(&format!("= {id} ! snapshot_missing")), "{out}");
     }
     assert!(!outside.join("doc.json").exists(), "nothing is written outside the cache");
-    // a session dir that links out of the cache is not written to either
+}
+
+/// A tampered state.json cannot point a read (or the doc.json it writes) outside the cache root: not by `../`,
+/// not by an absolute dir (on Windows one that names a drive).
+#[test]
+fn cache_paths_stay_inside_the_root() {
+    let s = Sandbox::new("escape");
+    let abs = s.dir.join("outside").display().to_string();
+    let outside = escape_from(&s, &["../outside", &abs]);
+    refused(&s, &outside, &["u1", "u2"]);
+}
+
+/// Nor by a symlink: a page dir inside the cache that links outside it is not read, a session dir that links out
+/// of the cache is not written to.
+#[cfg(unix)]
+#[test]
+fn cache_symlinks_stay_inside_the_root() {
+    let s = Sandbox::new("escape-link");
+    let outside = escape_from(&s, &["t/u1"]);
+    std::os::unix::fs::symlink(&outside, s.dir.join("cache/t/u1")).expect("symlink");
+    refused(&s, &outside, &["u1"]);
     let o2 = s.dir.join("outside2");
     std::fs::create_dir_all(&o2).expect("outside2");
     std::os::unix::fs::symlink(&o2, s.dir.join("cache/linked")).expect("symlink");
@@ -1102,7 +1127,7 @@ fn oversized_input_is_refused() {
     // the built-in tables (src/data/*.json) are counted where every other setting is shown
     assert!(s.run("config").0.contains(
         "
-tables 8 files · 2092 rows · built-in · providers 49, errors 53, check 86, sites 69, clean 167, words 1605, limits 52, telemetry 11
+tables 8 files · 2091 rows · built-in · providers 49, errors 53, check 86, sites 69, clean 167, words 1605, limits 52, telemetry 10
 "
     ));
     // every behaviour threshold is a row of its own
@@ -1501,6 +1526,12 @@ fn serve(reply: impl Fn(&str, &mut std::net::TcpStream) -> std::io::Result<()> +
         }
     });
     addr
+}
+
+/// A local page's picture by its path, `file:///p/x.jpg`, as one text on every OS: Windows names the drive
+/// the page is on (`file:///C:/p/x.jpg`, the URL standard's join).
+fn no_drive(out: &str) -> String {
+    regex::Regex::new("file:///[A-Za-z]:/").expect("regex").replace_all(out, "file:///").into_owned()
 }
 
 fn online(s: &Sandbox, cmd: &str) -> String {
@@ -2002,8 +2033,9 @@ fn dotfiles_bare_files_and_directories_stay_local() {
         assert!(!keyed(&format!("{cmd} dry:true")).0.contains("search \""), "{cmd}");
     }
     assert!(keyed("id_rsa backup dry:true").0.contains("search \"id_rsa backup\""), "a missing bare name is a word");
-    let (out, rc) = keyed("acme phone /etc");
-    assert!(out.starts_with("? /etc is a directory · name a file in it") && rc == Some(2), "{out}");
+    std::fs::create_dir_all(s.dir.join("work/src")).expect("a dir here");
+    let (out, rc) = keyed("acme phone ./src");
+    assert!(out.starts_with("? ./src is a directory · name a file in it") && rc == Some(2), "{out}");
     let (out, rc) = keyed("main.rs");
     assert!(out.starts_with("? main.rs: a missing file or a site · type ./main.rs") && rc == Some(2), "{out}");
     let secrets = [".env", "id_rsa", ".env.local", "server.key"];
@@ -2457,8 +2489,13 @@ fn json_records_are_golden() {
     for cmd in ["./info.html", "u1#0", "./island.html", "u2#2", "./media-honest.html", "u3 media"] {
         got += &s.run(&format!("{cmd} json:true")).0;
     }
-    let real = s.dir.canonicalize().expect("dir").display().to_string();
-    let got = got.replace(&real, "<dir>").replace(&s.dir.display().to_string(), "<dir>");
+    // the run's own dir as `<dir>`, `/` between parts, a file URL's drive gone (`file:///C:/img` → `file:///img`):
+    // one golden file on every OS
+    let dirs = [s.dir.canonicalize().expect("dir").display().to_string(), s.dir.display().to_string()];
+    let local = |t: &str| {
+        let t = dirs.iter().fold(t.to_string(), |t, d| t.replace(d, "<dir>"));
+        no_drive(&if cfg!(windows) { t.replace('\\', "/") } else { t })
+    };
     // every number of milliseconds or seconds of age → 0 (a debug build's first media page can take 10 ms)
     let zero = |text: &str| {
         let mut out = String::new();
@@ -2479,6 +2516,12 @@ fn json_records_are_golden() {
         let mut lines: Vec<String> =
             v["lines"].as_array().expect("lines").iter().filter_map(|l| l.as_str()).map(String::from).collect();
         assert_eq!(v["bytes_out"], lines.join("\n").len(), "bytes_out counts the lines: {rec}");
+        lines = lines.into_iter().map(|l| local(&l)).collect();
+        for k in ["path", "url"] {
+            if let Some(t) = v[k].as_str().map(local) {
+                v[k] = t.into();
+            }
+        }
         // the `=` line's Ntok counts the printed text, its own `local Nms` too: a slow run's 12ms is one more token
         if let Some(head) = lines.first_mut().filter(|l| l.starts_with("= ")) {
             *head = tok.replace(head, "0tok").into_owned();
@@ -2539,7 +2582,7 @@ fn pictures_on_demand() {
         |f: &str| media.lines().find(|l| l.ends_with(f)).and_then(|l| l.split(' ').next()).unwrap_or("m9").to_string();
     let (png_m, first) = (m("a.png"), online(&s, &format!("u1 {}", m("a.png"))));
     let line = first.lines().next().unwrap_or_default();
-    let saved = s.dir.join(format!("cache/t/u1/assets/{png_m}.png"));
+    let saved = s.dir.join("cache").join("t").join("u1").join("assets").join(format!("{png_m}.png"));
     let size = fats::lang::ksize(std::fs::read(&saved).expect("saved").len());
     let want = format!(
         "= j1.u1 {png_m} photo 3000x2000 png {size}B · saved {} · ~1.5–4.7k tok if viewed · plain ",
@@ -3192,8 +3235,12 @@ fn a_cache_hit_is_the_page_asked_for() {
 #[test]
 fn the_default_cache_is_swept() {
     let s = Sandbox::new("defroot");
-    let caches = if cfg!(target_os = "macos") { "home/Library/Caches" } else { "home/.cache" };
-    let root = s.dir.join(caches).join("fatsearch");
+    let caches: &[&str] = match () {
+        _ if cfg!(target_os = "macos") => &["Library", "Caches"],
+        _ if cfg!(windows) => &["AppData", "Local"],
+        _ => &[".cache"],
+    };
+    let root = caches.iter().fold(s.dir.join("home"), |p, c| p.join(c)).join("fatsearch");
     std::fs::create_dir_all(root.join("default/u1")).expect("an older build's cache");
     std::fs::create_dir_all(root.join("default/notes")).expect("not ours");
     std::fs::write(root.join("default/state.json"), "{}").expect("state");
@@ -3209,10 +3256,44 @@ fn the_default_cache_is_swept() {
     assert!(!root.join("default/u1").exists() && root.join("default/notes").exists(), "only its own page went");
 }
 
+/// The default key dir is the user's config dir: on Windows `%APPDATA%` as the install guide says.
+#[test]
+fn the_default_key_dir_is_the_users_config_dir() {
+    let s = Sandbox::new("defkeys");
+    let config: &[&str] = match () {
+        _ if cfg!(target_os = "macos") => &["Library", "Application Support"],
+        _ if cfg!(windows) => &["AppData", "Roaming"],
+        _ => &[".config"],
+    };
+    let dir = config.iter().fold(s.dir.join("home"), |p, c| p.join(c)).join("fatsearch");
+    let o = s.cmd("config").env_remove("FATS_KEY_DIR").output().expect("run fats");
+    let out = String::from_utf8_lossy(&o.stdout);
+    let row = out.lines().find(|l| l.starts_with("key_dir ")).unwrap_or_default();
+    assert!(row.starts_with(&format!("key_dir {} · default", dir.display())), "{row}");
+}
+
+/// A dir with a page's `meta.json` and its parent's `state.json`, both written two hours ago.
+fn stale_page(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("dir");
+    std::fs::write(dir.join("meta.json"), "{}").expect("meta");
+    std::fs::write(dir.parent().expect("parent").join("state.json"), "{}").expect("state");
+    age_by(dir, 2 * 3600);
+}
+
+/// A cache root fats made, holding one page of session `t` two hours old: the next run that is not
+/// `FATS_SESSION=t` sweeps it (the last sweep is aged past 5 min).
+fn swept_root(s: &Sandbox) -> PathBuf {
+    s.file("a.html", &page("Page a", "<p>some text here</p>"));
+    assert_eq!(s.run("./a.html").1, 0);
+    let c = s.dir.join("cache");
+    age_by(&c.join("t/u1"), 2 * 3600);
+    age_by(&c.join("swept"), 301);
+    c
+}
+
 /// `FATS_CACHE` at a dir fats did not make (another app's `otherapp/state.json`) is never swept, and says
 /// so; in a root fats made, only a session's `u<N>`/`j<N>` with a meta.json (and `run/`) go, never a project's
-/// `src/`, never through a symlinked session.
-#[cfg(unix)]
+/// `src/`.
 #[test]
 fn the_sweep_deletes_only_its_own() {
     let s = Sandbox::new("foreign");
@@ -3230,23 +3311,26 @@ fn the_sweep_deletes_only_its_own() {
     let o = s.cmd("").env("FATS_CACHE", &shared).output().expect("run fats");
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.contains(" · not swept (dir not created by fats) · 0 jobs\n"), "never walked: {out}");
-    // a root fats made: a project with a state.json, and a session linked to a dir outside it
-    s.file("a.html", &page("Page a", "<p>some text here</p>"));
-    assert_eq!(s.run("./a.html").1, 0);
-    let c = s.dir.join("cache");
-    let (src, victim) = (c.join("proj/src"), s.dir.join("victim/u1"));
-    for d in [&src, &victim] {
-        std::fs::create_dir_all(d).expect("dir");
-        std::fs::write(d.join("meta.json"), "{}").expect("meta");
-        std::fs::write(d.parent().expect("parent").join("state.json"), "{}").expect("state");
-    }
-    std::os::unix::fs::symlink(s.dir.join("victim"), c.join("linked")).expect("symlink");
-    [&src, &victim, &c.join("t/u1")].iter().for_each(|p| age_by(p, 2 * 3600));
-    age_by(&c.join("swept"), 301);
+    // a root fats made, with a project that has a state.json
+    let c = swept_root(&s);
+    stale_page(&c.join("proj/src"));
     assert!(s.run("config").0.contains(" · env FATS_CACHE · swept\n"));
     assert!(!c.join("t/u1").exists(), "ours went");
-    assert!(src.join("meta.json").exists() && victim.join("meta.json").exists(), "nothing else");
-    // this session's own sweep, the session being the symlink
+    assert!(c.join("proj/src/meta.json").exists(), "nothing else");
+}
+
+/// The sweep never follows a session that is a symlink out of the cache: not when it walks every session, not
+/// when that session is this run's own.
+#[cfg(unix)]
+#[test]
+fn the_sweep_never_follows_a_linked_session() {
+    let s = Sandbox::new("linked");
+    let c = swept_root(&s);
+    let victim = s.dir.join("victim/u1");
+    stale_page(&victim);
+    std::os::unix::fs::symlink(s.dir.join("victim"), c.join("linked")).expect("symlink");
+    assert!(s.run("config").0.contains(" · env FATS_CACHE · swept\n"));
+    assert!(!c.join("t/u1").exists() && victim.join("meta.json").exists(), "ours went, the link's stayed");
     s.cmd("").env("FATS_SESSION", "linked").output().expect("run fats");
     assert!(victim.join("meta.json").exists(), "a linked session is never swept");
 }

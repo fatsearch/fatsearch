@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# The ubuntu job of .github/workflows/ci.yml in a local Linux container (podman), so a Linux gate costs no CI
-# minutes: the same steps (`cargo fetch --locked && cargo deny fetch`, then `scripts/nonet.sh ./check.sh full`
+# The full gate on Linux in a local container (podman), wider than the public ci.yml test job: the steps (`cargo fetch --locked && cargo deny fetch`, then `scripts/nonet.sh ./check.sh full`
 # with CARGO_NET_OFFLINE=true), the same tool versions, as a non-root user with passwordless sudo like the runner.
 # Differences: this machine's architecture (arm64 on Apple silicon, CI is x86_64; no test depends on it, and
 # scripts/size-gate has no Linux-aarch64 record, so the size gate reports "not checked"); Debian (the official

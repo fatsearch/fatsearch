@@ -75,7 +75,7 @@ GET https://fatsearch.com/v1/latest?s=1&v=0.2.0&os=macos&arch=arm64&via=brew&fir
 ```
 
 `s` schema · `v` version · `from` the previous version, only until the first check after an upgrade ·
-`os` `macos`/`linux`/`windows` · `arch` `arm64`/`x86_64` · `via` `npm`/`brew`/`cargo`/`sh`/`ps1`/`unknown` ·
+`os` `macos`/`linux`/`windows` · `arch` `arm64`/`x86_64` · `via` `npm`/`brew`/`cargo`/`sh`/`unknown` ·
 `first` the month of the first run (left out if the notice file holds no `YYYY-MM`) · `d7` days used of the last 7 (0–7) · `t` the level.
 
 The weekly counts are one `POST https://fatsearch.com/v1/l2` with a JSON body:

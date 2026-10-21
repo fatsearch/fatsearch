@@ -560,15 +560,20 @@ mod tests {
     /// dir, `~` for home and the middle parts as `…`; the card's Status keeps it whole.
     #[test]
     fn the_cache_row_fits_100_columns() {
-        let tmp = "/var/folders/s8/5n29mppx4z54b1vrnn6zpkrh0000gn/T/tmp.qXxiDel2af";
-        let dir = PathBuf::from(format!("{tmp}/Library/Caches/fatsearch"));
+        // the OS's own separator, as the dirs it gets (`C:\Users\…\AppData\Local\fatsearch`)
+        let os = |p: &str| p.replace('/', std::path::MAIN_SEPARATOR_STR);
+        let tmp = os("/var/folders/s8/5n29mppx4z54b1vrnn6zpkrh0000gn/T/tmp.qXxiDel2af");
+        let dir = PathBuf::from(os(&format!("{tmp}/Library/Caches/fatsearch")));
         assert!(dir.display().to_string().chars().count() >= 60);
         let (row, card) = cache_words(&dir);
         let line = format!("   ▸ 2.   {:18} {row}", "Cache");
         assert!(line.chars().count() <= 100, "{} chars: {line}", line.chars().count());
-        assert!(row.starts_with("/var/folders/…/Caches/fatsearch · ") && card.starts_with(&format!("{tmp}/")), "{row}");
-        let home = Path::new(tmp);
-        assert_eq!(row_path(&dir, Some(home)), "~/Library/Caches/fatsearch");
+        assert!(
+            row.starts_with(&os("/var/folders/…/Caches/fatsearch · ")) && card.starts_with(&os(&format!("{tmp}/"))),
+            "{row}"
+        );
+        let home = Path::new(&tmp);
+        assert_eq!(row_path(&dir, Some(home)), os("~/Library/Caches/fatsearch"));
         assert_eq!(row_path(Path::new("/srv/fats"), Some(home)), "/srv/fats", "a short dir stays whole");
         let main = ["free", "oxy", "decodo", "bd", "gh", "settings", "done"];
         let row = |p: &&str| format!("   ▸ 2. {} {:18} {}", state(p).0, text(p)[0], state(p).1);

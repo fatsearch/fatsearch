@@ -875,12 +875,15 @@ fn error_body_is_kept_not_shown() {
     assert!(kept.starts_with("# oxylabs 500 provider_error\n") && kept.contains("Traceback"), "{kept}");
     assert!(kept.contains("# oxylabs-js 500 provider_error\n"), "every hop's answer: {kept}");
     assert!(!kept.contains(OXY) && kept.contains("key=***"), "kept masked: {kept}");
+    // owner-only: a Unix mode; Windows has none to read, the file is there
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{}", path.display());
     }
+    #[cfg(not(unix))]
+    assert!(path.is_file(), "{}", path.display());
     // a search keeps its answers next to its record
     clean(&run("rust news provider:oxy"));
     let stats = run("stats");
@@ -1724,7 +1727,8 @@ fn wait_is_one_deadline_for_every_url() {
 }
 
 /// A pending run's promise is this session's median call on its route (host + tier), never a constant:
-/// no number before 3 such calls, then 1 s left of the 2 s three Oxylabs calls took, at `wait:1`.
+/// no number before 3 such calls, then 1 s left of the 2 s three Oxylabs calls took, at `wait:1` (on Windows
+/// ≈2s too: its slower calls round the median up).
 #[test]
 fn pending_promises_the_sessions_median() {
     let _l = lock();
@@ -1736,8 +1740,12 @@ fn pending_promises_the_sessions_median() {
     for id in &ids {
         assert!(run(&format!("{id} wait:5")).contains(" Slow Page · "));
     }
+    // the median (2 s and the calls' own time) less the second waited, rounded: ≈1s; a Windows VM's slower
+    // calls (process start, timer ticks) round it to ≈2s
     let out = run("https://ex.com/slow/m5 provider:oxy fresh:true wait:1");
-    assert!(out.contains(" oxy running → ") && out.contains(" wait:30 · free, usually ready in ≈1s"), "{out}");
+    let eta = ["≈1s", "≈2s"].map(|n| format!(" wait:30 · free, usually ready in {n}"));
+    let eta = if cfg!(windows) { &eta[..] } else { &eta[..1] };
+    assert!(out.contains(" oxy running → ") && eta.iter().any(|e| out.contains(e)), "{out}");
     // never past the running call's own deadline, read 0.3 s in: `timeout:` caps every call, the oxy no-JS
     // gate (it ran 20 s under `timeout:1`) and a render alike, in either spelling
     let later = |cmd: &str| {
@@ -1836,8 +1844,9 @@ const SLICE_MS: u128 = if cfg!(windows) { 25 + 16 } else { 25 };
 /// THE home-IP brake waits, it never buys: 12 plain pages of one host with every key = $0 and no `!` row (a call
 /// that skipped its turn would buy Bright Data, $0.0015 for a free page); the wait shows apart from the fetch ms.
 /// The gaps are timed where the local site reads each request, not where the brake lets the call start: connect,
-/// accept and 8 lanes on a loaded machine's scheduler move each by a few ms, so the bar is the pace less
-/// `SLICE_MS`; the brake's own starts are pinned in `a_new_host_is_paced_from_its_first_start`.
+/// accept and 8 lanes on a loaded machine's scheduler move each by a few ms, so the median gap's bar is the pace
+/// less `SLICE_MS`, every gap's half the pace (a quarter on Windows), the whole batch's 10 paces less `SLICE_MS`
+/// each; the brake's own starts are pinned in `a_new_host_is_paced_from_its_first_start`.
 #[test]
 fn a_paced_batch_waits_and_spends_nothing() {
     let _l = lock();
@@ -1850,8 +1859,16 @@ fn a_paced_batch_waits_and_spends_nothing() {
     // a new host's first batch too: every lane opened the pace file before the first start, each still waits
     let mut at = HITS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     at.sort();
-    let gaps: Vec<u128> = at.windows(2).map(|w| w[1].duration_since(w[0]).as_millis()).collect();
-    assert!(gaps.len() == 11 && gaps.iter().all(|&g| g >= 200 - SLICE_MS), "requests ms apart: {gaps:?}");
+    let mut gaps: Vec<u128> = at.windows(2).map(|w| w[1].duration_since(w[0]).as_millis()).collect();
+    gaps.sort_unstable();
+    // the typical gap is the pace; a lane's first request also builds its client and connects after its turn (on a
+    // loaded Windows VM the first ones reached the site 58 and 105 ms late: one gap of 142, one of 95), never two
+    // at once (an unbraked batch: 8 lanes ~0 ms apart). A late first request shortens one gap, never the batch: 11
+    // paces from the first start to the last, 10 of them less a slice each
+    let floor = if cfg!(windows) { 200 / 4 } else { 200 / 2 };
+    let span = at.first().zip(at.last()).map_or(0, |(a, z)| z.duration_since(*a).as_millis());
+    assert!(gaps.len() == 11 && gaps[5] >= 200 - SLICE_MS && gaps[0] >= floor, "requests ms apart: {gaps:?}");
+    assert!(span >= 10 * (200 - SLICE_MS), "first to last request {span} ms: {gaps:?}");
 }
 
 /// The brake on a host's first starts: lanes that all opened its pace file before the first one started (a new
