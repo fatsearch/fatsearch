@@ -31,6 +31,19 @@ static HITS: Mutex<Vec<std::time::Instant>> = Mutex::new(Vec::new());
 const OXY: &str = "oxyK3y-7f9QzR2mWb5Lp8TnVc";
 /// The Bright Data key is a common word: it must still never print.
 const BD: &str = "sunflower";
+/// An old Oxylabs key left in the environment: Oxylabs refuses it (its dashboard has a new one).
+const STALE: &str = "oxyStaleK3y-4h8RtYp2Wq6M";
+/// A new Oxylabs key `fats setup` checks (saved nowhere yet) that the provider's error answer quotes.
+const ECHO: &str = "oxyEch0K3y-5tGh8Jk2Lm4Np";
+
+/// Oxylabs' answer to `ECHO`: an RFC 9457 field error naming the key (a 500: its reason is printed).
+fn echo_500(key: &str) -> Reply {
+    let body = format!(r#"{{"title":"BAD_KEY","errors":[{{"pointer":"/key","detail":"{key} unknown"}}]}}"#);
+    Reply { status: 500, headers: vec![], body: body.into_bytes() }
+}
+
+/// A good Oxylabs key a CI job exports, copied in by `fats setup import-env`.
+const ENV_OXY: &str = "oxyEnvK3y-9cXbN3Lq7Vz5J";
 const JUNK: &str = "<html><body><pre>Traceback (most recent call last): {\"debug\":\"upstream 10.0.0.7 \
     exploded\"}</pre></body></html>";
 
@@ -78,6 +91,7 @@ fn provider(api: Api, key: &str, req: &Value) -> Reply {
         return decodo_reply(key, req, target);
     }
     let fake = pdf_reply(api, req, target).or_else(|| prefetch_reply(api, target)).or_else(|| gh_login(api, target));
+    let fake = fake.or_else(|| (api == Api::OxyScrapers && key == ECHO).then(|| echo_500(key)));
     if let Some(r) = fake.or_else(|| one_key(api, req, target)).or_else(|| doh(api, req, target)) {
         return r;
     }
@@ -193,7 +207,7 @@ fn reply(api: Api, key: &str, target: &str) -> Reply {
             (429, h(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", &reset)]), String::new())
         }
         (Api::GhRepos, t) if (key == GH || key.is_empty()) && t != "ghbad" => (200, vec![], fixture("gh-repos")),
-        (Api::OxyScrapers, _) if mode == 3 => (401, vec![], format!("Invalid api key: {key}")),
+        (Api::OxyScrapers, _) if mode == 3 || key == STALE => (401, vec![], format!("Invalid api key: {key}")),
         (Api::BdBalance, _) if mode == 2 => (200, vec![], r#"{"balance":0.42}"#.into()),
         (Api::BdBalance, _) => (200, vec![], fixture("bd-balance")),
         (Api::BdZones, _) => (200, vec![], fixture("bd-zones")),
@@ -760,23 +774,32 @@ fn lock() -> (Scratch, MutexGuard<'static, ()>) {
             std::env::set_var("FATS_CACHE", dir().join("cache"));
             std::env::set_var("FATS_KEY_DIR", dir().join("keys"));
             std::env::set_var("FATS_SESSION", "t");
-            std::env::set_var("OXYLABS_WEB_API_KEY", OXY);
-            std::env::set_var("BRIGHTDATA_API_KEY", BD);
             std::env::set_var("BRIGHTDATA_UNLOCKER_ZONE", "my_unlocker");
-            std::env::set_var("GH_TOKEN", GH);
             std::env::set_var("FATS_ALLOW_PRIVATE", "1"); // plain fetches the local `walled` site
             // counted (full only), never sent: `telemetry::tick` runs in main and the MCP loop, neither here
             std::env::set_var("FATS_TELEMETRY", "full");
             std::env::set_var("FATS_PLAIN_HOST_PACE_MS", "0"); // unbraked: one test names it (`plain_host_pace_ms:`)
             let quiet = ["CI", "BUILD_NUMBER", "TF_BUILD", "TEAMCITY_VERSION", "GITHUB_ACTIONS", "DO_NOT_TRACK"];
-            for k in ["FATS_OFFLINE", "FATS_JSON", "FATS_NOCACHE", "FATS_CHUNK"].into_iter().chain(quiet) {
+            let keys = ["OXYLABS_WEB_API_KEY", "BRIGHTDATA_API_KEY", "DECODO_AUTH_TOKEN", "GH_TOKEN"];
+            let off = ["FATS_OFFLINE", "FATS_JSON", "FATS_NOCACHE", "FATS_CHUNK"].into_iter().chain(keys);
+            for k in off.chain(quiet) {
                 std::env::remove_var(k);
             }
         }
         fats::provider::fake(provider);
     });
-    // the dir goes before the turn does (a tuple drops in order)
-    (Scratch::new("redact"), turn)
+    // the dir goes before the turn does (a tuple drops in order); the keys of every test, unless it names others
+    let fresh = Scratch::new("redact");
+    keys(ALL);
+    (fresh, turn)
+}
+
+/// The keys every test starts with: Oxylabs, Bright Data (its zone from `BRIGHTDATA_UNLOCKER_ZONE`), GitHub.
+const ALL: &[(&str, &str)] = &[("oxy", OXY), ("bd", BD), ("gh", GH)];
+
+/// `keys` as the key dir's `auth.json`, in place of what it held (fats reads no key from the environment).
+fn keys(keys: &[(&str, &str)]) {
+    scratch::auth(&dir().join("keys"), keys);
 }
 
 fn run(cmd: &str) -> String {
@@ -892,8 +915,8 @@ fn error_body_is_kept_not_shown() {
     clean(&stats);
 }
 
-/// (4) `fats` and `fats config` say where a key comes from, never what it is: not even before the printer's
-/// redactor runs, and BD's key is an ordinary word.
+/// (4) `fats` and `fats config` say where a key comes from and its last 4 chars, never what it is: not even
+/// before the printer's redactor runs, and BD's key is an ordinary word.
 #[test]
 fn status_and_config_show_presence_only() {
     let _t = lock();
@@ -901,10 +924,12 @@ fn status_and_config_show_presence_only() {
     for (name, o) in [("status", fats::stats::status(&c)), ("config", fats::stats::config())] {
         let text = o.lines.join("\n");
         assert!(!text.contains(OXY) && !text.contains(BD), "{name} builds a key into its lines: {text}");
-        assert!(text.contains("env"), "{name} says where the key is from: {text}");
+        assert!(text.contains(" …TnVc") && text.contains(" auth.json"), "{name} says where the key is from: {text}");
     }
     let status = run("");
-    assert!(status.contains("keys oxy:env bd:env"), "{status}");
+    assert!(status.contains("\nkeys oxy …TnVc · bd … zone "), "{status}");
+    assert!(status.contains(" · decodo none · gh …2Wv9 · auth.json\n"), "{status}");
+    assert!(run("config").contains("\noxy 10s $1.00/1k · build · key …TnVc auth.json\n"));
     for cmd in ["", "config", "json:true", "config json:true"] {
         clean(&run(cmd));
     }
@@ -968,7 +993,7 @@ fn bright_data_refusal_names_its_code() {
             !out.contains("Access denied") && !out.contains("Government") && !out.contains("Bad Port"),
             "{cmd}: {out}"
         );
-        assert!(out.contains("spent $0.0000"), "a refusal is not billed: {out}");
+        assert!(!out.lines().next().unwrap_or_default().contains("spent"), "a refusal is not billed: {out}");
         let rows: Vec<&str> = out.lines().skip(1).filter(|l| l.contains(" ! ") || l.starts_with('!')).collect();
         assert_eq!(rows.len(), 1, "{cmd}: {out}");
         assert!(rows[0].contains(row) && rows[0].contains(&format!("→ {b} ")), "{cmd}: {out}");
@@ -988,7 +1013,10 @@ fn bright_data_refusal_names_its_code() {
     );
     // beside a 5xx it is an unlock failure: the 502 it is, unbilled (before the policy rule: also http_502)
     let out = run("https://ex.com/rejectblock provider:bd");
-    assert!(out.contains("bd:http_502✗$0 (not charged)") && out.contains("spent $0.0000"), "{out}");
+    assert!(
+        out.contains("bd:http_502✗$0 (not charged)") && !out.lines().next().unwrap_or_default().contains("spent"),
+        "{out}"
+    );
     let files = written();
     assert!(!files.contains("Access denied") && !files.contains("x-brd-error"), "a header was stored");
     assert!(files.contains("\"why\": \"proxy_error\""), "the token is in the hop record");
@@ -1050,7 +1078,7 @@ fn router_shown() {
     assert!(config.contains("FATS_ACCEPT_MD FATS_TELEMETRY FATS_TELEMETRY_DEBUG DO_NOT_TRACK · status"), "{config}");
     let b = fats::lang::bin();
     for want in [
-        "\ntext text, json, xml bodies (by content type or start) served as they are, l<N> per line, 300 lines",
+        "\ntext text, json, xml bodies (by content type or start) served as they are, a line a row (no id), 300 lines",
         "\npdf plain → oxy (no JS, 30s) → bd (raw bytes), never oxyjs · ",
         "\nlow_balance $1.00 · ",
         "\nmarkdown on · plain sends Accept: text/markdown;q=1.0, text/html;q=0.9, ",
@@ -1105,7 +1133,7 @@ fn account_refusals(file: &std::path::Path, n: usize) {
     let (out, rc) = run_rc("account fresh:true");
     clean(&out);
     let refused =
-        format!("\nbd ! bad_key replace BRIGHTDATA_API_KEY → {b} setup · bd https://brightdata.com/cp/setting/users\n");
+        format!("\nbd ! bad_key replace the saved key → {b} setup · bd https://brightdata.com/cp/setting/users\n");
     assert!(out.contains(&refused) && out.starts_with("= account · ") && rc == 0, "one provider read: {out}");
     assert_eq!(calls(), n + 12, "bd stops at the refused key");
     assert!(run("").contains(" · bd ! bad_key · "), "status names it");
@@ -1125,7 +1153,7 @@ fn account_refusals(file: &std::path::Path, n: usize) {
     let (out, rc) = run_rc("account fresh:true");
     clean(&out);
     assert!(rc == 1 && out.starts_with("= ! bad_key account · 2 providers · read now"), "{out}");
-    assert!(out.contains("\noxy ! bad_key replace OXYLABS_WEB_API_KEY → ") && out.contains(&refused), "{out}");
+    assert!(out.contains("\noxy ! bad_key replace the saved key → ") && out.contains(&refused), "{out}");
     let json = run("account fresh:true json:true");
     assert_eq!(json.lines().filter(|l| l.contains("\"error\":\"bad_key\"")).count(), 2, "{json}");
 
@@ -1311,10 +1339,7 @@ fn og_card_serves_a_js_shell() {
     let out = run(&format!("{}/og-own", walled()));
     let head = out.lines().next().unwrap_or_default();
     assert!(head.contains(" NASA · 127.0.0.1 · 0 sections · 1 photo · ") && head.contains("tok · og plain"), "{out}");
-    assert!(
-        head.contains("$0.0000 · ! js_shell → ") && head.contains(" js:true · bd, then oxyjs ≤$0.0030 ≈25s"),
-        "{out}"
-    );
+    assert!(head.contains("ms · ! js_shell → ") && head.contains(" js:true · bd, then oxyjs ≤$0.0030 ≈25s"), "{out}");
     assert!(out.lines().any(|l| l.starts_with("m1 photo jpg | (no alt) → http://127.0.0.1:")), "{out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), n, "the ladder stops at the card: {out}");
     let id = head.split_whitespace().nth(1).unwrap_or_default().rsplit('.').next().unwrap_or_default().to_string();
@@ -1340,8 +1365,7 @@ fn og_card_serves_a_js_shell() {
 #[test]
 fn og_card_arrow_names_the_render_tier() {
     let _t = lock();
-    let mut env = Env::default();
-    env.set("BRIGHTDATA_API_KEY", None);
+    keys(&[("oxy", OXY), ("gh", GH)]);
     let out = run(&format!("{}/og-own fresh:true", walled()));
     let head = out.lines().next().unwrap_or_default();
     assert!(head.contains(" · ! js_shell → ") && head.ends_with(" js:true · oxyjs ≤$0.0015 ≈25s"), "{out}");
@@ -1496,7 +1520,7 @@ fn dead_host_is_final() {
     assert!(t0.elapsed() < std::time::Duration::from_secs(1), "{:?}", t0.elapsed());
     assert_eq!(rc, 1, "{out}");
     let head = out.lines().next().unwrap_or_default();
-    assert!(head.contains("! no_host") && head.contains("tried plain:no_host✗") && head.contains("$0.0000"), "{out}");
+    assert!(head.contains("! no_host") && head.contains("tried plain:no_host✗") && !head.contains("spent"), "{out}");
     assert!(out.contains("check the host's spelling"), "{out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls + 1, "the second resolver only, no provider: {out}");
     let dry = run("https://dead.invalid/menu dry:true");
@@ -1507,7 +1531,7 @@ fn dead_host_is_final() {
     let (calls, t0) = (CALLS.load(Ordering::SeqCst), std::time::Instant::now());
     let (out, rc) = run_rc("https://void.ex.com/page wait:30");
     assert!(t0.elapsed() < std::time::Duration::from_secs(1) && rc == 1, "{:?} {out}", t0.elapsed());
-    assert!(out.contains("! no_host") && out.contains("$0.0000") && !out.contains("http://"), "{out}");
+    assert!(out.contains("! no_host") && !out.contains('$') && !out.contains("http://"), "free: {out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls + 2, "A, then AAAA, no provider: {out}");
     let out = run("https://six.ex.com/long");
     assert!(out.contains("Learned Route Works"), "an AAAA is an address: {out}");
@@ -1524,7 +1548,7 @@ fn unaskable_host_is_never_looked_up() {
         let (out, rc) = run_rc(&format!("https://{host}/page fresh:true wait:30"));
         assert!(t0.elapsed() < std::time::Duration::from_secs(1) && rc == 1, "{:?} {out}", t0.elapsed());
         let head = out.lines().next().unwrap_or_default();
-        assert!(head.contains("! no_host") && head.contains("$0.0000") && !out.contains("network"), "{out}");
+        assert!(head.contains("! no_host") && !head.contains("spent") && !out.contains("network"), "{out}");
         assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no resolver, no provider: {out}");
     }
 }
@@ -1597,7 +1621,7 @@ fn paid_ask_calls_one_provider() {
     let out = run("https://ex.com/slow js:true hedge:0");
     assert!(out.contains("bd:bad_key✗ oxyjs✓ 2") && out.contains(" · hedge:off"), "{out}");
     let stats = run("stats full"); // each paid call's request shape, bd with no country sent
-    let unhedged = stats.contains("$0.0015 · hedge:off raw ") && stats.contains(" · bd/60s:bad_key✗ oxyjs@US/60s✓");
+    let unhedged = stats.contains("$0.0015 · hedge:off raw ") && stats.contains(" · bd/40s:bad_key✗ oxyjs@US/40s✓");
     assert!(unhedged, "stats shows the run unhedged: {stats}");
     let read = run("https://ex.com/slow"); // a paid run is read from the cache, and says so there too
     assert!(read.lines().next().is_some_and(|l| l.contains(" · cache 0s · hedge:off")), "{read}");
@@ -1611,7 +1635,8 @@ fn timeouts_bill_by_provider() {
     let out = run("https://ex.com/stall js:true timeout:1 wait:5");
     // `timeout:` is the renders' one wall: bd's cut used it, oxyjs never starts
     let tried = "tried bd:provider_timeout✗≤$0.0015 (unverified) · ";
-    assert!(out.contains(tried) && out.contains("spent $0.0000"), "{out}");
+    let head = out.lines().next().unwrap_or_default();
+    assert!(out.contains(tried) && head.contains(" spent $0.0000 + ≤$0.0015 unverified"), "a cut, unverified: {out}");
     // `timeout:8` once said "nothing left to try": the agent's own cut → the default time
     let row = out.lines().find(|l| l.contains(" timeout:1s → ")).unwrap_or_default();
     assert!(row.ends_with(" u1 fresh:true ≤$0.0040") && !out.contains("nothing left"), "{out}");
@@ -1852,7 +1877,10 @@ fn a_paced_batch_waits_and_spends_nothing() {
     let _l = lock();
     let urls: Vec<String> = (0..12).map(|i| format!("{}/doc/brake-page-{i}", walled())).collect();
     let out = run(&format!("{} wait:30 plain_host_pace_ms:200", urls.join(" ")));
-    assert!(out.contains(" 12 inputs · 12 ok · ") && out.contains(" $0.0000\n"), "{out}");
+    assert!(
+        out.contains(" 12 inputs · 12 ok · ") && !out.lines().next().unwrap_or_default().contains("spent"),
+        "{out}"
+    );
     assert!(!out.contains(" ! ") && !out.contains("\n!"), "{out}");
     let stats = run("stats");
     assert!(stats.contains(" · waited 0.") && !stats.contains("paced"), "the wait apart from the ms: {stats}");
@@ -2010,11 +2038,10 @@ fn a_starved_pages_newer_copy_is_its_move() {
         run("http://127.0.0.1:9/k-wall/starve-a http://127.0.0.1:9/k-wall/starve-b fresh:true wait:30 cost:0.0015");
     let b = starved(&out).0;
     assert!(out.contains(&format!("\n{b} ! budget_hit ")), "{out}");
-    let mut keys = Env::default();
-    keys.set("OXYLABS_WEB_API_KEY", None).set("BRIGHTDATA_API_KEY", None);
+    keys(&[("gh", GH)]);
     let none = run(&b);
     assert!(none.contains(&format!(" → {} setup", fats::lang::bin())) && !none.contains("fresh:"), "{none}");
-    drop(keys);
+    keys(ALL);
     let fixed = run(&format!("{b} fresh:true wait:30 cost:0.003"));
     let c = fixed.lines().next().and_then(|l| l.strip_prefix("= ")?.split(' ').next()?.rsplit('.').next());
     let c = c.unwrap_or_default().to_string();
@@ -2040,7 +2067,7 @@ fn no_address_verdict_no_paid_call() {
         let row = out.lines().find(|l| l.starts_with('u') && l.contains(" ! dns_failed ")).unwrap_or_default();
         assert!(rc == 1 && row.contains(" dns_failed plain nodename nor servname provided, or not known → "), "{out}");
         assert!(row.ends_with(" fresh:true") && !out.contains("dns_wait:") && !out.contains("dns_timeout"), "{out}");
-        assert!(out.contains(" spent $0.0000"), "{out}");
+        assert!(!out.lines().next().unwrap_or_default().contains("spent"), "{out}");
     }
     // `dry:true` looks nothing up (no network at all, CI's sandbox has none): no resolver call, no wait on a
     // slow one, its route quoted; `dns_timeout` is the real run's verdict only
@@ -2053,7 +2080,10 @@ fn no_address_verdict_no_paid_call() {
     assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no second resolver either");
     let (out, rc) = run_rc("https://lag.ex.com/page fresh:true wait:30 dns_wait:1");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no answer by 1 s, no call at all: {out}");
-    assert!(rc == 1 && out.contains("dns_timeout") && out.contains(" spent $0.0000"), "{out}");
+    assert!(
+        rc == 1 && out.contains("dns_timeout") && !out.lines().next().unwrap_or_default().contains("spent"),
+        "{out}"
+    );
     assert!(out.contains(" fresh:true dns_wait:15"), "no answer in time, more time: {out}");
     let out = run("https://lag.ex.com/page fresh:true wait:30");
     assert!(!out.contains("dns_timeout"), "answered at 2 s, inside the 5 s wait: {out}");
@@ -2142,65 +2172,144 @@ fn oxylabs_relayed_site_5xx_is_billed() {
     assert!(out.contains("oxy:http_503✗$0.0010 (assumed)") && !out.contains("spent $0.0000"), "{out}");
 }
 
-/// `fats setup`: each key checked with its one free read, saved 0600 in the key dir, the zone picked from the
-/// account's Web Unlocker zones; a refused key is not saved; `dry:true` calls nothing. No key ever prints. A key
-/// dir that exists at 0755 (an installer wrote its receipt there first) is made 0700.
+/// `fats setup` checks the saved keys, one free read each, and writes nothing: `auth.json` stays byte for byte and
+/// an old key in the environment is never sent (Oxylabs refuses it here: the check passes on the saved key), one
+/// line names it; `dry:true` calls nothing; a refused key changes nothing either. No key prints, only its last 4.
 #[test]
-fn setup_checks_and_saves_keys() {
+fn setup_checks_the_saved_keys_and_writes_nothing() {
     let _l = lock();
-    let keys = dir().join("keys");
-    std::fs::remove_dir_all(&keys).ok();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o755)
-        .create(&keys)
-        .expect("key dir");
+    let auth = || std::fs::read(dir().join("keys").join("auth.json")).unwrap_or_default();
+    let before = auth();
+    let mut env = Env::default();
+    env.set("OXYLABS_WEB_API_KEY", Some(STALE));
     let calls = CALLS.load(Ordering::SeqCst);
     let (out, rc) = run_rc("setup dry:true");
     assert!(rc == 0 && out.starts_with("= dry setup oxy not checked · bd not checked"), "{out}");
-    assert!(
-        out.contains("\nbd key from env · would read GET https://api.brightdata.com/zone/get_active_zones"),
-        "{out}"
-    );
+    let bd = "\nbd key … auth.json · would read GET https://api.brightdata.com/zone/get_active_zones";
+    assert!(out.contains(bd), "{out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls, "dry: no call");
     let (out, rc) = run_rc("setup");
     assert_eq!(rc, 0, "{out}");
     assert!(out.starts_with("= setup oxy ok 351 scrapers · bd ok zone my_unlocker · decodo none · key dir "), "{out}");
-    assert!(out.contains("\nbd ok zone my_unlocker · key from env · saved auth.json settings.json (600)\n"), "{out}");
+    assert!(out.contains("\noxy ok 351 scrapers · key …TnVc auth.json\n"), "{out}");
+    assert!(out.contains("\nbd ok zone my_unlocker · key … auth.json\n"), "{out}");
+    let unused = format!(
+        "\nenv OXYLABS_WEB_API_KEY …Wq6M ≠ saved …TnVc · not used · replace: {} setup oxy\n",
+        fats::lang::bin()
+    );
+    assert!(out.contains(&unused), "{out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls + 2, "one read per provider: {out}");
-    let saved = |f: &str| std::fs::read_to_string(keys.join(f)).unwrap_or_default();
-    for (f, v) in [
-        ("auth.json", format!("\"oxy\": \"{OXY}\"")),
-        ("auth.json", format!("\"bd\": \"{BD}\"")),
-        ("settings.json", "\"bd_zone\": \"my_unlocker\"".into()),
-    ] {
-        assert!(saved(f).contains(&v), "{f}");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(keys.join(f)).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
-            assert_eq!(mode, 0o600, "{f}");
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&keys).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
-        assert_eq!(mode, 0o700, "key dir");
-    }
+    assert_eq!(auth(), before, "a check writes nothing");
+    let status = run("");
+    let keys = "\nkeys oxy …TnVc · bd … zone my_unlocker · decodo none · gh …2Wv9 · auth.json\n";
+    assert!(status.contains(keys) && status.contains(&unused), "{status}");
     let (out, rc) = run_rc("setup zone:nope");
-    assert_eq!(rc, 1, "{out}");
     let b = fats::lang::bin();
     let row = format!(
         "\nbd ! no_zone nope is not a Web Unlocker zone here · unblocker zones: zone_b, my_unlocker → {b} setup bd zone:zone_b\n"
     );
-    assert!(out.contains(&row), "{out}");
-    std::fs::remove_dir_all(&keys).ok();
+    assert!(rc == 1 && out.contains(&row), "{out}");
     ACCOUNT.store(3, Ordering::SeqCst);
     let (out, rc) = run_rc("setup");
     ACCOUNT.store(0, Ordering::SeqCst);
     assert!(rc == 1 && out.starts_with("= setup oxy ! bad_key · bd ! bad_key"), "{out}");
-    assert!(!keys.join("auth.json").exists(), "a refused key is not saved");
-    for k in [OXY, BD] {
+    assert_eq!(auth(), before, "a refused key stays as it was");
+    for k in [OXY, BD, STALE] {
+        assert!(!out.contains(k) && !status.contains(k), "{out}");
+    }
+}
+
+/// An old key in the environment is never sent: with no Oxylabs key saved, a page asked of Oxylabs is `no_key`, the
+/// move `fats setup oxy`, and status says the key is none.
+#[test]
+fn an_env_key_is_never_sent() {
+    let _l = lock();
+    let mut env = Env::default();
+    env.set("OXYLABS_WEB_API_KEY", Some(ENV_OXY));
+    keys(&[("bd", BD), ("gh", GH)]);
+    let js = JS.load(Ordering::SeqCst);
+    let out = run(&format!("{}/k-wall-env provider:oxy fresh:true wait:30", walled()));
+    let b = fats::lang::bin();
+    assert!(out.contains(" ! no_key ") && out.contains(&format!(" → {b} setup\n")), "{out}");
+    assert!(!out.contains("oxy✓") && !out.contains("oxyjs✓") && JS.load(Ordering::SeqCst) == js, "{out}");
+    let status = run("");
+    assert!(status.contains("\nkeys oxy none · bd … zone "), "{status}");
+    let row = format!("\n! no_key oxy · env OXYLABS_WEB_API_KEY …Vz5J not imported → {b} setup import-env\n");
+    assert!(status.contains(&row) && !status.contains(ENV_OXY), "{status}");
+    // an env key is a secret too: masked when printed, never sent as search words
+    let out = run(&format!("rust {ENV_OXY}"));
+    assert!(out.contains("! key_in_query ") && !out.contains(&ENV_OXY[3..15]), "{out}");
+    clean(&out);
+}
+
+/// A key-shaped word after `setup` or any word people type for it (`login`, `keys`, `auth`, …: `words.json`
+/// `aliases`) is refused: `fats login <key>` must never become a search that sends the key to a provider. Nothing
+/// is fetched (the fake transport counts 0 calls), nothing saved, the key never printed; `login page design` still
+/// searches.
+#[test]
+fn a_key_after_any_setup_word_is_refused() {
+    let _l = lock();
+    keys(ALL);
+    let calls = || CALLS.load(Ordering::SeqCst);
+    let n = calls();
+    // a key as Oxylabs mints it, and Decodo's base64 token (`+/=`)
+    let leads = ["setup", "login", "Login", "keys", "key", "auth", "signin", "sign-in", "credentials"];
+    for (fresh, lead) in
+        ["nEwK3y-8dQ2xLm7RwZ4kP0Yb", "ZGNkMHVzZXI6UGFzczEyMzQ1Njc4OTA+/x=="].iter().flat_map(|k| leads.map(|l| (k, l)))
+    {
+        for args in [format!("{lead} {fresh}"), format!("{lead} decodo {fresh}"), format!("json:true {lead} {fresh}")] {
+            let (out, rc) = run_rc(&args);
+            let refused = out.contains("! key_in_argv · never on the command line (shell history, ps) · paste: ");
+            assert!(rc == 1 && refused && !out.contains(&fresh[..12]) && !out.contains("? "), "{args}: {out}");
+        }
+    }
+    assert_eq!(calls(), n, "nothing fetched");
+    assert_eq!(std::fs::read_to_string(dir().join("keys/auth.json")).unwrap_or_default().matches(OXY).count(), 1);
+    assert!(!run("login page design").contains("key_in_argv"), "a word that is no key: a search");
+}
+
+/// `fats setup import-env`, the explicit copy for a machine without a browser: a key the environment holds goes into
+/// `auth.json` after its check, 0600 in a key dir made 0700 (an installer's 0755); a different saved key stays (a
+/// person replaces it: `fats setup oxy`), the file byte for byte; `dry:true` copies nothing.
+#[test]
+fn import_env_copies_only_where_no_key_is_saved() {
+    let _l = lock();
+    let keys_dir = dir().join("keys");
+    let auth = || std::fs::read(keys_dir.join("auth.json")).unwrap_or_default();
+    std::fs::remove_dir_all(&keys_dir).ok();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o755)
+        .create(&keys_dir)
+        .expect("key dir");
+    let mut env = Env::default();
+    env.set("OXYLABS_WEB_API_KEY", Some(ENV_OXY)).set("BRIGHTDATA_API_KEY", Some(BD));
+    let (out, rc) = run_rc("setup import-env dry:true");
+    assert!(rc == 0 && out.contains("\noxy key …Vz5J OXYLABS_WEB_API_KEY · would read GET "), "{out}");
+    assert!(auth().is_empty(), "dry: nothing copied");
+    let (out, rc) = run_rc("setup import-env");
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("\noxy ok 351 scrapers · key …Vz5J OXYLABS_WEB_API_KEY · saved auth.json (600)\n"), "{out}");
+    let bd = "\nbd ok zone my_unlocker · key … BRIGHTDATA_API_KEY · saved auth.json settings.json (600)\n";
+    assert!(out.contains(bd), "the key with the zone in use: {out}");
+    let prefs = std::fs::read_to_string(keys_dir.join("settings.json")).unwrap_or_default();
+    assert!(prefs.contains("\"bd_zone\": \"my_unlocker\""), "{prefs}");
+    assert!(!out.contains("not used"), "{out}");
+    let saved = String::from_utf8_lossy(&auth()).into_owned();
+    assert!(saved.contains(&format!("\"oxy\": \"{ENV_OXY}\"")) && saved.contains(&format!("\"bd\": \"{BD}\"")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
+        assert_eq!((mode(&keys_dir.join("auth.json")), mode(&keys_dir)), (0o600, 0o700));
+    }
+    keys(ALL);
+    let before = auth();
+    let (out, rc) = run_rc("setup import-env");
+    assert!(rc == 0 && out.contains("\noxy ok 351 scrapers · key …TnVc auth.json\n"), "{out}");
+    assert!(out.contains("\nenv OXYLABS_WEB_API_KEY …Vz5J ≠ saved …TnVc · not used · replace: "), "{out}");
+    assert_eq!(auth(), before, "a saved key is never replaced");
+    assert!(!keys_dir.join("auth.json.bak").exists(), "nothing replaced, no backup");
+    for k in [OXY, BD, ENV_OXY] {
         assert!(!out.contains(k), "{out}");
     }
 }
@@ -2253,6 +2362,25 @@ fn search_prefetches_top_results() {
     settle(&ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
     let dry = run("preq d provider:oxy dry:true");
     assert!(dry.contains("\nthen fetch:1 prefetches the top 1 detached · free, plain only\n"), "{dry}");
+}
+
+/// With the free fetch off a search prefetches nothing: the prefetch is plain only, and plain switched off is no
+/// missing key, so no run and no `! no_key … → fats setup` row; `dry:true` names no prefetch, `config` says it is off.
+#[test]
+fn free_off_prefetches_nothing() {
+    let _l = lock();
+    let runs = || std::fs::read_dir(dir().join("cache/t/run")).map_or(0, |d| d.count());
+    assert!(run("setup free off").starts_with("= setup free off"));
+    let before = runs();
+    let (out, dry, cfg) = (run("preq nofree provider:oxy"), run("preq nofree2 dry:true"), run("config"));
+    let after = runs();
+    assert!(run("setup free on").starts_with("= setup free on"));
+    assert!(out.contains("/long1-preq-nofree") && !out.contains("prefetching") && !out.contains("no_key"), "{out}");
+    assert!(dry.contains("search \"preq nofree2\" via ") && !dry.contains("prefetches"), "{dry}");
+    assert!(cfg.contains(" · prefetch off (free fetch off) · "), "{cfg}");
+    assert_eq!(after, before, "no detached run started");
+    let on = run("preq nofree3 provider:oxy");
+    assert!(on.contains("prefetching "), "free on again: {on}");
 }
 
 /// The first read right after a search waits for the result's prefetch like a fetch (default `wait:`), and
@@ -2330,7 +2458,7 @@ fn prefetch_never_renders() {
     }
     assert!(done(first) && done(first + 1), "both prefetches ended within 10 s");
     assert_eq!((JS.load(Ordering::SeqCst), CALLS.load(Ordering::SeqCst)), (js, calls), "a prefetch calls no provider");
-    let foot = format!("\n~ prefetch u{first} failed · blocked_403 · not charged · prefetch u{} failed · ", first + 1);
+    let foot = format!("\n~ prefetch u{first} failed · blocked_403 · prefetch u{} failed · ", first + 1);
     assert!(run("config").contains(&foot), "the reason, free");
     // a read word with no id reads what is there: `more` the search's list (its cursor
     // survived the prefetch's own state writes), `up` the failed page's best copy, never the paid ladder
@@ -2351,7 +2479,10 @@ fn gh_lists_repositories() {
     let _l = lock();
     let out = run("gh ghok fetch:0");
     clean(&out);
-    assert!(out.contains("\" · 2 results · github · ") && out.contains(" · spent $0.0000\n"), "{out}");
+    assert!(
+        out.contains("\" · 2 results · github · ") && !out.lines().next().unwrap_or_default().contains("spent"),
+        "free: {out}"
+    );
     assert!(out.contains("  ★12.4k owner/repo · A repo · pushed 2026-10-01\n"), "{out}");
     assert!(out.contains("  ★7 owner/bare · pushed 2025-01-02\n"), "no description: {out}");
     assert!(run("stats").contains(" search \"") && run("stats full").contains(" · gh✓"));
@@ -2426,7 +2557,8 @@ fn gh_lists_a_login_the_search_leaves_out() {
 fn gh_without_a_token_says_its_limit() {
     let _l = lock();
     let mut env = Env::default();
-    env.set("GH_TOKEN", None).set("PATH", Some(""));
+    keys(&[("oxy", OXY), ("bd", BD)]);
+    env.set("PATH", Some(""));
     let out = run("gh ghok fetch:0");
     assert!(out.contains(" · 2 results · github · no token: 10 searches/min · "), "{out}");
     assert!(run("gh ghok fetch:0 json:true").contains(r#""provider":"github""#));
@@ -2463,7 +2595,7 @@ fn a_sign_in_is_named_by_the_landing() {
         let calls = CALLS.load(Ordering::SeqCst);
         let out = run(&format!("{}/doc/{doc} fresh:true", walled()));
         let head = out.lines().next().unwrap_or_default();
-        assert!(head.contains(" plain ") && head.ends_with("spent $0.0000") && !head.contains(" ! "), "{out}");
+        assert!(head.contains(" plain ") && head.ends_with("ms") && !head.contains(" ! "), "{out}");
         assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no provider call: {out}");
     }
 }
@@ -2487,7 +2619,7 @@ fn two_providers_shells_are_an_app_page() {
     );
     let row = out.lines().find(|l| l.contains("! no_copy ")).unwrap_or_default();
     assert!(row.ends_with(" setup") && !out.contains("nothing left"), "every keyed render was tried: {out}");
-    assert!(out.contains("\nu1 ! no_key decodo · would try JS render ≤$0.0015 · set DECODO_AUTH_TOKEN"), "{out}");
+    assert!(out.contains("\nu1 ! no_key decodo · would try JS render ≤$0.0015"), "{out}");
     let id = head.split(['.', ' ']).nth(2).unwrap_or_default();
     // `dry:true` on that id with `js:true` quotes the refetch, never `local read · $0`
     let dry = run(&format!("{id} js:true dry:true"));
@@ -2502,7 +2634,6 @@ fn two_providers_shells_are_an_app_page() {
 #[test]
 fn any_one_key_gets_the_page() {
     let _t = lock();
-    let mut env = Env::default();
     let w = walled();
     // (keys, page, the tier path it must print)
     let rows: &[(&str, &str, &str)] = &[
@@ -2519,8 +2650,8 @@ fn any_one_key_gets_the_page() {
         ("both", "k-sherr", "plain:blocked_403✗ bd:js_shell✗$0.0015 oxyjs:provider_error✗$0 (not charged)"),
     ];
     for (keys, page, path) in rows {
-        env.set("OXYLABS_WEB_API_KEY", (*keys != "bd").then_some(OXY));
-        env.set("BRIGHTDATA_API_KEY", (*keys != "oxy").then_some(BD));
+        let oxy = [("oxy", OXY)].into_iter().filter(|_| *keys != "bd");
+        self::keys(&oxy.chain([("bd", BD)].into_iter().filter(|_| *keys != "oxy")).collect::<Vec<_>>());
         let out = run(&format!("{w}/{page}-{keys} provider:auto fresh:true wait:30"));
         assert!(out.lines().next().unwrap_or_default().contains(path), "{keys} {page}: {out}");
         assert!(*page != "k-sherr" || out.contains(" fresh:true provider:oxy js:true ≤$0.0015"), "{out}");
@@ -2629,7 +2760,7 @@ fn a_sites_own_language_is_no_geo_copy() {
     assert!(own.starts_with("= j") && !own.contains("lang:es") && !own.contains("country:"), "{own}");
     assert!(geo.contains(" · ! lang:es\n") && geo.contains(" ! lang:es · served in es, sent none · "), "{geo}");
     let stats = run("stats full");
-    let row = |p: &str| stats.lines().find(|l| l.contains(p) && l.contains(" bd/60s✓")).map(|l| l.contains("✓own:es"));
+    let row = |p: &str| stats.lines().find(|l| l.contains(p) && l.contains(" bd/40s✓")).map(|l| l.contains("✓own:es"));
     assert_eq!((row(" raw 1.0kB "), row(" raw 908B ")), (Some(true), Some(false)), "{stats}");
 }
 
@@ -2672,9 +2803,8 @@ fn a_limit_past_the_cap_buys_nothing_more() {
 #[test]
 fn decodo_is_a_third_tier() {
     let _t = lock();
-    let mut env = Env::default();
     let w = walled();
-    env.set("DECODO_AUTH_TOKEN", Some(DECODO));
+    keys(&[ALL, &[("decodo", DECODO)]].concat());
     let dry = run(&format!("{w}/k-three dry:true"));
     let ladder = "fetch plain → oxy (after a captcha) → decodo (after a captcha) → bd ∥ oxyjs after 5s → decodojs";
     assert!(dry.contains(ladder) && dry.contains(" · up to $0.0065"), "{dry}");
@@ -2686,17 +2816,14 @@ fn decodo_is_a_third_tier() {
     // looked up outside the test)
     let (out, rc) = run_rc("setup");
     assert!(rc == 0 && out.contains(" · decodo ok key ok · key dir "), "{out}");
-    assert!(out.contains("\ndecodo ok key ok · key from env · saved auth.json (600)\n"), "{out}");
-    // the saved keys would serve the one-key runs below
-    std::fs::remove_dir_all(dir().join("keys")).ok();
-    env.set("DECODO_AUTH_TOKEN", Some("wrongDecodoToken42"));
+    assert!(out.contains("\ndecodo ok key ok · key …Z4kP auth.json\n"), "{out}");
+    keys(&[ALL, &[("decodo", "wrongDecodoToken42")]].concat());
+    let auth = std::fs::read(dir().join("keys").join("auth.json")).unwrap_or_default();
     let (out, rc) = run_rc("setup");
     assert!(rc == 1 && out.contains(" · decodo ! bad_key") && !out.contains("wrongDecodoToken42"), "{out}");
-    let auth = std::fs::read_to_string(dir().join("keys").join("auth.json")).unwrap_or_default();
-    assert!(!auth.contains("decodo"), "a refused key is not saved: {auth}");
+    assert_eq!(std::fs::read(dir().join("keys").join("auth.json")).unwrap_or_default(), auth, "a check writes nothing");
     clean(&out);
-    std::fs::remove_dir_all(dir().join("keys")).ok();
-    env.set("OXYLABS_WEB_API_KEY", None).set("BRIGHTDATA_API_KEY", None);
+    keys(&[("decodo", "wrongDecodoToken42")]);
     let out = run("https://ex.com/401 provider:decodo");
     let row = format!(
         "! bad_key decodo → {} setup · decodo https://dashboard.decodo.com/web-data/playground",
@@ -2704,7 +2831,7 @@ fn decodo_is_a_third_tier() {
     );
     assert!(out.contains(&row) && !out.contains("wrongDecodoToken42"), "{out}");
     clean(&out);
-    env.set("DECODO_AUTH_TOKEN", Some(DECODO));
+    keys(&[("decodo", DECODO)]);
     let out = run(&format!("{w}/k-wall-decodo fresh:true wait:30"));
     let path = "plain:blocked_403✗ decodo:cloudflare_wall✗$0.0010 decodojs✓";
     assert!(out.lines().next().unwrap_or_default().contains(path) && out.contains("Decodo Page"), "{out}");
@@ -2716,7 +2843,8 @@ fn decodo_is_a_third_tier() {
     clean(&out);
     let stats = run("stats");
     assert!(stats.contains(" · decodo@US ") && stats.contains(" · decodo-js@US "), "{stats}");
-    assert!(stats.contains(" spent $0.0045"), "the wall + render, a page, the relayed 502; the 500 free: {stats}");
+    let spent = " spent $0.0060";
+    assert!(stats.contains(spent), "bd's render, the wall + render, a page, the relayed 502; the 500 free: {stats}");
 }
 
 /// One raw HTTP/1.1 request to the key form; "" = nothing listens there any more.
@@ -2792,6 +2920,32 @@ fn setup_form_takes_one_key() {
     std::fs::remove_dir_all(&keys).ok();
 }
 
+/// A key being checked (in no file yet) that the provider's error answer quotes is masked like a saved one: the
+/// form's page, its run log, any `error.txt` and the printed lines hold no 12 chars of it, any case.
+#[test]
+fn a_checked_key_the_answer_echoes_is_masked() {
+    let _l = lock();
+    let keys = dir().join("keys");
+    std::fs::remove_dir_all(&keys).ok();
+    let out = run("setup oxy");
+    let url = out.split_whitespace().find(|w| w.starts_with("http://127.0.0.1:")).unwrap_or_default().to_string();
+    let (host, path) = url.trim_start_matches("http://").split_once('/').unwrap_or_default();
+    let post = |key: &str| {
+        let body = format!("key={key}");
+        let head = format!("POST /{path}/save HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n", body.len());
+        http(host, &format!("{head}Content-Type: application/x-www-form-urlencoded\r\n\r\n{body}"))
+    };
+    let page = post(ECHO).to_lowercase();
+    assert!(page.contains("! oxylabs web api said no: provider_error 500 key: unknown · try again"), "{page}");
+    let done = post(OXY); // a good key ends the form
+    assert!(done.contains("works</b>"), "{done}");
+    // every byte the cache holds: the run log, any `error.txt`
+    for t in [page, out, run("stats"), written()].map(|t| t.to_lowercase()) {
+        assert!(!t.contains(&ECHO.to_lowercase()[3..15]), "{t}");
+    }
+    std::fs::remove_dir_all(&keys).ok();
+}
+
 /// `fats setup <name>` beside its switches: `free` needs no key (its off switch named), `dry:true` starts no
 /// form.
 #[test]
@@ -2840,7 +2994,7 @@ fn https_refused_moves_to_http_once() {
         head.contains(" · landed http://127.0.0.1 · ") && head.contains(" plain ") && !out.contains(" ! "),
         "{out}"
     );
-    assert!(head.contains("spent $0.0000") && t0.elapsed().as_secs() < 2, "{out}");
+    assert!(!head.contains("spent") && t0.elapsed().as_secs() < 2, "{out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no provider call");
     assert!(written().contains("\"why\": \"tls:wrong-version-number+http:200\""), "the https cause first");
     let oops = format!("{}/oops", walled());
@@ -2873,7 +3027,7 @@ fn a_certificate_failure_ends_the_run_at_zero() {
     let (calls, t0) = (CALLS.load(Ordering::SeqCst), std::time::Instant::now());
     let (out, rc) = run_rc(&format!("{url} wait:30"));
     let head = out.lines().next().unwrap_or_default();
-    assert!(rc == 1 && head.contains("plain:tls_failed✗") && head.contains("spent $0.0000"), "{out}");
+    assert!(rc == 1 && head.contains("plain:tls_failed✗") && !head.contains("spent"), "{out}");
     assert!(t0.elapsed().as_secs() < 5, "{out}");
     assert_eq!(CALLS.load(Ordering::SeqCst), calls, "no provider call: {out}");
     let row = out.lines().find(|l| l.starts_with('u') && l.contains(" ! tls_failed ")).unwrap_or_default();
@@ -2902,7 +3056,7 @@ fn a_meta_refresh_is_followed_on_plain() {
     let _l = lock();
     let out = run(&format!("{}/latest wait:30", walled()));
     let head = out.lines().next().unwrap_or_default();
-    assert!(head.contains(" Announcing The Release · ") && head.contains(" plain ") && head.contains("$0"), "{out}");
+    assert!(head.contains(" Announcing The Release · ") && head.contains(" plain ") && !head.contains('$'), "{out}");
     // the target is judged as any landing: `latest` names no page, so no flag
     assert!(!out.contains("redirected") && !out.contains("oxy") && !out.contains(" ! "), "{out}");
     let meta = written();

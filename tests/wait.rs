@@ -12,14 +12,47 @@ use serde_json::Value;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Every provider answers, 30 s late; Bright Data's search for `oxyslow` answers at once (the search hedge).
+/// Every provider answers, 30 s late; Bright Data's search for `oxyslow` answers at once (the search hedge), its
+/// render of a `/lands3s` page brings the page after 3 s.
 fn slow(api: Api, _: &str, req: &Value) -> Reply {
-    if api == Api::BdRequest && req["url"].as_str().is_some_and(|u| u.contains("q=oxyslow")) {
+    let url = req["url"].as_str().unwrap_or_default();
+    if api == Api::BdRequest && url.contains("q=oxyslow") {
         let body = r#"{"organic":[{"link":"https://ex.com/bd","title":"From BD","description":"d"}]}"#;
         return Reply { status: 200, headers: vec![], body: body.as_bytes().to_vec() };
     }
-    let headers = vec![("x-fake-delay-ms".to_string(), "30000".to_string())];
-    Reply { status: 200, headers, body: b"{}".to_vec() }
+    let (ms, body) = if api == Api::BdRequest && url.contains("/lands3s") {
+        let p = "A page that lands after three seconds still lands whole, with its numbers: 12 apples. ".repeat(12);
+        let html =
+            format!("<html><head><title>Lands Late</title></head><body><h1>Lands Late</h1><p>{p}</p></body></html>");
+        ("3000", serde_json::json!({"status_code": 200, "headers": {}, "body": html}).to_string())
+    } else {
+        ("30000", "{}".to_string())
+    };
+    let headers = vec![("x-fake-delay-ms".to_string(), ms.to_string())];
+    Reply { status: 200, headers, body: body.into_bytes() }
+}
+
+/// A local site that answers every request 403 (plain fails at once, the paid tiers run): its base URL. A closed
+/// port is no instant failure everywhere: Windows retries the connect for ~2 s.
+fn site_403() -> String {
+    use std::io::{Read, Write};
+    let site = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", site.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        for mut c in site.incoming().flatten() {
+            // a request (one small packet) gets the 403
+            if c.read(&mut [0; 4096]).is_ok_and(|n| n > 0) {
+                c.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").ok();
+            }
+        }
+    });
+    url
+}
+
+fn run(args: &[&str]) -> (String, Duration) {
+    let t0 = Instant::now();
+    let (out, ..) = fats::cli::run(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+    (out, t0.elapsed())
 }
 
 /// The environment, set once per process, and this test's turn in a fresh dir, removed after (`cargo test`
@@ -36,17 +69,16 @@ fn setup_env() -> (Scratch, MutexGuard<'static, ()>) {
             std::env::set_var("FATS_CACHE", dir.join("cache"));
             std::env::set_var("FATS_KEY_DIR", dir.join("keys"));
             std::env::set_var("FATS_SESSION", "t");
-            std::env::set_var("OXYLABS_WEB_API_KEY", "oxyK3y-wait");
-            std::env::set_var("BRIGHTDATA_API_KEY", "bdK3y-wait");
             std::env::set_var("BRIGHTDATA_UNLOCKER_ZONE", "my_unlocker");
-            std::env::set_var("GH_TOKEN", "ghp_wait");
             std::env::remove_var("FATS_OFFLINE");
             std::env::set_var("FATS_TELEMETRY", "0");
             std::env::set_var("FATS_ALLOW_PRIVATE", "1");
         }
         fats::provider::fake(slow);
     });
-    (Scratch::new("wait"), turn)
+    let fresh = Scratch::new("wait");
+    scratch::auth(&fresh.join("keys"), &[("oxy", "oxyK3y-wait"), ("bd", "bdK3y-wait"), ("gh", "ghp_wait")]);
+    (fresh, turn)
 }
 
 /// A command against the 30 s fake at `wait:1`: its wall time, and the row naming the provider cut at `wait:`.
@@ -104,27 +136,33 @@ fn search_hedge_answers_by_wait() {
 
 /// Both keys, `timeout:8` (bd cut at 8 s, oxyjs hedged at 5 s and cut 8 s later: 13.3 s): the
 /// agent's `timeout:` is the renders' ONE wall: one cut call, done by `timeout:` + 1 s. Plain fails at once: a
-/// local site's 403 (a closed port is no instant failure everywhere: Windows retries the connect for ~2 s, plain's
-/// own time, which the paid wall never counts).
+/// local site's 403 (plain's own time, which the paid wall never counts).
 #[test]
 fn timeout_is_one_wall_with_both_keys() {
-    use std::io::{Read, Write};
     let _dir = setup_env();
-    let site = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let url = format!("http://{}/cut", site.local_addr().expect("addr"));
-    std::thread::spawn(move || {
-        for mut c in site.incoming().flatten() {
-            // a request (one small packet) gets the 403
-            if c.read(&mut [0; 4096]).is_ok_and(|n| n > 0) {
-                c.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").ok();
-            }
-        }
-    });
-    let t0 = Instant::now();
-    let (out, ..) = fats::cli::run(&[&url, "timeout:2", "hedge:1", "wait:30"].map(String::from));
-    let took = t0.elapsed();
+    let url = format!("{}/cut", site_403());
+    let (out, took) = run(&[&url, "timeout:2", "hedge:1", "wait:30"]);
     eprintln!("timeout:2: {} ms\n{out}", took.as_millis());
     let eq = out.lines().find(|l| l.starts_with("= ")).unwrap_or_default();
     assert_eq!(eq.matches("provider_timeout✗").count(), 1, "one cut call: {out}");
     assert!(took <= Duration::from_secs(3), "{took:?}: {out}");
+}
+
+/// The same URL asked again while its run is live waits for that run, as `fats u1` would: `pending` at `wait:1`,
+/// then the page the moment bd lands (~3 s after the first ask) within `wait:30`, in the same id, never `pending`
+/// at once; then a cache hit. `dry:true` on the live run says it would wait for u1, never a second fetch.
+#[test]
+fn a_live_url_asked_again_waits_for_its_run() {
+    let _dir = setup_env();
+    let url = format!("{}/lands3s", site_403());
+    let (first, took) = run(&[&url, "wait:1"]);
+    assert!(first.starts_with("= j1.u1 pending ") && took < Duration::from_secs(2), "{took:?}: {first}");
+    let (dry, _) = run(&[&url, "dry:true"]);
+    assert!(dry.contains("/lands3s = u1 (running) · waits up to 30s for it · $0"), "{dry}");
+    let (again, took) = run(&[&url, "wait:30"]);
+    let head = again.lines().next().unwrap_or_default();
+    assert!(head.starts_with("= j1.u1 Lands Late ") && !head.contains("pending"), "{took:?}: {again}");
+    assert!(took < Duration::from_secs(5), "the page the moment it lands: {took:?}");
+    let (third, _) = run(&[&url]);
+    assert!(third.lines().next().is_some_and(|l| l.contains("Lands Late") && l.contains(" · cache ")), "{third}");
 }

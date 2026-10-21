@@ -24,7 +24,14 @@
   "share_card": ["og", "opengraph", "share", "social", "card"],
   "share_host": ["og", "opengraph"],
   "ad_slot": ["ad", "advertisement"],
-  "said": [["comment", "comments"], ["count", "total"]],
+  "post_counts": [
+    ["comments", ["comment", "comments"]], ["replies", ["reply", "replies"]], ["upvotes", ["upvote", "upvotes"]],
+    ["votes", ["vote", "votes"]], ["likes", ["like", "likes"]], ["answers", ["answer", "answers"]]
+  ],
+  "post_marker": ["count", "num", "number", "total"],
+  "post_skip": ["remaining", "more", "hidden", "new", "unread"],
+  "post_facts": [["score", ["score"]], ["points", ["points"]], ["posted", ["datetime"]]],
+  "post_time": ["posted", ["created", "published", "posted"], ["time", "timestamp", "date"]],
   "tracking": ["utm_", "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "_ga"],
   "currency": ["€", "$", "£", "EUR", "USD"],
   "info": [

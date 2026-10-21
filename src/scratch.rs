@@ -34,3 +34,19 @@ impl Drop for Scratch {
         std::fs::remove_dir_all(&self.0).ok();
     }
 }
+
+/// `keys` (provider name → key) as `<dir>/auth.json`, the file `fats setup` writes: 0600 in a 0700 dir. The one
+/// way a test gives fats a key: it reads none from the environment.
+pub(crate) fn auth(dir: &Path, keys: &[(&str, &str)]) {
+    let keys: serde_json::Map<String, serde_json::Value> =
+        keys.iter().map(|(n, k)| (n.to_string(), (*k).into())).collect();
+    std::fs::create_dir_all(dir).expect("key dir");
+    let file = dir.join("auth.json");
+    std::fs::write(&file, serde_json::json!({"version": 1, "keys": keys}).to_string()).expect("auth.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("chmod key dir");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod auth.json");
+    }
+}

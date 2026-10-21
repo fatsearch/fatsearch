@@ -207,8 +207,9 @@ fn title_query(doc: &Doc) -> Vec<String> {
 pub fn info_line(info: &Info) -> String {
     let get = |k: &str| info.get(k).map(String::as_str).filter(|v| !v.is_empty());
     let mut parts: Vec<String> = get("outline").map(String::from).into_iter().collect();
-    let fields = ["author", "published", "modified", "price", "rating"];
-    parts.extend(fields.iter().filter_map(|k| get(k).map(|v| format!("{k} {v}"))));
+    // the post's own counts after the page's facts (`clean::post`): `comments 296 · score 26 · posted 2025-12-11`
+    let fields = ["author", "published", "modified", "price", "rating"].into_iter().chain(crate::clean::post_keys());
+    parts.extend(fields.filter_map(|k| get(k).map(|v| format!("{k} {v}"))));
     if let Some(d) = get("description")
         && parts.len() < 3
     {
@@ -287,16 +288,14 @@ fn read(p: &Page, k: usize, part: usize, lines: &[String]) -> bool {
     [Id { sec: Some(k), part, ..Id::default() }.sec_tail(), key_of(lines)].iter().any(|r| p.at.0.contains(r))
 }
 
-/// The read log's key of part `part` of section `k` (`Entry::read`): `=` + 16 hex of its text, the `lN` numbers out
-/// (they move with the copy's length).
+/// The read log's key of part `part` of section `k` (`Entry::read`): `=` + 16 hex of its text.
 pub fn part_key(doc: &Doc, k: usize, part: usize) -> Option<String> {
     doc.sections.get(k.checked_sub(1)?)?;
     parts_of(doc, k).get(part).map(|lines| key_of(lines))
 }
 
 fn key_of(lines: &[String]) -> String {
-    let text: String = lines.iter().map(|l| l.trim_start_matches(|c: char| c == 'l' || c.is_ascii_digit())).collect();
-    format!("={}", &blake3::hash(text.as_bytes()).to_hex()[..16])
+    format!("={}", &blake3::hash(lines.concat().as_bytes()).to_hex()[..16])
 }
 
 pub type Shown = (Vec<String>, Option<Cursor>);
@@ -318,7 +317,7 @@ pub fn outline(p: &Page, prov: Option<&str>) -> Shown {
     let mut lines = vec![head_line(p, prov, doc.tokens.clean, None)];
     lines.extend(page_flags(p).iter().filter(|f| f.row).map(|f| f.bang(id)));
     // a failed run's skipped tiers (`fetch::skipped`: `no_key`, `budget_hit`), kept with it: every read says them,
-    // a `no_key` row only while that key is still missing ("set BRIGHTDATA_API_KEY" under an arrow using it),
+    // a `no_key` row only while that key is still missing (`→ fats setup bd` under an arrow that buys bd),
     // a `budget_hit` row only while no newer copy served (the page's row points there), its arrow the reader's
     // (`lang::restamp`)
     let missing = no_key_left(p.meta);
@@ -387,12 +386,9 @@ pub fn outline(p: &Page, prov: Option<&str>) -> Shown {
 }
 
 /// An island no reader can use: its first part is an encoded blob (base64 or its URL-safe form: ≥ `blob_share`
-/// of its chars, no space in it, line ids aside). Its row prints the size and no way in.
+/// of its chars, no space in it). Its row prints the size and no way in.
 fn encoded(doc: &Doc, k: usize) -> bool {
-    let lid = |n: &str| n.strip_prefix('l').is_some_and(|d| d.parse::<usize>().is_ok());
-    let first = parts_of(doc, k).into_iter().next().unwrap_or_default();
-    let text: String =
-        first.iter().map(|l| l.split_once(' ').filter(|x| lid(x.0)).map_or(l.as_str(), |x| x.1)).collect();
+    let text = parts_of(doc, k).into_iter().next().unwrap_or_default().concat();
     let coded = text.chars().filter(|c| c.is_ascii_alphanumeric() || "+/=-_".contains(*c)).count();
     let share: f64 = limit("blob_share");
     !text.is_empty() && !text.contains(char::is_whitespace) && coded as f64 >= share * text.chars().count() as f64
@@ -415,7 +411,7 @@ pub fn size(p: &Page, lines: &[String]) -> usize {
 
 /// The HOW a whole read's `=` figure counts in place of its own: `local 2ms`, `cache 2h`, `bd 4321ms spent $0.0015`
 /// differ per read of one page, so it counts a plain fetch's width and a fetch and its cache read print one size.
-const HOW_WIDTH: &str = "plain 400ms spent $0.0000";
+const HOW_WIDTH: &str = "plain 400ms";
 
 /// The `=` line: id, a failed fetch's code, title, shape (sections, PDF pages, text lines), `size` tok, and how it
 /// came (a cache read too: a paid run is read from the cache); `how` = a HOW in place of this read's (`HOW_WIDTH`).
@@ -428,7 +424,7 @@ fn head_line(p: &Page, prov: Option<&str>, size: usize, how: Option<&str>) -> St
             // the path when it was more than one plain call (a second ask says why: `md:thin`)
             let more = meta.hops.len() > 1 || meta.hops.iter().any(|h| h.why.starts_with("md:"));
             let by = if more { meta.tried() } else { meta.provider.clone() + &meta.geo() };
-            format!("{by} {}ms spent ${:.4}{}", meta.ms, meta.cost, meta.how())
+            format!("{by} {}ms{}{}", meta.ms, crate::provider::spent(" ", meta.cost, meta.upto()), meta.how())
         }
     };
     let n = doc.served();
@@ -702,7 +698,7 @@ fn page_flags(p: &Page) -> Vec<Flag> {
         let (why, again, fix, _) = fail_row(meta, &p.at.4, "", id, p.at.1.is_some());
         // a copy holding the page's own words says so and points at them, never "nothing left"
         let (shown, copy) = if anchored { (" · page content shown", "") } else { ("", " · showing the best copy") };
-        // why the run failed, as on a failed copy without a doc (`bd cut at 60 s (3m ago)`); the failure count, never
+        // why the run failed, as on a failed copy without a doc (`bd cut at 40 s (3m ago)`); the failure count, never
         // beside a newer copy that served (its row points there)
         let why = if why.is_empty() { why } else { format!(" · {why}") };
         // an app page's way out, or a stored copy of the page (never "nothing left" with the page in the cache)

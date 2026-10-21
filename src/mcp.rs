@@ -9,9 +9,10 @@
 use crate::lang::CARD;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    PaginatedRequestParams, ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerConfig, Tool,
+    ToolAnnotations,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 
 /// The tool description: one line + two examples (~60 tokens) for clients that drop `instructions`.
@@ -64,7 +65,7 @@ impl ServerHandler for Fats {
     async fn call_tool(
         &self,
         req: CallToolRequestParams,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         if req.name != "fats" {
             return Err(ErrorData::invalid_params(format!("unknown tool {} · the one tool is fats", req.name), None));
@@ -74,7 +75,8 @@ impl ServerHandler for Fats {
         };
         let (cmd, asked) = (vec![cmd.to_string()], vec![cmd.to_string()]);
         // `cli::run` blocks (and runs its own fetch runtime), so it gets a blocking thread
-        let (text, rc, image) = tokio::task::spawn_blocking(move || crate::cli::run(&cmd))
+        let work = tokio::task::spawn_blocking(move || crate::cli::run(&cmd));
+        let (text, rc, image) = ticking(work, ctx.meta.get_progress_token(), &ctx.peer)
             .await
             .map_err(|e| ErrorData::internal_error(format!("fats crashed: {e}"), None))?;
         // the cache sweep, the notice (stderr, never in the answer), the update check: off the answer's path
@@ -90,6 +92,27 @@ impl ServerHandler for Fats {
         let mut r = CallToolResult::success(blocks);
         r.is_error = Some(rc != 0); // rc 1 = the command failed, 2 = usage: the text says why either way
         Ok(r.into())
+    }
+}
+
+/// `work`, the host's spinner fed while it runs: every 5 s (`cli::TICK`) a `notifications/progress` with the
+/// request's `_meta.progressToken`, `still working · 10 s`; none without a token (MCP spec, basic/utilities/progress).
+/// A host may show it to the human; none shows it to the model before the answer, so the answer never waits on it.
+async fn ticking<T>(
+    mut work: tokio::task::JoinHandle<T>,
+    token: Option<ProgressToken>,
+    peer: &Peer<RoleServer>,
+) -> Result<T, tokio::task::JoinError> {
+    let Some(token) = token else { return work.await };
+    let mut s = 0;
+    loop {
+        if let Ok(done) = tokio::time::timeout(crate::cli::TICK, &mut work).await {
+            return done;
+        }
+        s += crate::cli::TICK.as_secs();
+        let tick =
+            ProgressNotificationParam::new(token.clone(), s as f64).with_message(format!("still working · {s} s"));
+        peer.notify_progress(tick).await.ok();
     }
 }
 

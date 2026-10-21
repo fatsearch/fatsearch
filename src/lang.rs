@@ -19,7 +19,7 @@ pub struct Words {
     pub lists: Vec<&'static str>,
     /// Other spellings of a reserved word, and what people type for it (`login` → `setup`, `balance` →
     /// `account`): reserved only without free text, like the word itself; `-V` by its case.
-    aliases: Vec<(&'static str, &'static str)>,
+    pub aliases: Vec<(&'static str, &'static str)>,
     /// Words people type that name no command (`logout`, `install`): alone (mods aside) they get one `!` line
     /// pointing to what fats has (`{b}` = the binary), never a paid search.
     elsewhere: Vec<(&'static str, &'static str)>,
@@ -38,6 +38,8 @@ pub struct Words {
     /// The IANA root zone (`tlds-alpha-by-domain.txt`, version 2026101900): a bare name is a host only when its
     /// last label is one (`bare_tld`): `opencode.json`, `main.go` are words.
     tlds: Vec<&'static str>,
+    /// What leads a path, never a key (`setup::masked`): `/etc/x`, `./file`, `~/x`.
+    pub path_lead: Vec<&'static str>,
     /// The TLDs that are a file's extension too: a lone one-dot name ending in one (`main.rs`) is a file when it
     /// exists, else it asks file or site (`parse`), never a guessed site.
     file_tlds: Vec<&'static str>,
@@ -57,7 +59,7 @@ pub static WORDS: LazyLock<Words> = LazyLock::new(|| crate::settings::table("wor
 pub const CARD: &str = "\
 fats <url|file.pdf>     fetch, outline           fats u3  u3#2  u3#2 l4  page  section  link
 fats u3#2 <words>       filter inside            fats <words>  web search → ids  site:ex.com  since:7d
-mods key:value  limit:20  match:exact|words  country:de  js:true  cost:0.5  wait:30 (then pending)  provider:plain|bd|oxy|decodo  device:mobile
+mods key:value  limit:20  match:exact|words  country:de  js:true  wait:30 (then pending)  provider:plain|bd|oxy|decodo  device:mobile
 more  up  all  full  json  fats = status  fats setup = keys  fats account = balance  j8.u3 = another session's id";
 
 /// `fats guide`: how to use fats well, the body the installed skill points at (`skills/fatsearch/SKILL.md`), so
@@ -83,7 +85,7 @@ pub const SCREENS: [(&str, &str); 11] = crate::settings::embed!("screens/", ".tx
 const STYLES: [(&str, u8); 6] = [("bold", 1), ("dim", 2), ("green", 32), ("red", 31), ("cyan", 36), ("/", 0)];
 
 /// A screen with styles only.
-const NO_HOLES: [(&str, &str); 0] = [];
+pub const NO_HOLES: [(&str, &str); 0] = [];
 
 pub fn screen(name: &str) -> &'static str {
     SCREENS.iter().find(|s| s.0 == name).map_or("", |s| s.1)
@@ -98,6 +100,8 @@ pub fn draw(text: &str, holes: &[(&str, impl AsRef<str>)]) -> String {
 /// A human screen: `text`'s holes, then its styles.
 pub fn paint(text: &str, holes: &[(&str, impl AsRef<str>)]) -> String {
     let plain = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    #[cfg(test)]
+    let plain = tests::NO_COLOR.get().unwrap_or(plain);
     draw(&draw(text, holes), &STYLES.map(|(k, n)| (k, if plain { String::new() } else { format!("\x1b[{n}m") })))
 }
 
@@ -179,7 +183,7 @@ pub fn fix(code: &str, at: &At) -> String {
     // refused after oxy → oxyjs), never after a page's no-JS failure (`not_pdf`: a render brings no PDF)
     if sent
         && (js.is_some() || crate::provider::REFUSED.contains(&code))
-        && let Some((_, arrow)) = crate::fetch::left_ask(at.id, at.url, at.done, |_| true)
+        && let Some((_, arrow)) = crate::fetch::left_ask(at.id, at.url, &crate::provider::Tier::ALL, at.done, |_| true)
     {
         return arrow;
     }
@@ -1024,7 +1028,7 @@ fn own_words(cmd: &mut Cmd, toks: &mut Vec<String>, i: usize) {
         ("setup", w) if switches.contains(&w) || w == "plain" => 1 + usize::from(on),
         // the level is checked by `settings::set`, which names the levels
         ("setup", "telemetry") => 1 + usize::from(toks.get(i + 2).is_some_and(own)),
-        ("telemetry", "show") => 1,
+        ("telemetry", "show") | ("setup", "import-env") => 1,
         // the value is every word up to the mods, whole (`~/Library/Application Support/x` is a cache dir)
         ("config", "set") => 3 + toks.iter().skip(i + 4).take_while(|t| own(t)).count(),
         ("config", "unset") => 2,
@@ -1078,9 +1082,9 @@ impl Out {
         Out { lines, ..Out::default() }
     }
 
-    /// Usage problem (`?` line, exit 2).
-    pub fn ask(line: String) -> Out {
-        Out { rc: 2, ..Out::new(vec![line]).with("error", "usage") }
+    /// THE `?` printer: a usage row, exit 2; a key-shaped word in it (what was typed may be a key) as its tail.
+    pub fn ask(line: &str) -> Out {
+        Out { rc: 2, ..Out::new(vec![crate::setup::masked(line)]).with("error", "usage") }
     }
 
     /// Whole-command failure (`= !` line + fix, exit 1).
@@ -1212,8 +1216,14 @@ fn record(o: &Out, warn: &[serde_json::Value]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// `NO_COLOR` as this thread's `paint` reads it (Some = set or not), None = the environment's: a test sees
+        /// both sides without touching the process environment.
+        pub(crate) static NO_COLOR: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
 
     fn c(s: &str) -> Cmd {
         parse(&s.split(' ').map(String::from).collect::<Vec<_>>())

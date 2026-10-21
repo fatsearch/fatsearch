@@ -1,11 +1,11 @@
 {
   "specs": [
     {"name": "plain", "short": "plain", "env": "", "timeout": {"secs": 10, "nanos": 0}, "price": 0.0, "can": ["page", "pdf", "gov"], "bills_site_5xx": false, "buys": "", "search_s": 0},
-    {"name": "brightdata", "short": "bd", "env": "BRIGHTDATA_API_KEY", "timeout": {"secs": 60, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "search", "pdf", "auto_geo"], "bills_site_5xx": false, "buys": "unblock+JS", "search_s": 10},
+    {"name": "brightdata", "short": "bd", "env": "BRIGHTDATA_API_KEY", "timeout": {"secs": 40, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "search", "pdf", "auto_geo"], "bills_site_5xx": false, "buys": "unblock+JS", "search_s": 10},
     {"name": "oxylabs", "short": "oxy", "env": "OXYLABS_WEB_API_KEY", "timeout": {"secs": 10, "nanos": 0}, "price": 0.0010, "can": ["page", "search", "pdf", "gov"], "bills_site_5xx": true, "buys": "no-JS fetch", "search_s": 2},
-    {"name": "oxylabs-js", "short": "oxyjs", "env": "OXYLABS_WEB_API_KEY", "timeout": {"secs": 60, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "gov"], "bills_site_5xx": true, "buys": "JS render", "search_s": 0},
+    {"name": "oxylabs-js", "short": "oxyjs", "env": "OXYLABS_WEB_API_KEY", "timeout": {"secs": 40, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "gov"], "bills_site_5xx": true, "buys": "JS render", "search_s": 0},
     {"name": "decodo", "short": "decodo", "env": "DECODO_AUTH_TOKEN", "timeout": {"secs": 15, "nanos": 0}, "price": 0.0010, "can": ["page", "gov"], "bills_site_5xx": true, "buys": "no-JS fetch", "search_s": 0},
-    {"name": "decodo-js", "short": "decodojs", "env": "DECODO_AUTH_TOKEN", "timeout": {"secs": 60, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "gov"], "bills_site_5xx": true, "buys": "JS render", "search_s": 0}
+    {"name": "decodo-js", "short": "decodojs", "env": "DECODO_AUTH_TOKEN", "timeout": {"secs": 40, "nanos": 0}, "price": 0.0015, "can": ["page", "js", "gov"], "bills_site_5xx": true, "buys": "JS render", "search_s": 0}
   ],
   "apis": [
     {"api": "BdRequest", "method": "POST", "url": "https://api.brightdata.com/request", "what": ""},

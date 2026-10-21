@@ -46,6 +46,7 @@
   "dns_wait": 5,
   "dns_fast_ms": 1000,
   "reason_chars": 50,
+  "key_chars": 20,
   "week_samples": 1000,
   "crash_chars": 48,
   "telemetry_wait_s": 5,

@@ -45,7 +45,7 @@ pub struct Settings {
     pub bd_zone: Option<Set<String>>,
     /// Thresholds set outside limits.json (env `FATS_<NAME>`, `settings.json`), checked against its kinds (`limit_of`).
     pub limits: std::collections::HashMap<&'static str, Set<serde_json::Value>>,
-    /// `settings.json` as read at start: providers switched off, the zone, `set`.
+    /// `settings.json` as read at start (`set`, the zone; the `off` switches are read at each call: `on`).
     pub saved: Saved,
     /// One `! bad_setting …` row per refused value.
     pub rejects: Vec<String>,
@@ -98,23 +98,39 @@ pub fn saved(name: &str) -> Saved {
     saved_in(&get().key_dir.value, name)
 }
 
+/// Key-dir file `name`'s path (a unit test's own dir, `tests::key_dir`).
+pub fn key_file(name: &str) -> PathBuf {
+    let dir = &get().key_dir.value;
+    #[cfg(test)]
+    let dir = &tests::key_dir(dir);
+    dir.join(name)
+}
+
 fn saved_in(dir: &Path, name: &str) -> Saved {
+    #[cfg(test)]
+    let dir = &tests::key_dir(dir);
     std::fs::read(dir.join(name)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
 /// Change key-dir file `name` with `edit` and write it whole: a temp file (0600, synced), then a rename, so a
-/// crash leaves the old file or the new one. A file a newer fats wrote (`version` > 1) is never overwritten.
-/// Err = `<name>: <why>`.
+/// crash leaves the old file or the new one. A file a newer fats wrote (`version` > 1) is never overwritten; one
+/// whose edit replaces or removes a key is copied to `<name>.bak` (0600) first. Err = `<name>: <why>`.
 fn save(name: &str, edit: impl FnOnce(&mut Saved)) -> Result<(), String> {
     save_to(&get().key_dir.value, name, edit).map_err(|e| format!("{name}: {e}"))
 }
 
 fn save_to(dir: &Path, name: &str, edit: impl FnOnce(&mut Saved)) -> std::io::Result<()> {
+    #[cfg(test)]
+    let dir = &tests::key_dir(dir);
     let mut s = saved_in(dir, name);
     if s.version > 1 {
         return Err(std::io::Error::other(format!("{name} is version {}: written by a newer fats", s.version)));
     }
+    let old = s.keys.clone();
     edit(&mut s);
+    if old.iter().any(|(k, v)| s.keys.get(k) != Some(v)) {
+        save_in(dir, &format!("{name}.bak"), &std::fs::read(dir.join(name))?, false)?;
+    }
     s.version = 1;
     let tmp = format!(".{name}.tmp");
     save_in(dir, &tmp, &serde_json::to_vec_pretty(&s).map_err(std::io::Error::other)?, false)?;
@@ -141,18 +157,19 @@ fn migrate(dir: &Path) {
 /// THE names `fats setup` keys, switches and saves under (`auth.json`): `free` = the plain fetch.
 pub const SWITCHES: [&str; 5] = ["free", "oxy", "bd", "decodo", "gh"];
 
-/// The env var of `name`: its providers.json row's (by `short`), `GH_TOKEN` for gh; none without a row.
-pub fn env_of(name: &str) -> &'static str {
-    let spec = crate::provider::PROVIDERS.specs.iter().find(|s| s.short == name);
-    spec.map_or(if name == "gh" { "GH_TOKEN" } else { "" }, |s| s.env)
+/// THE key read (fetches, setup, config, status): `auth.json` only, read at each call (a long `fats mcp` sees a
+/// key `fats setup` saved). A key in the environment is never sent: `fats setup import-env` copies it in, so the
+/// key a person saved is the key every call uses. Never printed or logged.
+pub fn key(name: &str) -> Option<String> {
+    saved(AUTH).keys.get(name).map(|v| v.trim().to_string()).filter(|k| !k.is_empty())
 }
 
-/// THE key read (fetches, setup, config): env first, then `auth.json`, read at each call (a long `fats mcp` sees a
-/// key `fats setup` saved). (value, source `env` | `auth.json`); never printed or logged.
-pub fn key(name: &str) -> Option<(String, &'static str)> {
-    let from_env = Some(env_of(name)).filter(|e| !e.is_empty()).and_then(env).map(|v| (v, "env"));
-    let file = || saved(AUTH).keys.get(name).map(|v| (v.clone(), AUTH));
-    from_env.into_iter().chain(file()).map(|(v, at)| (v.trim().to_string(), at)).find(|k| !k.0.is_empty())
+/// `name`'s key in the environment when it is not the one `auth.json` holds: (its variable, the providers.json
+/// row's or `GH_TOKEN` for gh; the key). Never sent, only copied in (`fats setup import-env`) or named as unused.
+/// Unit tests read none.
+pub fn env_key(name: &str) -> Option<(&'static str, String)> {
+    let var = crate::provider::Tier::parse(name).map_or(if name == "gh" { "GH_TOKEN" } else { "" }, |t| t.spec().env);
+    env(var).map(|v| (var, v.trim().to_string())).filter(|v| !v.1.is_empty() && key(name).as_ref() != Some(&v.1))
 }
 
 /// `name`'s key into `auth.json`, a Bright Data zone into `settings.json`. Err = the reason, never the key.
@@ -167,25 +184,34 @@ pub fn remove_key(name: &str) -> Result<(), String> {
     save(PREFS, |f| f.bd_zone = f.bd_zone.take().filter(|_| name != "bd"))
 }
 
-/// `name` is not switched off (`settings.json` `off`, read at start).
+/// `name` is not switched off (`settings.json` `off`, read at each call as `key` reads keys: a `set_on` in this
+/// process, a `fats setup` beside a long `fats mcp`, shows at once).
 pub fn on(name: &str) -> bool {
-    !get().saved.off.iter().any(|o| o == name)
+    !saved(PREFS).off.iter().any(|o| o == name)
 }
 
-/// Switch `name` on or off, never leaving nothing that can fetch: after it, the free fetch or a keyed provider
-/// (not gh) stays on. Err = the reason (`! refused · <it>`).
+/// Switch `name` on or off (`switched`). Err = the reason (`! refused · <it>`).
 pub fn set_on(name: &str, on: bool) -> Result<(), String> {
+    let off = switched(name, on)?;
+    save(PREFS, |f| f.off = off)
+}
+
+/// THE switch rule: `settings.json`'s `off` with `name` switched, never leaving nothing that can fetch: after it,
+/// the free fetch or a keyed provider (not gh) stays on. Err = why not; `fats setup` shows no button it refuses.
+pub fn switched(name: &str, on: bool) -> Result<Vec<String>, String> {
     if !SWITCHES.contains(&name) {
         return Err(format!("unknown {name} · one of {}", SWITCHES.join(" ")));
     }
     let mut off = saved(PREFS).off;
     off.retain(|o| o != name);
-    off.extend((!on).then(|| name.to_string()));
+    if !on {
+        off.push(name.to_string());
+    }
     let fetches = |n: &&str| *n != "gh" && !off.iter().any(|o| o == n) && (*n == "free" || key(n).is_some());
     if !SWITCHES.iter().any(fetches) {
         return Err("nothing left that can fetch: turn one on or add a key".into());
     }
-    save(PREFS, |f| f.off = off)
+    Ok(off)
 }
 
 /// The settings `config set` takes besides the thresholds: the env readers', by their env name less `FATS_`.
@@ -254,14 +280,12 @@ pub fn save_in(dir: &Path, file: &str, bytes: &[u8], append: bool) -> std::io::R
     if append { Ok(()) } else { f.sync_all() }
 }
 
-/// THE secret register: every credential this binary can send (each provider's env var, `GH_TOKEN`, every key in
-/// `auth.json`). `lang::emit` masks them in everything it prints, a provider's error body is masked before it is
-/// kept. A new credential goes in here.
+/// THE secret register: every credential this binary can send (every key in `auth.json`, `key`) and every key the
+/// environment holds (`env_key`: never sent, still never printed). `lang::emit` masks them in everything it
+/// prints, a provider's error body is masked before it is kept. A new credential goes in here.
 pub fn secrets() -> Vec<String> {
-    let envs = crate::provider::PROVIDERS.specs.iter().map(|s| s.env).chain(["GH_TOKEN"]).filter(|e| !e.is_empty());
-    let all = envs.filter_map(|e| std::env::var(e).ok()).chain(saved(AUTH).keys.into_values());
-    let all = all.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    all.collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+    let env = SWITCHES.into_iter().filter_map(|p| env_key(p).map(|e| e.1));
+    saved(AUTH).keys.into_values().map(|k| k.trim().to_string()).chain(env).filter(|k| !k.is_empty()).collect()
 }
 
 /// The built-in tables: data, not logic, as JSON under `src/data/`, each parsed once (`table`) into its owner's
@@ -478,8 +502,44 @@ impl Reader<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        /// This thread's key dir in place of the scratch home's one that every unit test process shares: a test
+        /// that saves keys and switches owns its `auth.json` and `settings.json`, no other test sees them.
+        pub(crate) static KEY_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The key dir `saved_in` and `save_to` use for `dir`: this thread's own (`KEY_DIR`), else `dir`.
+    pub(crate) fn key_dir(dir: &Path) -> PathBuf {
+        KEY_DIR.with_borrow(Clone::clone).unwrap_or_else(|| dir.into())
+    }
+
+    /// A key replaced (or removed) leaves the file it was in as `auth.json.bak`, 0600; a new key replaces nothing and
+    /// writes none. The key read is `auth.json`'s, never the environment's (unit tests read no env at all).
+    #[test]
+    fn a_replaced_key_leaves_a_backup() {
+        let dir = crate::scratch::Scratch::new("auth-bak");
+        KEY_DIR.set(Some(dir.to_path_buf()));
+        crate::scratch::auth(&dir, &[("oxy", "first-oxy-key-0123456789")]);
+        save_key("bd", "bd-key-0123456789", Some("zone_a")).expect("save");
+        assert!(!dir.join("auth.json.bak").exists(), "a new key replaces nothing");
+        let before = std::fs::read(dir.join(AUTH)).expect("auth.json");
+        save_key("oxy", " second-oxy-key-0123456789 ", None).expect("replace");
+        assert_eq!(std::fs::read(dir.join("auth.json.bak")).expect("the backup"), before);
+        assert_eq!(key("oxy").as_deref(), Some("second-oxy-key-0123456789"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("auth.json.bak")).map(|m| m.permissions().mode() & 0o777);
+            assert_eq!(mode.ok(), Some(0o600));
+        }
+        remove_key("bd").expect("remove");
+        let bak = String::from_utf8(std::fs::read(dir.join("auth.json.bak")).expect("the backup")).expect("utf-8");
+        assert!(bak.contains("bd-key-0123456789") && key("bd").is_none() && env_key("oxy").is_none(), "{bak}");
+        KEY_DIR.set(None);
+    }
 
     /// Review 0.1.7: a unit test never reads the developer's cache, keys or zone (`worst` read its stored copies):
     /// the settings of a test run sit under a scratch home and take nothing from the env.
@@ -552,9 +612,9 @@ mod tests {
                 ("errors", 53),
                 ("check", 86),
                 ("sites", 69),
-                ("clean", 167),
-                ("words", 1605),
-                ("limits", 52),
+                ("clean", 186),
+                ("words", 1608),
+                ("limits", 53),
                 ("telemetry", 10)
             ]
         );
@@ -574,7 +634,11 @@ mod tests {
         let p = &crate::provider::PROVIDERS;
         assert_eq!((p.specs.len(), p.apis.len(), p.links.len(), p.cctld.len()), (6, 14, 4, 25));
         let bd = crate::provider::Tier::Bd.spec();
-        assert_eq!((bd.short, bd.env, bd.timeout.as_secs(), bd.price), ("bd", "BRIGHTDATA_API_KEY", 60, 0.0015));
+        assert_eq!((bd.short, bd.env, bd.timeout.as_secs(), bd.price), ("bd", "BRIGHTDATA_API_KEY", 40, 0.0015));
+        // every render tier gets 40 s
+        use crate::provider::Tier;
+        let renders = [Tier::Bd, Tier::OxyJs, Tier::DecodoJs].map(|t| t.spec().timeout.as_secs());
+        assert_eq!(renders, [40; 3]);
         let costs = crate::provider::Api::BdCosts.row();
         assert_eq!((costs.method, costs.url), ("POST", "https://api.brightdata.com/costs/export/json"));
         assert_eq!((p.links[2].billing, p.cctld["uk"]), (Some("https://brightdata.com/cp/billing"), "gb en"));

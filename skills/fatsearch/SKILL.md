@@ -20,9 +20,9 @@ installed version. Over MCP: `fats("guide")`. One screen of commands: `fats help
 2. Install one way: `brew install fatsearch/tap/fatsearch` · `npm i -g fatsearch` · `cargo install --locked fatsearch` ·
    `curl -fsSL https://github.com/fatsearch/fatsearch/releases/latest/download/fatsearch-installer.sh | sh`
    (Windows: `npm i -g fatsearch`).
-3. Keys are optional (plain pages cost $0). Keys already in the environment work as they are. Never ask for a key
-   in chat: `fats setup oxy` (or `bd`, `decodo`) prints a local form; pass its steps to the user.
+3. Keys are optional (plain pages cost $0) and live in `auth.json` only: an exported key is not used until the user
+   runs `fats setup import-env`. Never ask for a key in chat: `fats setup oxy` (or `bd`, `decodo`) prints a local
+   form; pass its steps to the user.
 4. Connect: `claude mcp add --scope user fats -- fats mcp` · `codex mcp add fats -- fats mcp` · other hosts: a
    stdio server, command `fats` (absolute path for GUI apps), args `["mcp"]`.
-5. Verify: `fats https://example.com` prints a first line with `Example Domain`.
-6. Ask the user one question: which page or search to start with.
+5. Ask the user one question: which page or search to start with.

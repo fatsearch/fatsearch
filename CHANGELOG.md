@@ -5,6 +5,127 @@ versions: [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Numbers co
 Silicon Mac, one run each unless a range is given; provider results move run to run.
 Method: [docs/benchmarks.md](docs/benchmarks.md).
 
+## 0.2.3 - 2026-10-21
+
+### Added
+
+- A wait you can see: when `fats` waits more than 5 s for a page or a search, a terminal shows
+  `~ still working · bd, oxyjs running · 10 s` on stderr, every 5 s. Only a terminal: a pipe (an agent's shell)
+  gets no byte, so the answer an agent reads is unchanged. Under `fats mcp`, a call that sent a
+  `progressToken` gets an MCP progress notification every 5 s (`still working · 10 s`), so a host can show its
+  spinner. Between two providers the line says `next tier`; `starting` only before the first call.
+
+### Changed
+
+- A post's own counts are in the first answer: `u1#0 info | comments 296 · score 26 · posted 2025-12-11`. They
+  come from the first element on the page that carries a comment, reply, vote, like or answer count and sits in
+  no list item, nav or sidebar (a related post's card, a menu's count), and its score and posted time from that
+  same element only (a comment's score never counts). A thread copy that holds fewer
+  comments than that count says `25 of 296 comments served`. A count of what the page does not show (`remaining
+  comments`) and a score with no count beside it (a review's bars) give no row.
+- `fats guide` lists `wait:30 s before pending` among the mods, the value a `pending` row's next move uses; it
+  showed `wait:90`, which holds a call for up to a minute and a half.
+- A JavaScript render (Bright Data, Oxylabs or Decodo with JavaScript) now gets 40 s before `fats` cuts it
+  (was 60 s): of 131 renders that served in my runs, 8 took 40–60 s and none longer. The row of a cut says
+  `oxyjs cut at 40 s`; `timeout:60` still gives a render the old time. A render cut at its 40 s is never
+  retried, with one key too: the run ends there instead of rendering the page again for up to 80 s more at
+  twice the price. A call without JavaScript keeps its one retry after a cut.
+- `fats guide` and `fats help` no longer show a `cost:` value: an agent copied `cost:0` from the guide on
+  every page and then skipped the paid fetch the page needed. The `cost:` mod works as before
+  (docs/reference.md).
+- `fats guide` rule 6 reads `pending ≠ failed: fats u3 wait:30, free.` It also said "Never fresh:true",
+  while a `! budget_hit` row's next move is `fresh:true`: the guide banned the fix its own rows print.
+- A web search lists every result that fits the 1000-token read cap (was 300 tokens, about four rows, then
+  `fats more`). A 9-result search now prints in one answer of ~620 tokens instead of three answers of ~760.
+- The `=` line names a spend only when there is one: a free fetch ends `plain 76ms` (was `plain 76ms spent
+  $0.0000`); a paid one still ends `spent $0.0015`, a call cut before it answered `spent $0.0000 + ≤$0.0015
+  unverified`, and `fats stats` keeps its total. The background line drops `not charged` the same way. Free
+  answers had printed `$0.0000` so often that an agent treated staying at $0 as the goal. A small page read
+  whole counts 11 fewer tokens (the dropped `spent $0.0000`). json records gain `upto`, the unverified part.
+- With two provider keys, a `! budget_hit` row ends with a second way for a user who asked to pay:
+  `· if the user said pay, fats u1 fresh:true provider:oxy ≤$0.0025` (Oxylabs first, then Decodo, then Bright
+  Data; the price is that provider's whole path). An agent told "use oxylabs" had applied it to its search only.
+- A page whose paid try the `cost:` cap stopped exits 0 when a copy is shown (was 1): the command ran as
+  asked, and its `! budget_hit` row carries the paid move. Scripts: read `error` with `json:true`
+  (`"error": "budget_hit"`). A batch still counts it as `! budget_hit`; a capped page with no copy exits 1.
+- The agent skill (`skills/fatsearch/SKILL.md`) no longer asks the agent to verify the install on
+  example.com: it connects `fats` and asks the user where to start.
+- `fats setup` screens are in colour like the rest of fats: ✓ green, ○ dim, ✗ red, the chosen row and the
+  headings bold, the key hints dim. `NO_COLOR` turns it off.
+- Keys come from `auth.json` only, the file `fats setup` writes. A key exported in the environment
+  (`OXYLABS_WEB_API_KEY`, `BRIGHTDATA_API_KEY`, `DECODO_AUTH_TOKEN`, `GH_TOKEN`) is no longer sent. On a machine
+  without a browser (CI, SSH), run `fats setup import-env` once: it checks each exported key ($0) and copies it
+  into `auth.json` where no key is saved, never over a saved one. `BRIGHTDATA_UNLOCKER_ZONE` still sets the
+  Bright Data zone.
+- `fats`, `fats config` and `fats setup` name each key by its last 4 characters, so you can match it against
+  your provider's dashboard. The status line names every key, Bright Data's zone and the file: `keys oxy …6XBR ·
+  bd …k2Qf zone fatsrc · decodo none · gh none · auth.json` (it said `network on` too; it now says
+  `network off` only under `FATS_OFFLINE`).
+- `fats` and `fats setup` name an exported key they do not use by its last 4 characters, one row each:
+  `env OXYLABS_WEB_API_KEY …SEDm ≠ saved …6XBR · not used · replace: fats setup oxy`, or with no key saved
+  `! no_key oxy · env OXYLABS_WEB_API_KEY …SEDm not imported → fats setup import-env`; in `fats setup` that is
+  the provider's only `no_key` row (it used to print the plain one too). An exported key is
+  masked in everything fats prints, like a saved one, and is refused as search words.
+- A missing key's row ends with the setup move only: `! no_key oxy · would try … ≤$0.0025 → fats setup oxy`
+  (it also said `set OXYLABS_WEB_API_KEY`). A refused key's account row says `replace the saved key`.
+- Replacing or removing a saved key keeps the old `auth.json` as `auth.json.bak` (mode 0600). Removing or
+  switching off a key names that file and the `rm` that deletes it; the status keys row and the `fats config`
+  `key_dir` row end with ` · bak` while it is there.
+- The MCP registry entry (`server.json`) no longer asks for key variables; keys come from `fats setup`.
+- A machine without a browser (SSH, CI) adds a key through a pipe: `printf %s "$KEY" | fats setup oxy` (or
+  `bd`, `decodo`, `gh`) reads one line, strips its trailing CR/LF, checks the key ($0) and saves it:
+  `= setup oxy ok 351 scrapers · key …6XBR saved auth.json (600) · $0`. A key it replaces stays in
+  `auth.json.bak` (the same key piped again replaces nothing and says no backup). A bad key is one line,
+  `= ! bad_key setup oxy · … · not saved`, exit 1; with `FATS_OFFLINE` set nothing is checked or saved
+  (`= ! offline setup oxy · …`). `fats setup oxy` with a pipe used to start the browser key form, wait 10
+  minutes and leave a background `fats` running; now a pipe that sends nothing in 2 s gets the form.
+
+### Fixed
+
+- A JSON island and a text document (CSV, JSON, XML, plain text) print their lines without an `lN` number: that
+  name belongs to the page's links, so a model that copied `l7376` from an island read got `? l7376 unknown`.
+  The section title still names the lines (`lines 301-600`), and the rows cost fewer tokens.
+- Asking for a URL again while its fetch is still running now waits for that fetch, like `fats u3` does, and
+  prints the page the moment it lands within `wait:`. It used to answer `pending` at once, and an agent that
+  kept re-asking by URL spent about three times the calls of one that read the id. `dry:true` on such a URL
+  says `= u3 (running) · waits up to 30s for it · $0`.
+- In the `fats setup` menu a pasted key shows as one `•` a character and the count (`••••  36 chars`), so you
+  see the paste landed; no key character is drawn. It used to show nothing at all. The line end of a paste
+  (`\r\n`) no longer presses the next screen's first button: pasting a key with a trailing newline used to
+  open "Paste a new key" again right after the key was saved.
+- The key screen of a provider without a key says `Status  no key` (it repeated the rank row). A saved key's
+  message names it by its last 4 characters: `✓ Oxylabs Web API works · 351 scrapers · key saved …6XBR`.
+- On the `fats setup` main list ← quits, as before, and its footer now says so (`← or q quit`); inner lists
+  keep `← back · q quit`.
+- A key you saved with `fats setup` is the key fats uses. An old key left in the environment used to win over
+  it without a word: calls went out on the old key (your dashboard showed no use of the new one) and `fats`
+  said only `keys oxy:env`.
+- `fats setup` with no provider is a check and writes nothing. It used to save every key it found in the
+  environment into `auth.json`, so an old exported key replaced the one you had saved.
+- A key typed on a `fats setup` command line (`fats setup oxy <key>`, also after `login`, `keys`, `auth` and
+  the other words for setup; a key = 20 or more letters, digits and `_+/=-` with both letters and digits, base64
+  tokens too, never a path, URL or dotted name) is refused and never echoed: the command line lands in shell
+  history and `ps`.
+  The row names the two ways in: paste (`fats setup oxy`) and pipe (`printf %s "$KEY" | fats setup oxy`). It
+  used to print the key back in full, and `fats login <key>` ran a web search that sent the key to the
+  search provider. A key `fats setup` is checking is masked in the provider's error answer too (it was printed
+  whole when the answer quoted it). On any other command a long
+  letters-and-digits word (a commit sha, a part number) is still a search word; a `?` row shows it as its last
+  4 characters (`…6XBR`).
+- `fats setup` no longer shows a Turn off or Remove this key button that would leave nothing able to fetch
+  (a keyless install's Free fetch screen offered Turn off, then said it can't).
+- `fats setup`: Turn off / Turn on shows the new state at once (the screen kept saying "Turn off" and "ready"
+  after a provider was switched off), and a running `fats mcp` sees a switch made in `fats setup`.
+- `fats setup`: after a key is saved you stay on that provider's screen, with "✓ … works" and its buttons
+  (Paste a new key, Turn off, Remove this key), instead of being sent back to the list.
+- With the free fetch off (`fats setup free off`) and both an Oxylabs and a Bright Data key, a page starts with
+  Oxylabs without JavaScript (10 s, $0.0010), then the two renders as before. It used to skip that step and wait
+  on two 60 s renders: a Reddit listing failed after 65 s that Oxylabs serves without JavaScript in about 6 s.
+  `dry:true` and `fats config` print the new order: `oxy → bd ∥ oxyjs after 5s`.
+- With the free fetch off, a web search no longer starts its free background fetch of the top result. That fetch
+  only uses the free request, so it could only fail, and `fats stats` then showed a false `! no_key` row with
+  `→ fats setup` for a key that was set. `fats config` says `prefetch off (free fetch off)`.
+
 ## 0.2.2 - 2026-10-21
 
 ### Changed
@@ -220,6 +341,15 @@ Method: [docs/benchmarks.md](docs/benchmarks.md).
 - Fetches no longer run `gh auth token` themselves; `fats setup gh` copies the token once.
 
 ### Fixed
+
+- In the `fats setup` menu a pasted key shows as one `•` a character and the count (`••••  36 chars`), so you
+  see the paste landed; no key character is drawn. It used to show nothing at all. The line end of a paste
+  (`\r\n`) no longer presses the next screen's first button: pasting a key with a trailing newline used to
+  open "Paste a new key" again right after the key was saved.
+- The key screen of a provider without a key says `Status  no key` (it repeated the rank row). A saved key's
+  message names it by its last 4 characters: `✓ Oxylabs Web API works · 351 scrapers · key saved …6XBR`.
+- On the `fats setup` main list ← quits, as before, and its footer now says so (`← or q quit`); inner lists
+  keep `← back · q quit`.
 - Windows: printed commands no longer say `fats.exe` (`fats.exe setup` → `fats setup`); a crash is counted (its
   `src\x.rs` path never matched); a local page's path drops the `\\?\` prefix; a read page keeps its 30 min again;
   a detached fetch keeps its lock (a Windows file lock is never a child process's) instead of reading as
@@ -353,6 +483,15 @@ Method: [docs/benchmarks.md](docs/benchmarks.md).
 - `AGENTS.md` for coding agents changing this repository: build, gates, the rules that reject a change, the file map.
 
 ### Fixed
+
+- In the `fats setup` menu a pasted key shows as one `•` a character and the count (`••••  36 chars`), so you
+  see the paste landed; no key character is drawn. It used to show nothing at all. The line end of a paste
+  (`\r\n`) no longer presses the next screen's first button: pasting a key with a trailing newline used to
+  open "Paste a new key" again right after the key was saved.
+- The key screen of a provider without a key says `Status  no key` (it repeated the rank row). A saved key's
+  message names it by its last 4 characters: `✓ Oxylabs Web API works · 351 scrapers · key saved …6XBR`.
+- On the `fats setup` main list ← quits, as before, and its footer now says so (`← or q quit`); inner lists
+  keep `← back · q quit`.
 - A file name among the search words (`opencode.json`, `next.config.mjs`, `cargo build main.rs`) stays a search
   word; it no longer turns the search into a paid `site:` search on a host that does not exist. A bare name is a
   site only when it ends in a real top-level domain; `fats docs.rs tokio spawn` still searches docs.rs.
@@ -381,6 +520,15 @@ Method: [docs/benchmarks.md](docs/benchmarks.md).
   let them install a binary that cannot start on 2.31–2.34).
 
 ### Fixed
+
+- In the `fats setup` menu a pasted key shows as one `•` a character and the count (`••••  36 chars`), so you
+  see the paste landed; no key character is drawn. It used to show nothing at all. The line end of a paste
+  (`\r\n`) no longer presses the next screen's first button: pasting a key with a trailing newline used to
+  open "Paste a new key" again right after the key was saved.
+- The key screen of a provider without a key says `Status  no key` (it repeated the rank row). A saved key's
+  message names it by its last 4 characters: `✓ Oxylabs Web API works · 351 scrapers · key saved …6XBR`.
+- On the `fats setup` main list ← quits, as before, and its footer now says so (`← or q quit`); inner lists
+  keep `← back · q quit`.
 - The key dir is made owner-only (0700) whenever `fats` saves a key into it, also when it existed already: on
   Linux the installer's receipt can create `~/.config/fatsearch` at 0755 before `fats` first runs.
 
@@ -436,6 +584,15 @@ First public release.
   larger N says it was capped.
 
 ### Fixed
+
+- In the `fats setup` menu a pasted key shows as one `•` a character and the count (`••••  36 chars`), so you
+  see the paste landed; no key character is drawn. It used to show nothing at all. The line end of a paste
+  (`\r\n`) no longer presses the next screen's first button: pasting a key with a trailing newline used to
+  open "Paste a new key" again right after the key was saved.
+- The key screen of a provider without a key says `Status  no key` (it repeated the rank row). A saved key's
+  message names it by its last 4 characters: `✓ Oxylabs Web API works · 351 scrapers · key saved …6XBR`.
+- On the `fats setup` main list ← quits, as before, and its footer now says so (`← or q quit`); inner lists
+  keep `← back · q quit`.
 - An unknown flag (`--login`, `-x`, `rust --fast`) is refused with a `!` line and never becomes a paid web search.
   Beside an id or a file a dash word is a free filter (`fats u1 -n`). A dash inside a phrase is kept as typed.
 - A run whose process died reads `! abandoned` in `fats jN`, in its page read and in `stats`, with what it spent

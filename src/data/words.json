@@ -152,6 +152,7 @@
     "xn--ygbi2ammx", "xn--zfr164b", "xxx", "xyz", "yachts", "yahoo", "yamaxun", "yandex", "ye", "yodobashi", "yoga",
     "yokohama", "you", "youtube", "yt", "yun", "za", "zappos", "zara", "zero", "zip", "zm", "zone", "zuerich", "zw"
   ],
+  "path_lead": ["/", "./", "~"],
   "file_tlds": ["md", "rs", "py", "sh", "zip", "mov", "java", "tf", "pl", "ml"],
   "secret_names": [
     ".env", ".env.*", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "authorized_keys", "known_hosts", ".netrc",

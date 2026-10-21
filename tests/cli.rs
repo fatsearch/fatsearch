@@ -21,7 +21,7 @@ impl Sandbox {
 
     fn cmd(&self, args: &str) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fats"));
-        // the caller's environment never leaks in: a provider key exported in the shell running the tests
+        // the caller's environment never leaks in: a setting or zone exported in the shell running the tests
         // changes dry routes and hints; Windows keeps `SystemRoot`: without it Winsock does not start, every
         // connect fails (`connect_failed` to the local site). The home is the sandbox's, `%APPDATA%` and
         // `%LOCALAPPDATA%` too: Windows' default key dir and cache, never the runner's own (a refused `FATS_CACHE`
@@ -76,7 +76,14 @@ impl Sandbox {
         (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code().unwrap_or(-1))
     }
 
-    /// Both providers' keys (fake values) and the Bright Data zone in the key dir.
+    /// `keys` (provider name → key) as the key dir's `auth.json`, in place of what it held: fats reads no key from
+    /// the environment.
+    fn auth(&self, keys: &[(&str, &str)]) {
+        scratch::auth(&self.dir.join("keys"), keys);
+    }
+
+    /// Both providers' keys (fake values) and the Bright Data zone in the key dir, as 0.1 kept them (moved into
+    /// `auth.json` by the first command).
     fn keys(&self) {
         let k = self.dir.join("keys");
         std::fs::create_dir_all(&k).expect("key dir");
@@ -257,13 +264,20 @@ fn the_guide_is_one_call_from_every_door() {
     assert_eq!(s.run("guide"), (fats::lang::GUIDE.to_string(), 0));
     let body = include_str!("../src/data/guide.md");
     assert!(body.starts_with("# fatsearch") && body.contains("## Rules"), "the guide is the whole how-to");
+    assert!(body.len() <= 5200, "the guide is one read, about 2k tok: {} B", body.len());
+    // a `!` row's move may be `fresh:true` (`budget_hit`): the guide never bans the fix its rows print
+    assert!(!body.contains("Never fresh:true"), "the guide and its rows agree");
     let skill = include_str!("../skills/fatsearch/SKILL.md");
     assert!(skill.contains("Run `fats guide` before the first use") && skill.contains("fatsearch (command: `fats`)"));
     assert!(skill.len() < 2000, "the installed skill is a pointer, the guide lives in the binary: {} B", skill.len());
+    // an install check is one more turn before the user's question: the skill connects, then asks
+    assert!(!skill.contains("Verify") && !skill.contains("example.com"), "no verify step");
     for help in ["rust --help", "commands", "help login"] {
         assert_eq!(s.run(help).0, format!("{}\n{}\n", fats::lang::CARD, to_guide()), "{help} is the card");
     }
     assert!(fats::lang::CARD.len() <= 500, "the card rides every MCP connect: {} B", fats::lang::CARD.len());
+    // a cap is the user's call: the first reads name no `cost:` value an agent would copy to stay free
+    assert!(!fats::lang::CARD.contains("cost:") && !fats::lang::GUIDE.contains("cost:0"), "no free-only lever");
     let help = s.run("help").0;
     assert!(help.len() <= 500, "--help, the pointer with it, is every cold agent's first read: {} B", help.len());
     let first = "First time? Call fats(\"guide\")";
@@ -397,9 +411,10 @@ fn dry_names_route_country_device() {
     assert!(out.contains("· device:mobile (oxy, decodo; bd serves desktop)"), "{out}");
     let keyed = |cmd: &str| {
         let mut c = s.cmd(cmd);
-        c.env_remove("FATS_OFFLINE").env("OXYLABS_WEB_API_KEY", "x").env("BRIGHTDATA_API_KEY", "y");
-        String::from_utf8_lossy(&c.env("BRIGHTDATA_UNLOCKER_ZONE", "z").output().expect("run").stdout).into_owned()
+        c.env_remove("FATS_OFFLINE").env("BRIGHTDATA_UNLOCKER_ZONE", "z");
+        String::from_utf8_lossy(&c.output().expect("run").stdout).into_owned()
     };
+    s.auth(&[("oxy", "x"), ("bd", "y")]);
     let out = keyed("https://1.1.1.1/ dry:true");
     // no country named, a gTLD: no `country:` row (oxy sends the home US, bd its own best: `config`)
     let ladder = "fetch plain → oxy (after a captcha) → bd ∥ oxyjs after 5s → new u2 · up to $0.0040\n";
@@ -416,19 +431,20 @@ fn dry_names_route_country_device() {
         out.contains("fetch bd → oxyjs → new u2 · up to $0.0030 · ≈25s · hedge:off, one provider at a time"),
         "{out}"
     );
+    s.auth(&[("oxy", "x")]);
     let o = s
         .cmd("https://1.1.1.1/a https://1.1.1.1/b country:pl dry:true")
         .env_remove("FATS_OFFLINE")
-        .env("OXYLABS_WEB_API_KEY", "x")
         .output()
         .expect("run");
     let out = String::from_utf8_lossy(&o.stdout);
     // one key: every rung of that provider; no retry: 14 s of the 90 s wall < oxyjs' 60 s
     assert!(out.contains("fetch plain → oxy → oxyjs → new u2 · up to $0.0025 · country:PL\n"), "{out}");
     let cmd = "https://1.1.1.1/pricing country:fr dry:true";
-    let o = s.cmd(cmd).env_remove("FATS_OFFLINE").env("OXYLABS_WEB_API_KEY", "x").output();
+    let o = s.cmd(cmd).env_remove("FATS_OFFLINE").output();
     let out = String::from_utf8_lossy(&o.expect("run").stdout).into_owned();
     assert!(out.contains("country:FR") && !out.contains("! ignored"), "a page fetch honours country: {out}");
+    s.auth(&[]);
     let out = s.run("gh rust country:fr dry:true").0;
     assert!(
         out.contains("! ignored country:fr · only a web search or a page fetch uses it"),
@@ -437,9 +453,8 @@ fn dry_names_route_country_device() {
     let o = s.cmd("https://1.1.1.1/ js:true dry:true").env_remove("FATS_OFFLINE").output().expect("run");
     let out = String::from_utf8_lossy(&o.stdout);
     // what each key would buy here, its price, and where to get it
-    let bd = "! no_key bd · would try unblock+JS ≤$0.0015 · set BRIGHTDATA_API_KEY + BRIGHTDATA_UNLOCKER_ZONE → \
-              fats setup bd";
-    let oxy = "! no_key oxy · would try JS render ≤$0.0015 · set OXYLABS_WEB_API_KEY → fats setup oxy";
+    let bd = "! no_key bd · would try unblock+JS ≤$0.0015 → fats setup bd";
+    let oxy = "! no_key oxy · would try JS render ≤$0.0015 → fats setup oxy";
     // the run stores its failure in an id all the same: dry names it
     let row = out.split("nothing can fetch it · new u").nth(1).and_then(|r| r.split_once(' ')).map(|r| r.1);
     assert!(row.is_some_and(|r| r.starts_with(&format!("· $0 · {bd} · {oxy} · ! no_key decodo"))), "{out}");
@@ -666,6 +681,24 @@ fn a_thread_names_the_comments_it_lacks() {
         "one comment's replies: no `of`"
     );
     assert!(s.run("u1#0").0.contains("\ncomments: 40"), "the stated size is in the page's info");
+}
+
+/// The post's own counts are in the first answer: the first element with a count attribute is the post, its score
+/// and time come from it alone, never from a comment (here in a `<template>`) nor from a thread the copy lacks.
+#[test]
+fn the_first_answer_names_the_posts_counts() {
+    let s = Sandbox::new("postcounts");
+    let post =
+        r#"<body><x-post comment-count="296" score="26" created-timestamp="2025-12-11T09:49:02.123+0000"></x-post>"#;
+    let comment =
+        r#"<x-comment score="90" comment-count="4" created-timestamp="2025-12-13"><p>A reply</p></x-comment>"#;
+    let page =
+        include_str!("fixtures/reddit-thin-template.html").replacen("<body>", post, 1).replace("{comments}", comment);
+    s.file("post.html", &page);
+    let u1 = s.run("./post.html").0;
+    assert!(u1.contains("\nu1#0 info | comments 296 · score 26 · posted 2025-12-11\n"), "{u1}");
+    let info = s.run("u1#0").0;
+    assert!(info.contains("\ncomments: 296\n") && info.contains("\nscore: 26\n") && !info.contains("90"), "{info}");
 }
 
 /// A picture in an ad slot is listed, not counted: a tag, class or id word `ad`/`ads`/`advertisement` on a
@@ -1070,11 +1103,12 @@ fn a_geo_copy_after_us_asks_the_cctld_then_bd_then_counts() {
         rows.push(serde_json::json!({"url": url, "dir": format!("t/u{n}")}));
     }
     std::fs::write(s.dir.join("cache/t/state.json"), serde_json::json!({"u": rows}).to_string()).expect("state");
-    let oxy_only = s.cmd("u1").env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+    s.auth(&[("oxy", "x")]);
+    let oxy_only = s.cmd("u1").output().expect("run");
     let out = String::from_utf8_lossy(&oxy_only.stdout);
     assert!(out.lines().next().is_some_and(|l| l.contains(" · lang:it · sent US")), "{out}");
     assert!(!out.contains("u1 ! lang:it") && !out.contains("country:us"), "no paid loop: {out}");
-    let oxy_only = s.cmd("u2").env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+    let oxy_only = s.cmd("u2").output().expect("run");
     let out = String::from_utf8_lossy(&oxy_only.stdout);
     assert!(out.contains("u2 ! lang:it · served in it, sent US · the provider's geo copy → fats u2 country:fr "));
     s.keys();
@@ -1127,7 +1161,7 @@ fn oversized_input_is_refused() {
     // the built-in tables (src/data/*.json) are counted where every other setting is shown
     assert!(s.run("config").0.contains(
         "
-tables 8 files · 2091 rows · built-in · providers 49, errors 53, check 86, sites 69, clean 167, words 1605, limits 52, telemetry 10
+tables 8 files · 2114 rows · built-in · providers 49, errors 53, check 86, sites 69, clean 186, words 1608, limits 53, telemetry 10
 "
     ));
     // every behaviour threshold is a row of its own
@@ -1177,19 +1211,19 @@ fn loose_key_file_is_flagged() {
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
     let out = status();
-    assert!(out.contains("keys oxy:auth.json") && out.contains("! key_mode auth.json is 644"), "{out}");
+    assert!(out.contains("\nkeys oxy … · bd none · ") && out.contains("! key_mode auth.json is 644"), "{out}");
     assert!(out.contains("→ chmod 600 ") && !out.contains("SECRET"), "{out}");
     std::fs::set_permissions(k.join("auth.json"), std::fs::Permissions::from_mode(0o600)).expect("chmod");
     assert!(!status().contains("key_mode"));
 }
 
-/// Keys live in env and `auth.json` only: `./.env` and the Bright Data CLI's credentials are never read.
+/// Keys live in `auth.json` only: an exported key, `./.env` and the Bright Data CLI's credentials are never read.
 /// The 0.1 key files move into `auth.json` / `settings.json` once (0600) and are deleted; no key ever prints.
 #[test]
-fn keys_come_from_env_and_auth_json_only() {
+fn keys_come_from_auth_json_only() {
     let s = Sandbox::new("setup");
     let bare = |args: &str| {
-        let o = s.cmd(args).output().expect("run");
+        let o = s.cmd(args).env("OXYLABS_WEB_API_KEY", "oxy-exported-Zq82").output().expect("run");
         (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code().unwrap_or(-1))
     };
     s.file(".env", "export OXYLABS_WEB_API_KEY=\"oxy-dotenv-Zq81\"\n");
@@ -1198,13 +1232,19 @@ fn keys_come_from_env_and_auth_json_only() {
     std::fs::create_dir_all(&bdata).expect("bdata dir");
     std::fs::write(bdata.join("credentials.json"), r#"{"api_key": "bd-cli-Kx7"}"#).expect("bdata key");
     let (out, _) = bare("");
-    assert!(out.contains("\nkeys none → fats setup · network off (FATS_OFFLINE)\n"), "{out}");
+    assert!(out.contains("\nkeys none → fats setup · network off\n"), "{out}");
+    let row = "\n! no_key oxy · env OXYLABS_WEB_API_KEY …Zq82 not imported → fats setup import-env\n";
+    assert!(out.contains(row) && !out.contains("oxy-exported"), "{out}");
+    // `fats setup`: one row for the missing key, the env's (it names the move), never the plain one beside it
+    let (out, _) = bare("setup");
+    assert!(out.contains(row) && out.matches("! no_key oxy").count() == 1, "{out}");
     let k = s.dir.join("keys");
     std::fs::create_dir_all(&k).expect("key dir");
     std::fs::write(k.join("oxylabs.key"), "oxy-legacy-Q9\n").expect("legacy key");
     std::fs::write(k.join("brightdata.zone"), "zone_a\n").expect("legacy zone");
     let (out, rc) = bare("setup");
-    assert!(rc == 0 && out.contains("\noxy key from auth.json · would read "), "{out}");
+    assert!(rc == 0 && out.contains("\noxy key … auth.json · would read "), "{out}");
+    assert!(out.contains("\nenv OXYLABS_WEB_API_KEY …Zq82 ≠ saved … · not used · replace: fats setup oxy\n"), "{out}");
     assert!(!k.join("oxylabs.key").exists() && !k.join("brightdata.zone").exists(), "moved");
     let auth = std::fs::read_to_string(k.join("auth.json")).unwrap_or_default();
     let prefs = std::fs::read_to_string(k.join("settings.json")).unwrap_or_default();
@@ -1215,7 +1255,7 @@ fn keys_come_from_env_and_auth_json_only() {
         let mode = std::fs::metadata(k.join("auth.json")).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
         assert_eq!(mode, 0o600);
     }
-    assert!(!out.contains("Zq81") && !out.contains("Kx7") && !out.contains("Q9"), "{out}");
+    assert!(!out.contains("oxy-exported") && !out.contains("Kx7") && !out.contains("Q9"), "a tail only: {out}");
 }
 
 /// A Bright Data key saved without its zone is `! no_zone` with the zone move, never `no_key` (the key is there);
@@ -1233,7 +1273,129 @@ fn a_bd_key_without_a_zone_is_no_zone() {
     let row = " · ! no_zone bd · key saved, no Web Unlocker zone yet → fats setup bd zone:<name>";
     assert!(dry.contains(row) && !dry.contains("no_key"), "{dry}");
     let (out, rc) = s.run("setup bd zone:web_unlocker1 dry:true");
-    assert!(rc == 0 && out.starts_with("= dry setup ") && out.contains("bd key from auth.json"), "{out}");
+    assert!(rc == 0 && out.starts_with("= dry setup ") && out.contains("bd key … auth.json"), "{out}");
+    // every zone move is spelled `setup bd zone:<name>`; the short `setup zone:<name>` is the same move
+    assert_eq!(s.run("setup zone:web_unlocker1 dry:true"), (out, rc));
+}
+
+/// A key-shaped word on a `fats setup` command line is refused, rc 1, never read, saved or echoed (shell history,
+/// `ps`); on any other command it is a word as typed (a sha, a part number). Every `?` row shows such a word as
+/// its tail. Base64 (`+/=`) is key-shaped; a URL, a word with a dot, a path led by `/`, `./` or `~` never is.
+#[test]
+fn a_key_on_the_setup_command_line_is_refused() {
+    let s = Sandbox::new("argv-key");
+    let k = "abcDEF0123456789ghiJKL6XBR";
+    let ways = |p: &str| {
+        let pipe = format!("pipe: printf %s \"$KEY\" | fats setup {p}");
+        format!("! key_in_argv · never on the command line (shell history, ps) · paste: fats setup {p} · {pipe}")
+    };
+    for (args, p) in [("setup oxy {k}", "oxy"), ("setup bd {k}", "bd"), ("setup {k}", "oxy"), ("setup {k} json", "oxy")]
+    {
+        let (out, rc) = s.run(&args.replace("{k}", k));
+        let out = out.replace("\\\"", "\""); // `json` escapes the quotes
+        assert!(rc == 1 && out.contains(&ways(p)) && !out.contains(&k[..12]), "{args}: {out}");
+    }
+    assert!(!s.dir.join("keys/auth.json").exists(), "nothing saved");
+    // other commands: a word as typed; a `?` row: the tail
+    let (out, _) = s.run(&format!("{k} x"));
+    assert!(out.contains(k) && !out.contains("key_in_argv"), "{out}");
+    let (out, rc) = s.run(&format!("x provider:{k}"));
+    assert!(rc == 2 && out.starts_with("? provider:…6XBR · ") && !out.contains(&k[..12]), "{out}");
+    let b64 = "ZGNkMHVzZXI6UGFzczEyMzQ1Njc4OTA+/x==";
+    let (out, rc) = s.run(&format!("setup decodo {b64}"));
+    assert!(rc == 1 && out.contains(&ways("decodo")) && !out.contains(&b64[..12]), "{out}");
+    // short, one-kind, a URL, dotted (a sha's file), a path: no key
+    let paths = ["/api/v1/abcDEF0123456789ghiJKL", "./abcDEF0123456789ghiJKL6XBR", "~/abcDEF0123456789ghiJKL6XBR"];
+    let words = ["abcDEF0123456789ghi", "abcdefghijklmnopqrstuvwxyz", "example.com/abcDEF0123456789ghiJKL6XBR"];
+    let urls = ["https://ex.com/abcDEF0123456789ghiJKL6XBR", "4f2a9c0d1e3b5a7c9e1f3a5b7c9d1e3f5a7b9c1d.patch"];
+    for w in words.into_iter().chain(paths).chain(urls) {
+        let (out, _) = s.run(&format!("setup oxy {w}"));
+        assert!(!out.contains("key_in_argv"), "{w}: {out}");
+    }
+}
+
+/// `fats setup <p>` reads a piped key (SSH, CI): ONE line, its CR/LF stripped, the menu's check ($0), saved, a
+/// replaced key kept in `auth.json.bak` (the same key again replaces none: no `.bak` said or written); a bad one
+/// is `! bad_key`, rc 1, at once; under `FATS_OFFLINE` nothing is checked or saved. Never the key form: no run
+/// file (the form's detached run writes one), no key byte printed. (No case here reaches a network.)
+#[test]
+fn a_piped_key_is_checked_and_saved() {
+    use std::io::Write;
+    let s = Sandbox::new("pipe-key");
+    let offline = |args: &str, input: &str, off: bool| {
+        let mut c = s.cmd(args);
+        if !off {
+            c.env_remove("FATS_OFFLINE");
+        }
+        let mut child =
+            c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().expect("run");
+        child.stdin.take().expect("stdin").write_all(input.as_bytes()).expect("write");
+        let o = child.wait_with_output().expect("wait");
+        (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code().unwrap_or(-1))
+    };
+    let pipe = |args: &str, input: &str| offline(args, input, false);
+    let (out, rc) = offline("setup gh", "ghp-fake-0123456789AB", true);
+    let off = "= ! offline setup gh · FATS_OFFLINE is on: no check (unset FATS_OFFLINE) · not saved → printf %s";
+    assert!(rc == 1 && out.starts_with(off) && !s.dir.join("keys/auth.json").exists(), "{out}");
+    let t0 = std::time::Instant::now();
+    let (out, rc) = pipe("setup oxy", "notakey");
+    let bad = "= ! bad_key setup oxy · too short for a key: copy the whole key · not saved → printf %s \"$KEY\" | fats";
+    assert!(rc == 1 && out.starts_with(bad) && t0.elapsed().as_secs() < 3, "{out}");
+    assert!(!s.dir.join("cache/t/run/setup-oxy.json").exists() && !s.dir.join("keys/auth.json").exists());
+    let (out, rc) = pipe("setup gh", "ghp-fake-0123456789AB\r\n");
+    let first = "= setup gh ok unchecked · key …89AB saved auth.json (600) · $0\n";
+    assert!(rc == 0 && out.starts_with(first), "{out}");
+    let (out, rc) = pipe("setup gh", "ghp-fake-0123456789AB\n");
+    assert!(rc == 0 && out.starts_with(first) && !s.dir.join("keys/auth.json.bak").exists(), "the same key: {out}");
+    let (out, rc) = pipe("setup gh", "ghp-fake-0123456789CD\nnext line\n");
+    let kept = "key …89CD saved auth.json (600) · the old key in auth.json.bak · $0";
+    assert!(rc == 0 && out.contains(kept) && !out.contains("0123456789"), "{out}");
+    let read = |f: &str| std::fs::read_to_string(s.dir.join("keys").join(f)).unwrap_or_default();
+    assert!(read("auth.json").contains("\"ghp-fake-0123456789CD\"") && read("auth.json.bak").contains("89AB\""));
+}
+
+/// A pipe held open and never written (an agent's shell that keeps stdin) is no key: after 2 s `fats setup oxy`
+/// takes the form path, no hang; under `FATS_OFFLINE` that path starts no form (its check could not run): the dry
+/// row, no run file.
+#[test]
+fn a_silent_pipe_falls_back_to_the_form_in_2_s() {
+    let s = Sandbox::new("pipe-silent");
+    let t0 = std::time::Instant::now();
+    let mut child = s
+        .cmd("setup oxy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("run");
+    let held = child.stdin.take(); // open until the answer is in
+    let o = child.wait_with_output().expect("wait");
+    let (out, took) = (String::from_utf8_lossy(&o.stdout), t0.elapsed());
+    drop(held);
+    assert!(took.as_millis() >= 1900 && took.as_secs() < 5, "{took:?}");
+    assert_eq!(out, "= dry setup oxy · would start a one-shot key form on 127.0.0.1 · $0\n");
+    assert!(!s.dir.join("cache/t/run/setup-oxy.json").exists(), "no form server");
+}
+
+/// An old key file beside the keys (a replaced or removed key's, `auth.json.bak`) is named where a key is switched
+/// off, with the `rm` that deletes it, and by ` · bak` at the end of the status keys row and the config `key_dir`
+/// row, until it is deleted.
+#[test]
+fn a_key_backup_is_named_until_deleted() {
+    let s = Sandbox::new("bak");
+    let run = |args: &str| String::from_utf8_lossy(&s.cmd(args).output().expect("run").stdout).into_owned();
+    let k = s.dir.join("keys");
+    std::fs::create_dir_all(&k).expect("key dir");
+    std::fs::write(k.join("auth.json"), r#"{"version":1,"keys":{"oxy":"k-123456789"}}"#).expect("auth");
+    std::fs::write(k.join("auth.json.bak"), r#"{"version":1,"keys":{"oxy":"k-old456789"}}"#).expect("bak");
+    let bak = format!("old key kept in auth.json.bak (0600) · delete it: rm '{}'", k.join("auth.json.bak").display());
+    let off = "= setup oxy off · saved settings.json · from the next command\n";
+    assert_eq!(run("setup oxy off"), format!("{off}{bak}\n"));
+    let (health, cfg) = (run(""), run("config"));
+    assert!(health.contains(" · auth.json · network off · bak\n"), "{health}");
+    assert!(cfg.contains(&format!("\nkey_dir {} · env FATS_KEY_DIR · bak\n", k.display())), "{cfg}");
+    std::fs::remove_file(k.join("auth.json.bak")).expect("rm");
+    assert!(!run("").contains(" · bak\n") && !run("config").contains(" · bak\n"), "gone with its file");
+    assert_eq!(run("setup oxy off"), off);
 }
 
 /// `setup <name> on|off` never leaves nothing that can fetch; an off tier reads like a missing key in `config`;
@@ -1347,6 +1509,26 @@ fn free_off_and_per_call_rows() {
     );
     assert_eq!(run("config set cost_cap -1"), ("! refused · cost_cap is per call: the cost: mod\n".into(), 1));
     assert_eq!(run("config set wait abc").0, "! refused · wait is per call: the wait: mod\n");
+}
+
+/// The free fetch off with both keys: the page ladder starts at oxy without JS, then bd ∥ oxyjs, as `dry:true` and
+/// `config` print it (with free on, oxy runs only after plain's captcha).
+#[test]
+fn free_off_ladder_starts_at_the_no_js_rung() {
+    let s = Sandbox::new("freeladder");
+    s.auth(&[("oxy", "x"), ("bd", "y")]);
+    let keyed = |cmd: &str| {
+        let mut c = s.cmd(cmd);
+        c.env_remove("FATS_OFFLINE").env("BRIGHTDATA_UNLOCKER_ZONE", "z");
+        String::from_utf8_lossy(&c.output().expect("run").stdout).into_owned()
+    };
+    assert!(keyed("config").contains("auto: plain → oxy (after a captcha) → bd ∥ oxyjs after 5s · "));
+    assert!(keyed("setup free off").starts_with("= setup free off · saved"));
+    let out = keyed("https://1.1.1.1/ dry:true");
+    assert!(out.contains("fetch oxy → bd ∥ oxyjs after 5s → new u1 · up to $0.0040\n"), "{out}");
+    assert!(!out.contains("no_key") && !out.contains("! off"), "{out}");
+    let cfg = keyed("config");
+    assert!(cfg.contains("auto: oxy → bd ∥ oxyjs after 5s · "), "{cfg}");
 }
 
 /// Links are a list like any other: 300 ~tok then `more`; `fats j1` shows a job; every json record has id + url,
@@ -1528,6 +1710,85 @@ fn serve(reply: impl Fn(&str, &mut std::net::TcpStream) -> std::io::Result<()> +
     addr
 }
 
+/// `c` run with a terminal for its stdin, stdout and stderr (macOS `script(1)`'s pty: no `unsafe` openpty), its
+/// one output (stderr merged, as a person sees it).
+#[cfg(target_os = "macos")]
+fn in_terminal(c: &Command) -> String {
+    let mut t = Command::new("/usr/bin/script");
+    t.env_clear().envs(c.get_envs().filter_map(|(k, v)| Some((k, v?))));
+    t.current_dir(c.get_current_dir().unwrap_or(std::path::Path::new(".")));
+    t.arg("-q").arg("/dev/null").arg(c.get_program()).args(c.get_args());
+    let o = t.stdin(std::process::Stdio::null()).output().expect("script");
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// A wait past 5 s: a human at a terminal sees `~ still working` (checked through a pty on macOS; the Linux and
+/// Windows runners have no pty a test can open without `unsafe`); a pipe gets no byte of it (an agent's shell reads
+/// stderr after the call, merged with the answer), and an MCP client that sent a `progressToken` gets
+/// `notifications/progress` every 5 s with it. The local page answers after 6 s (plain, no key).
+#[test]
+fn a_long_wait_says_it_works_only_where_someone_watches() {
+    use std::io::{BufRead, Write};
+    let late = || {
+        serve(|_, c| {
+            std::thread::sleep(std::time::Duration::from_secs(6));
+            let body = page("Late Page", &"<p>A page that comes after six seconds, whole.</p>".repeat(8));
+            let h = format!("HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\r\n", body.len());
+            c.write_all(h.as_bytes()).and_then(|_| c.write_all(body.as_bytes()))
+        })
+    };
+    let (cli, mcp) = (late(), late());
+    #[cfg(target_os = "macos")]
+    let tty = {
+        let url = late();
+        let s = Sandbox::new("still-tty");
+        std::thread::spawn(move || in_terminal(s.cmd(&url).env_remove("FATS_OFFLINE").env("FATS_ALLOW_PRIVATE", "1")))
+    };
+    let piped = std::thread::spawn(move || {
+        let s = Sandbox::new("still-cli");
+        let o = s.cmd(&cli).env_remove("FATS_OFFLINE").env("FATS_ALLOW_PRIVATE", "1").output().expect("run");
+        (String::from_utf8_lossy(&o.stdout).into_owned(), o.stderr)
+    });
+    let s = Sandbox::new("still-mcp");
+    let mut child = s
+        .cmd("mcp")
+        .env_remove("FATS_OFFLINE")
+        .env("FATS_ALLOW_PRIVATE", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn fats mcp");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"it","version":"0"}}}"#;
+    let call = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "fats", "arguments": {"cmd": mcp}, "_meta": {"progressToken": "tok7"}}});
+    let reqs = format!("{init}\n{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}\n{call}\n");
+    stdin.write_all(reqs.as_bytes()).expect("write requests");
+    // the answer first, then EOF: the server ends with its client
+    let lines: Vec<serde_json::Value> = std::io::BufReader::new(child.stdout.take().expect("stdout"))
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| serde_json::from_str(&l).ok())
+        .take_while(|v: &serde_json::Value| v["id"] != 2)
+        .collect();
+    drop(stdin);
+    child.wait().expect("fats mcp exits");
+    let ticks: Vec<_> =
+        lines.iter().filter(|v| v["method"] == "notifications/progress").map(|v| &v["params"]).collect();
+    let first = serde_json::json!({"progressToken": "tok7", "progress": 5.0, "message": "still working · 5 s"});
+    assert_eq!(ticks.first(), Some(&&first), "{lines:?}");
+    let (out, err) = piped.join().expect("cli");
+    assert!(out.starts_with("= j1.u1 Late Page"), "{out}");
+    assert_eq!(String::from_utf8_lossy(&err), "", "a piped stderr gets no byte");
+    #[cfg(target_os = "macos")]
+    {
+        let seen = tty.join().expect("tty");
+        // one tick in a 6 s wait: at 5 s, naming the tier that runs
+        let line = "~ still working · plain running · 5 s\r\n";
+        assert!(seen.contains(line) && seen.matches("still working").count() == 1, "{seen}");
+    }
+}
+
 /// A local page's picture by its path, `file:///p/x.jpg`, as one text on every OS: Windows names the drive
 /// the page is on (`file:///C:/p/x.jpg`, the URL standard's join).
 fn no_drive(out: &str) -> String {
@@ -1581,6 +1842,53 @@ fn a_repeated_page_failure_is_a_count() {
     let again = page(&online(&s, "u4 fresh:true"));
     assert!(again.ends_with("showing the best copy · failed 2/2 here → fats setup"), "the error page again: {again}");
 }
+
+/// The command's own cap stopping the paid try is no failed command: the best copy is shown, its `budget_hit` row
+/// carries the paid move, rc 0 (rc 1 reads as "the command failed", and a weak model stops there). The same wall
+/// with no key to pay is a failed fetch, rc 1; so is a capped page with no copy to show.
+#[test]
+fn a_capped_page_with_a_copy_exits_zero() {
+    use std::io::Write;
+    let addr = serve(|_, c| {
+        let body = "<html><head><title>Access denied</title></head><body><div id=\"px-captcha\"></div>\
+                    <p>Please verify you are a human to read the news today.</p></body></html>";
+        let h = format!("HTTP/1.1 403 Forbidden\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\r\n", body.len());
+        c.write_all(h.as_bytes()).and_then(|_| c.write_all(body.as_bytes()))
+    });
+    let run = |s: &Sandbox, cmd: &str| {
+        let o = s.cmd(cmd).env_remove("FATS_OFFLINE").env("FATS_ALLOW_PRIVATE", "1").output().expect("run");
+        (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code())
+    };
+    let s = Sandbox::new("capzero");
+    s.keys();
+    let (out, rc) = run(&s, &format!("{addr}/wall cost:0"));
+    assert!(out.starts_with("= j1.u1 Access denied · ") && out.contains("\nPlease verify you are a human"), "{out}");
+    let row = format!("\nu1 ! budget_hit oxy bd oxyjs not tried · $0.0040 > cost:0 → {PAY_ROW}\n");
+    assert_eq!((out.contains(&row), rc), (true, Some(0)), "{out}");
+    // a batch counts it as the cap's stop, still rc 0
+    let (out, rc) = run(&s, &format!("{addr}/wall {addr}/wall2 cost:0"));
+    assert!(out.starts_with("= j2 2 inputs · 0 ok · 2 ! budget_hit · ") && rc == Some(0), "{out}");
+    // one paid key: the provider ask would repeat the row's own move
+    let bd = Sandbox::new("capzero-bd");
+    bd.keys();
+    std::fs::remove_file(bd.dir.join("keys/oxylabs.key")).expect("oxy key");
+    let (out, rc) = run(&bd, &format!("{addr}/wall cost:0"));
+    let one = " → fats u1 fresh:true cost:0.0015 ≤$0.0015\n";
+    assert!(out.contains(one) && !out.contains("said pay") && rc == Some(0), "{out}");
+    let bare = Sandbox::new("capzero-nokey");
+    let (out, rc) = run(&bare, &format!("{addr}/wall"));
+    assert_eq!((out.contains(" ! captcha_wall"), rc), (true, Some(1)), "no key to pay: a failed fetch: {out}");
+    // the cap stopped it and there is no copy to show (nothing listens on the port): a failed command
+    let gone = Sandbox::new("capzero-gone");
+    gone.keys();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("port");
+    let (out, rc) = run(&gone, &format!("http://{closed}/gone cost:0"));
+    assert!(out.starts_with("= j1.u1 ! budget_hit ") && rc == Some(1), "no copy: rc 1: {out}");
+}
+
+/// A `budget_hit` row's moves with both keys: the raised cap, then the provider ask for a user who said pay.
+const PAY_ROW: &str =
+    "fats u1 fresh:true cost:0.004 ≤$0.0040 · if the user said pay, fats u1 fresh:true provider:oxy ≤$0.0025";
 
 /// ONE price glyph. No output prints `~$`: every fixture served keyless (its `no_key` rows), and the
 /// dry, config, account and search rows in every key mode.
@@ -1715,7 +2023,7 @@ fn dead_run_is_abandoned() {
     let (out, rc) = s.run("u1");
     assert_eq!(rc, 1, "{out}");
     // its read = its failed copy's (`Detached::cut`), the same before and after the sweep stores it
-    let cut = "= j1.u1 ! abandoned · ex.com · tried oxy:abandoned✗≤$0.0010 (unverified) · 0ms spent $0.0000\n";
+    let cut = "= j1.u1 ! abandoned · ex.com · tried oxy:abandoned✗≤$0.0010 (unverified) · 0ms spent $0.0000 + ≤$0.0010 unverified\n";
     assert!(out.starts_with(cut) && out.contains("\nu1 ! abandoned ex.com/a → fats u1 fresh:true"), "{out}");
     assert!(s.run("status").0.contains("\nrunning u1 ! abandoned 3"), "{}", s.run("status").0);
     let stats = s.run("stats").0;
@@ -1814,10 +2122,7 @@ fn search_without_network_is_a_record() {
     let (out, rc) = keyless("cheapest proxies");
     assert_eq!(rc, Some(1));
     assert!(out.starts_with("= ! no_key search \"cheapest proxies\""), "{out}");
-    assert!(
-        out.contains("! no_key oxy · would try web search ≤$0.0010 · set OXYLABS_WEB_API_KEY → fats setup oxy"),
-        "{out}"
-    );
+    assert!(out.contains("! no_key oxy · would try web search ≤$0.0010 → fats setup oxy"), "{out}");
     shape(&out);
     let (out, _) = keyless("https://x.com/a/b.pdf preis dry:true");
     assert!(
@@ -1852,16 +2157,10 @@ fn search_without_network_is_a_record() {
 fn search_dry_shows_the_hedge() {
     let s = Sandbox::new("search-dry");
     let keyed = |cmd: &str| {
-        let o = s
-            .cmd(cmd)
-            .env_remove("FATS_OFFLINE")
-            .env("OXYLABS_WEB_API_KEY", "x")
-            .env("BRIGHTDATA_API_KEY", "y")
-            .env("BRIGHTDATA_UNLOCKER_ZONE", "z")
-            .output()
-            .expect("run");
+        let o = s.cmd(cmd).env_remove("FATS_OFFLINE").env("BRIGHTDATA_UNLOCKER_ZONE", "z").output().expect("run");
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
+    s.auth(&[("oxy", "x"), ("bd", "y")]);
     // the fetch router's driver: Bright Data starts beside Oxylabs after the hedge when `wait:` leaves time for
     // it, `cost:` drops it
     let out = keyed("rust news site:blog.rust-lang.org country:fr dry:true wait:30");
@@ -1880,9 +2179,10 @@ fn search_dry_shows_the_hedge() {
     // Bright Data alone leads (~10 s answers): inside the default 30 s it runs inline and keeps its retry (S6);
     // past a `wait:5` it runs detached, once, under `resume`'s patience (one call at the retry's time); the row
     // echoes the asked `wait:` (`wait:3` once printed `wait:30s`)
+    s.auth(&[("bd", "y")]);
     let bd = |q: &str| {
         let mut bd = s.cmd(q);
-        let o = bd.env_remove("FATS_OFFLINE").env("BRIGHTDATA_API_KEY", "y").env("BRIGHTDATA_UNLOCKER_ZONE", "z");
+        let o = bd.env_remove("FATS_OFFLINE").env("BRIGHTDATA_UNLOCKER_ZONE", "z");
         String::from_utf8_lossy(&o.output().expect("run").stdout).into_owned()
     };
     let out = bd("rust news dry:true");
@@ -1896,9 +2196,10 @@ fn search_dry_shows_the_hedge() {
 #[test]
 fn a_host_needs_a_real_tld_and_json_ends_a_search_as_a_word() {
     let s = Sandbox::new("search-words");
+    s.auth(&[("oxy", "x")]);
     let keyed = |cmd: &str| {
         let mut run = s.cmd(&format!("{cmd} dry:true"));
-        let o = run.env_remove("FATS_OFFLINE").env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+        let o = run.env_remove("FATS_OFFLINE").output().expect("run");
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
     for (cmd, query) in [
@@ -1947,9 +2248,10 @@ fn a_host_needs_a_real_tld_and_json_ends_a_search_as_a_word() {
 fn search_words_that_look_like_paths_or_operators_search() {
     let s = Sandbox::new("path-words");
     s.file("notes.md", "# Notes\nhello world\n");
+    s.auth(&[("oxy", "x")]);
     let keyed = |cmd: &str| {
         let mut run = s.cmd(&format!("{cmd} dry:true"));
-        let o = run.env_remove("FATS_OFFLINE").env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+        let o = run.env_remove("FATS_OFFLINE").output().expect("run");
         (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code())
     };
     for q in [
@@ -1985,13 +2287,14 @@ fn search_words_that_look_like_paths_or_operators_search() {
 #[test]
 fn a_local_path_never_reaches_a_search() {
     let s = Sandbox::new("path-leak");
+    s.auth(&[("oxy", "x")]);
     let keyed = |cmd: &str| {
-        let o = s.cmd(cmd).env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+        let o = s.cmd(cmd).output().expect("run");
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
     // a file URL names this OS's path (Windows: a drive; `file:///tmp/…` has no Windows path, an ask)
     let url = if cfg!(windows) { "file:///C:/fats-nope/a" } else { "file:///tmp/fats-nope/a" };
-    let paths = ["./secret.txt", "secret.txt", "../keys", "~/notes/plan", url, "b.pdf"];
+    let paths = ["./secret.txt", "secret.txt", "../keyring", "~/notes/plan", url, "b.pdf"];
     let windows = ["C:\\nope\\a", "C:/nope/a", ".\\secret\\plan", "..\\..\\hr", "~\\x", "\\\\corp-fs\\hr\\pay"];
     let shaped = ["~alice/secret", "$HOME/secret/plan", "internal/hr/salaries", "Documents/plan.key", "id.pem"];
     let rest = ["/tmp/fats-nope/a.pdf", "/tmp/fats-nope/no-ext"].into_iter().chain(windows).chain(shaped);
@@ -2006,7 +2309,7 @@ fn a_local_path_never_reaches_a_search() {
     // a dry row of a missing file says the run's verdict, $0, and plans nothing
     let dry = keyed("./secret.txt dry:true");
     assert!(dry.contains("\n! no_file ./secret.txt · $0") && !dry.contains("run it:"), "{dry}");
-    let o = s.cmd("notes.md hello").env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+    let o = s.cmd("notes.md hello").output().expect("run");
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(out.starts_with("? notes.md: a missing file or a site · type ./notes.md or https://notes.md"), "{out}");
     assert_eq!(o.status.code(), Some(2));
@@ -2023,8 +2326,9 @@ fn a_local_path_never_reaches_a_search() {
 #[test]
 fn dotfiles_bare_files_and_directories_stay_local() {
     let s = Sandbox::new("dotfiles");
+    s.auth(&[("oxy", "x")]);
     let keyed = |cmd: &str| {
-        let o = s.cmd(cmd).env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+        let o = s.cmd(cmd).output().expect("run");
         (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code())
     };
     for cmd in [".env", "summary .env", "id_rsa", "id_ed25519", "authorized_keys"] {
@@ -2188,7 +2492,7 @@ fn several_inputs_are_one_job() {
     let (out, rc) = s.run("./a.html ./b.html ./nope.html");
     assert_eq!(rc, 0, "{out}");
     let head = out.lines().next().unwrap_or_default();
-    assert!(head.starts_with("= j1 3 inputs · 2 ok · 1 ! no_file · ") && head.ends_with("spent $0.0000"), "{head}");
+    assert!(head.starts_with("= j1 3 inputs · 2 ok · 1 ! no_file · ") && head.ends_with("ms"), "free: {head}");
     assert!(
         out.contains("\n= j1.u1 Alpha") && out.contains("\n= j1.u2 Beta") && out.contains("\n= ! no_file ./nope.html")
     );
@@ -2252,11 +2556,11 @@ fn identical_reingest_is_one_snapshot() {
     let (first, _) = s.run("./a.html");
     let (again, rc) = s.run("./a.html");
     assert_eq!(rc, 0, "{again}");
-    assert!(first.lines().next().is_some_and(|l| l.contains("spent")), "{first}");
+    assert!(first.lines().next().is_some_and(|l| l.contains(" · local ") && !l.contains("spent")), "{first}");
     assert!(again.starts_with("= j2.u2 ") && again.lines().next().is_some_and(|l| l.contains("· cache ")), "{again}");
     s.file("a.html", &format!("{SECTIONS}<p>one more line</p>"));
     let (changed, _) = s.run("./a.html");
-    assert!(changed.lines().next().is_some_and(|l| l.contains("spent")), "{changed}");
+    assert!(changed.lines().next().is_some_and(|l| l.contains(" · local ")), "a new read: {changed}");
     let snaps = |d: &str| std::fs::read_dir(s.dir.join(d)).map(|r| r.flatten().filter(|e| e.path().is_dir()).count());
     assert_eq!(snaps("cache/t").ok(), Some(2), "u1 and u3 stored, u2 points at u1");
     let (stats, _) = s.run("stats");
@@ -2306,19 +2610,19 @@ fn text_documents_are_served_as_they_are() {
     });
     let s = Sandbox::new("text");
     let rows = [
-        ("/a.lua", "text", "2 lines", "l1 local x = 1", ""),
-        ("/c.csv", "text", "2 lines", "l2 bread,2", ""),
-        ("/r.md", "text", "3 lines", "l3 keep this", ""),
-        ("/d", "json", "1 line", "l1 {\"ok\"", "#0 info | keys: ok, data[3], meta{1}"),
-        ("/feed", "xml", "1 line", "l1 <rss>", "#0 info | 1 items: First post"),
-        ("/map", "xml", "2 lines", "l2 <urlset>", "#0 info | <urlset> url ×2"),
+        ("/a.lua", "text", "2 lines", "\nlocal x = 1\n", ""),
+        ("/c.csv", "text", "2 lines", "\nbread,2\n", ""),
+        ("/r.md", "text", "3 lines", "\nkeep this\n", ""),
+        ("/d", "json", "1 line", "\n{\"ok\"", "#0 info | keys: ok, data[3], meta{1}"),
+        ("/feed", "xml", "1 line", "\n<rss>", "#0 info | 1 items: First post"),
+        ("/map", "xml", "2 lines", "\n<urlset>", "#0 info | <urlset> url ×2"),
     ];
     for (i, (path, kind, lines, row, info)) in rows.iter().enumerate() {
         let out = online(&s, &format!("{addr}{path}"));
         let id = format!("u{}", i + 1);
         let head = out.lines().next().unwrap_or_default();
         assert!(head.contains(&format!(" · {kind} 1 KB {lines} · ")) && head.contains("plain "), "{out}");
-        assert!(head.contains("spent $0.0000"), "{out}");
+        assert!(!head.contains("spent"), "a free fetch names no spend: {out}");
         assert!(out.contains(row) && out.contains("(whole document shown)"), "{out}");
         assert!(info.is_empty() || out.contains(&format!("{id}{info}")), "{out}");
         assert!(!out.contains(" ! "), "no provider, no row: {out}");
@@ -2327,14 +2631,36 @@ fn text_documents_are_served_as_they_are() {
     let dir = s.dir.join("cache/t");
     assert!(dir.join("u4/raw.json").exists() && dir.join("u1/raw.txt").exists() && dir.join("u6/raw.xml").exists());
     let out = online(&s, &format!("{addr}/long.txt"));
-    // 300 lines a section, read to the 1,000-token cap: ~9 real tokens a numbered line (`clean::tok`)
-    assert!(out.contains(" · text 6 KB 700 lines · ") && out.contains("l136 row 136"), "{out}");
-    assert!(!out.contains("l137 ") && out.contains("… 1.5k more → fats more"), "{out}");
+    // 300 lines a section, read to the 1,000-token cap (`clean::tok`); a line carries no id: `lN` is a link
+    assert!(out.contains(" · text 6 KB 700 lines · ") && out.contains("\nrow 1\n") && !out.contains("l1 "), "{out}");
+    assert!(out.contains(" more → fats more · filter: fats u7 <words>"), "{out}");
     let next = s.run("u7#2").0;
-    assert!(next.contains("l301 row 301") && next.contains("lines 301-600"), "{next}");
+    assert!(next.contains("\nrow 301\n") && next.contains("lines 301-600"), "{next}");
     let hit = s.run("u7 650 match:words").0;
-    assert!(hit.contains("l650 row 650"), "{hit}");
+    assert!(hit.contains("u7#3 row 650"), "{hit}");
     shape(&hit);
+}
+
+/// Every id a read prints opens: an island's lines carry no `lN` (that name is the page's links), so a line a
+/// model copies from the read never answers `? lN unknown`.
+#[test]
+fn a_printed_line_id_opens() {
+    let s = Sandbox::new("lineids");
+    let rows: Vec<String> = (0..1000).map(|i| format!(r#"{{"id":{i},"name":"item {i}"}}"#)).collect();
+    let body = format!(
+        "<p>Lead of the <a href=\"https://ex.com/w\">widget</a>.</p>\
+         <script id=\"__NEXT_DATA__\" type=\"application/json\">{{\"items\":[{}]}}</script>",
+        rows.join(",")
+    );
+    s.file("p.html", &page("Widget", &body));
+    let first = s.run("./p.html").0;
+    let read = s.run("u1#2").0 + &s.run("u1 item 7").0;
+    assert!(first.contains("island script") && read.contains(r#""name": "item 7""#), "{first}{read}");
+    let words = read.split(|c: char| !c.is_ascii_alphanumeric());
+    for l in words.filter(|w| w.len() > 1 && w.starts_with('l') && w[1..].bytes().all(|b| b.is_ascii_digit())) {
+        let (out, rc) = s.run(&format!("u1 {l} dry:true"));
+        assert!(rc == 0 && !out.contains(" unknown"), "{l} printed, not addressable: {out}");
+    }
 }
 
 /// Islands on five framework shapes (Next, Nuxt 3, Nuxt 2, Shopify, JSON-LD) plus a deferred
@@ -2389,10 +2715,10 @@ fn islands_list_and_open() {
     assert!(open.contains("user0 [l2]") && open.contains("user39 [l41]"), "{open}");
     let links = s.run("u1 links").0;
     assert!(links.contains("l1 ex.com/w\n") && links.contains("l2 ex.com/u/0\n"), "{links}");
-    // JSON opens as a text document: pretty, a line id per line; a JS blob as it is
+    // JSON opens as a text document: pretty, no id on a line; a JS blob as it is
     let next = s.run("u1#3").0;
-    assert!(next.contains("l1 {") && next.lines().any(|l| l.contains(r#""name": "item 0 blue widget""#)), "{next}");
-    assert!(s.run("u1#5").0.contains("l1 window.__NUXT__="));
+    assert!(next.contains("\n{\n") && next.lines().any(|l| l.contains(r#""name": "item 0 blue widget""#)), "{next}");
+    assert!(s.run("u1#5").0.contains("\nwindow.__NUXT__="));
     // the page filter reads the served page, then (no hit there) the islands, and says so; an island filters
     // by its id
     let hinge = s.run("u1 hinge").0;
@@ -2875,7 +3201,7 @@ fn a_geo_copy_points_at_its_fix() {
     assert!(out.contains("sent none · the provider's geo copy → fats u2\n"), "the fix ran: $0: {out}");
 }
 
-/// TikTok, oxy key alone: oxyjs cut at 60 s → the page record → then the end: the row names the cut and no
+/// TikTok, oxy key alone: oxyjs cut at 40 s → the page record → then the end: the row names the cut and no
 /// longer call, the agent's `fresh:true` copy cut the same way counts `failed 2/2 here`; with both keys bd
 /// is the move, beside the count when the same lap comes again. A part read under one copy is read under
 /// every copy.
@@ -2885,7 +3211,7 @@ fn a_cut_render_ends_the_walk() {
     let s = Sandbox::new("cutend");
     let cut = || {
         let hops = serde_json::json!([{"provider": "plain", "code": "js_shell", "timeout_s": 10},
-            {"provider": "oxylabs-js", "code": "provider_timeout", "timeout_s": 60, "why": "took > 60 s here", "upto": 0.0015}]);
+            {"provider": "oxylabs-js", "code": "provider_timeout", "timeout_s": 40, "why": "took > 40 s here", "upto": 0.0015}]);
         let meta = serde_json::json!({"url": url, "provider": "plain", "ok": false, "code": "provider_timeout", "t": 1, "hops": hops});
         let pad =
             (1..=300).map(|i| format!(r#""k{i}":"Upload a video, follow creators and log in to like and comment. ""#));
@@ -2910,7 +3236,7 @@ fn a_cut_render_ends_the_walk() {
         // A failed copy with a doc says why, as one without (`fail_detail`): our cut with its age, then the end
         let first = row(&s.run("u1").0, "u1");
         let end = if keys == "oxy" { " ago) · failed 1/1 here".to_string() } else { format!(" ago){after}") };
-        assert!(first.contains("· showing the best copy · oxyjs cut at 60 s (") && first.ends_with(&end), "{first}");
+        assert!(first.contains("· showing the best copy · oxyjs cut at 40 s (") && first.ends_with(&end), "{first}");
         // the walk goes on in the same session: u2 = the agent's `fresh:true`, cut the same way (read log kept)
         let state = s.dir.join("cache/t/state.json");
         let mut st: serde_json::Value = serde_json::from_slice(&std::fs::read(&state).expect("state")).expect("json");
@@ -2928,7 +3254,7 @@ fn a_cut_render_ends_the_walk() {
             } else {
                 format!(" · failed 2/2 here{}", after.replace("u1", id))
             };
-            assert!(r.contains(" · oxyjs cut at 60 s (") && r.ends_with(&end), "{keys} {id}: {r}");
+            assert!(r.contains(" · oxyjs cut at 40 s (") && r.ends_with(&end), "{keys} {id}: {r}");
         }
     }
 }
@@ -3018,13 +3344,13 @@ fn an_old_both_cut_copy_is_a_timeout() {
 }
 
 /// An oxy-only session re-read with both keys: the failed run's stored `no_key bd`
-/// row said "set BRIGHTDATA_API_KEY" under an arrow that buys bd. A stored `no_key` row is said only while that key
+/// row said `→ fats setup bd` under an arrow that buys bd. A stored `no_key` row is said only while that key
 /// is still missing, with the reading binary's name.
 #[test]
 fn a_stored_no_key_row_ends_with_the_key() {
     let url = "https://www.ebay.com/itm/100000000001";
     let s = Sandbox::new("nokeyrow");
-    let bd = "! no_key bd · would try unblock+JS ≤$0.0015 · set BRIGHTDATA_API_KEY + BRIGHTDATA_UNLOCKER_ZONE → \
+    let bd = "! no_key bd · would try unblock+JS ≤$0.0015 → \
               fats-run17 setup · bd https://brightdata.com/cp/start";
     let cap = "! budget_hit bd not tried · $0.0030 > cost:0.002 → fats-run23 u1 fresh:true cost:0.003";
     let hops = serde_json::json!([{"provider": "plain", "code": "blocked_403"}, {"provider": "oxylabs-js", "code": "js_shell", "cost": 0.0015}]);
@@ -3043,6 +3369,7 @@ fn a_stored_no_key_row_ends_with_the_key() {
     let dry = s.cmd("u1 fresh:true cost:0.003 dry:true").env_remove("FATS_OFFLINE").output().expect("dry").stdout;
     let dry = String::from_utf8_lossy(&dry).into_owned();
     let up = dry.split("up to $").nth(1).and_then(|r| r.split([' ', ',', '\n']).next()).unwrap_or("?");
+    // one paid key (bd's is gone): no provider ask beside the cap, it would be the same move
     assert!(out.contains(&format!("u1 {} ≤${up}\n", cap.replace("fats-run23", "fats"))), "{dry}\n{out}");
     s.keys();
     let out = s.run("u1").0;
@@ -3432,12 +3759,13 @@ fn a_dead_runs_cost_outlives_its_run_dir() {
         age_by(&c.join("t/run"), 31 * 60);
         s.run("guide");
     }
-    let after = s.cmd("stats").env("OXYLABS_WEB_API_KEY", "x").output().expect("run").stdout;
+    s.auth(&[("oxy", "x")]);
+    let after = s.cmd("stats").output().expect("run").stdout;
     let after = String::from_utf8_lossy(&after);
     assert!(spent(&before).contains("≤$0.0015") && spent(&after) == spent(&before), "{before}\n{after}");
     assert!(!c.join("t/run").exists() && after.contains(" · 1 paid records · "), "8 sweeps, one row: {after}");
     // the id keeps the dead run as its failed copy: a bare read is `! abandoned` at $0, the priced fix on its row
-    let run = |cmd: &str| s.cmd(cmd).env("OXYLABS_WEB_API_KEY", "x").output().expect("run");
+    let run = |cmd: &str| s.cmd(cmd).output().expect("run");
     let (o, row) = (run("u1"), "\nu1 ! abandoned ex.com/a → fats u1 fresh:true ≤$0.0025\n");
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.code() == Some(1) && out.starts_with("= j1.u1 ! abandoned ") && out.contains(row), "{out}");
@@ -3587,13 +3915,13 @@ fn listing(s: &Sandbox, cmd: &str) -> Vec<String> {
     s.run("more").0.lines().map(String::from).collect()
 }
 
-/// A search's own `limit:N` is the rows it shows (`more` goes on by N); without it the list cap decides.
+/// A search's own `limit:N` is the rows it shows (`more` goes on by N); without it every row a read's cap holds.
 #[test]
 fn a_search_limit_is_the_rows_shown() {
     let s = Sandbox::new("limit");
     let rows = |l: &[String]| l.iter().filter(|r| r.starts_with('u') && r.contains("  ")).count();
     let default = listing(&s, "result page");
-    assert!((1..12).contains(&rows(&default)), "the list cap: {default:?}");
+    assert!(default[0].contains(" · 25 results · 17 shown u1-u17 · "), "the read cap: {default:?}");
     // `limit:N` = at most N rows (20 at most) within a read's 1000-token cap, a cut by tokens said on the `=` line
     let toks = |l: &[String]| l.iter().filter(|r| r.starts_with('u')).map(|r| fats::clean::tok(r)).sum::<usize>();
     for (n, want, said) in [(12, 12, false), (20, 17, true), (50, 17, true), (5, 5, false)] {
@@ -3676,8 +4004,8 @@ fn a_cached_hit_says_so() {
     assert!(out.starts_with("= j1.u3 Result three") && out.contains(" cache"), "opens from the cache: {out}");
 }
 
-/// The background line names a search's prefetch, why a failed run failed and what it cost: nothing billed =
-/// `not charged` (an agent read `u2 ! failed` as a broken, paid command), a billed call its `$`.
+/// The background line names a search's prefetch, why a failed run failed and what it cost: a billed call its
+/// `spent $`, nothing billed no spend (as every `=` line, `provider::spent`).
 #[test]
 fn a_failed_prefetch_says_what_it_cost() {
     let s = Sandbox::new("prefetchfoot");
@@ -3711,8 +4039,7 @@ fn a_failed_prefetch_says_what_it_cost() {
         std::fs::write(cache.join(format!("t/run/u{n}.json")), run.to_string()).expect("run");
     }
     let out = s.run("config").0;
-    let foot =
-        "~ prefetch u1 failed · login_wall · not charged · prefetch u2 failed · captcha_wall · $0.0010 · u3 done\n";
+    let foot = "~ prefetch u1 failed · login_wall · prefetch u2 failed · captcha_wall · spent $0.0010 · u3 done\n";
     assert!(out.ends_with(foot), "{out}");
     assert!(!s.run("config").0.contains("\n~ "), "told once");
 }
@@ -3796,8 +4123,9 @@ fn a_keyless_failure_on_a_terminal_is_a_tip() {
     assert!(run("rust http client dry:true", "1").contains("no_key"), "dry is the agent's language");
 }
 
-/// Every `→ fats …` the guide and the MCP instructions teach pastes into bash and zsh (the macOS default) whole, as
-/// printed, with `dry:true` after it: rc 0, never a shell error (`~25s` was zsh's "no such user").
+/// Every `→ fats …` the guide and the MCP instructions teach, and a `budget_hit` row's moves, paste into bash and
+/// zsh (the macOS default) whole, as printed, with `dry:true` after it: rc 0, never a shell error (`~25s` was zsh's
+/// "no such user", `pay?` its "no matches found").
 #[test]
 fn the_guide_arrows_paste_in_every_shell() {
     let s = Sandbox::new("guide-paste");
@@ -3807,15 +4135,20 @@ fn the_guide_arrows_paste_in_every_shell() {
     let arrows: Vec<&str> = text.split("→ ").skip(1).filter(|a| a.starts_with("fats ")).collect();
     let arrows: Vec<&str> = arrows.iter().map(|a| a.split(['`', '\n']).next().unwrap_or_default().trim()).collect();
     assert!(arrows.len() >= 3 && arrows.iter().any(|a| a.contains("≈25s")), "{arrows:?}");
+    // and a `budget_hit` row's two moves, as printed (`a_capped_page_with_a_copy_exits_zero`)
+    arrows.iter().chain([&PAY_ROW]).for_each(|a| pastes(&s, a));
+}
+
+/// `arrow` pasted into bash and zsh (the macOS default; `?`, `~`, `(` are its globs) whole, as printed, unquoted,
+/// with `dry:true` after it, in `s`'s work dir: rc 0, never a shell error.
+fn pastes(s: &Sandbox, arrow: &str) {
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_fats")).parent().expect("bin dir").display().to_string();
     for sh in ["/bin/bash", "/bin/zsh"].into_iter().filter(|sh| std::path::Path::new(sh).exists()) {
-        for arrow in &arrows {
-            let mut c = Command::new(sh);
-            c.env_clear().env("PATH", format!("{bin}:/usr/bin:/bin")).env("HOME", s.dir.join("home")).envs(s.env());
-            let o = c.current_dir(s.dir.join("work")).arg("-c").arg(format!("{arrow} dry:true")).output().expect("sh");
-            let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-            assert!(o.status.success() && err.is_empty(), "{sh} -c '{arrow} dry:true': {out}{err}");
-        }
+        let mut c = Command::new(sh);
+        c.env_clear().env("PATH", format!("{bin}:/usr/bin:/bin")).env("HOME", s.dir.join("home")).envs(s.env());
+        let o = c.current_dir(s.dir.join("work")).arg("-c").arg(format!("{arrow} dry:true")).output().expect("sh");
+        let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(o.status.success() && err.is_empty(), "{sh} -c '{arrow} dry:true': {out}{err}");
     }
 }
 
@@ -3842,6 +4175,7 @@ fn a_pasted_arrow_never_searches() {
         "fats u1 ~25s ≤$0.0030 (oxyjs) js:true",
         "fats u1 js:true · bd, then oxyjs ≤zsh.0030 ≈25s",
         "fats u1 fresh:true ≤bash.0015",
+        PAY_ROW,
     ]
     .map(String::from)
     .to_vec();

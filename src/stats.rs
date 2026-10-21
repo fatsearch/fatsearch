@@ -29,18 +29,19 @@ fn key_mode() -> Option<String> {
         .then(|| format!("! key_mode {file} is {mode:o}, readable by others → chmod 600 {}", p.display()))
 }
 
-/// A provider's key as `setup`, `account` and `config` read it: switched off = none; Bright Data's needs no zone here.
-fn key_of(t: Tier) -> Option<(String, &'static str)> {
-    settings::on(t.switch()).then(|| settings::key(t.switch())).flatten()
+/// A key (`p` = its switch: `oxy`, `gh`) as `fats` and `config` name it: its tail (`…6XBR`), `none` or `off`; never
+/// its value.
+pub fn key(p: &str) -> String {
+    if !settings::on(p) {
+        return "off".into();
+    }
+    settings::key(p).map_or("none".into(), |k| tail(&k))
 }
 
-/// Where a provider's key comes from (`env`, `auth.json`, `none`, `off`); never its value.
-fn key(t: Tier) -> &'static str {
-    if !settings::on(t.switch()) { "off" } else { key_of(t).map_or("none", |k| k.1) }
-}
-
-fn zone() -> String {
-    settings::zone().map_or_else(|| format!("none → {} setup", bin()), String::from)
+/// A key as a printed line names it: `…` and its last 4 chars (`…6XBR`), these only from a key of 16 chars or more
+/// (4 of them then tell little); never more of it.
+pub fn tail(k: &str) -> String {
+    format!("…{}", k.get(k.len().saturating_sub(4)..).filter(|_| k.len() >= 16).unwrap_or_default())
 }
 
 /// A stored record's meta.json is a search's (in `j<N>/`), not a page's (in `u<N>/`).
@@ -67,12 +68,8 @@ pub fn status(c: &Cache) -> Out {
     let sizes = format!("{size}B ({pics}B pictures) · {pages} pages · {searches} searches");
     let sizes = if c.root.join(MINE).is_file() { sizes } else { "not swept (dir not created by fats)".into() };
     lines.push(format!("cache {root}{m} · {sizes} · {jobs} jobs"));
-    let net = if crate::settings::get().offline.value { "off (FATS_OFFLINE)" } else { "on" };
-    let keys: Vec<String> = KEYS.iter().map(|t| format!("{}:{}", t.spec().short, key(*t))).collect();
-    lines.push(match KEYS.iter().all(|t| key(*t) == "none") {
-        true => format!("keys none → {b} setup · network {net}"),
-        false => format!("keys {} · bd zone {} · network {net}", keys.join(" "), zone()),
-    });
+    lines.push(crate::setup::keys_line());
+    lines.extend(crate::setup::env_rows());
     lines.extend(key_mode());
     let run = |(n, r, alive): &(usize, crate::cache::Detached, bool)| {
         let age = (crate::cache::now() - r.t).max(0.0) as u64;
@@ -111,7 +108,7 @@ fn health(paths: &[std::path::PathBuf]) -> Vec<String> {
         let last = &hops[hops.len().saturating_sub(HEALTH)..];
         if last.is_empty() {
             // the state the `keys` line names: off (its key kept or not), no key, or bd's key without its zone
-            let none = match (fetch::keyed().contains(&t), key(t)) {
+            let none = match (fetch::keyed().contains(&t), key(t.switch()).as_str()) {
                 (true, _) => "- no calls yet",
                 (_, "off") if settings::key(t.switch()).is_some() => "off (key kept)",
                 (_, "off") => "off",
@@ -256,9 +253,9 @@ fn ready() -> String {
     let marks = [rows.next().unwrap_or_default(), rows.next().unwrap_or_default()];
     let row = |l: &str| {
         let [name, label, on, off, none] = l.split('|').collect::<Vec<_>>()[..] else { return String::new() };
-        let (from, texts) = (settings::key(name).map(|k| k.1), [on, off, none]);
+        let (from, texts) = (settings::key(name).map(|k| tail(&k)), [on, off, none]);
         let at = if !settings::on(name) { 1 } else { usize::from(from.is_none() && !none.is_empty()) * 2 };
-        let text = crate::lang::draw(texts[at], &[("from", from.unwrap_or_default())]);
+        let text = crate::lang::draw(texts[at], &[("from", from.as_deref().unwrap_or_default())]);
         paint(marks[at.min(1)], &[("label", &format!("{label:<20}")), ("text", &text)])
     };
     rows.map(row).collect::<Vec<_>>().join("\n")
@@ -393,12 +390,12 @@ pub fn config() -> Out {
         let sp = t.spec();
         let price = format!("${:.2}/1k", sp.price * 1e3);
         // a provider without a key: its `no_key` row, the one text every command prints
-        let k = match key(t) {
+        let k = match key(t.switch()).as_str() {
             "off" => " · off (settings.json)".into(),
             _ if sp.env.is_empty() => String::new(),
             "none" if t == t.owner() => format!(" · key none {}", no_key_rows(sp.short, false).concat()),
             "none" => " · key none".into(),
-            k => format!(" · key {k} ({} or {})", sp.env, settings::AUTH),
+            k => format!(" · key {k} {}", settings::AUTH),
         };
         rows.push((sp.short, format!("{}s {price}", sp.timeout.as_secs()), format!("build{k}")));
     }
@@ -430,10 +427,11 @@ fn source(src: &str, k: &str) -> String {
 fn store_rows(s: &settings::Settings) -> Vec<Row> {
     let p = |v: &std::path::Path| v.display().to_string();
     let swept = if s.cache.value.join(MINE).is_file() { "swept" } else { "not swept (dir not created by fats)" };
+    let bak = if crate::setup::bak().is_some() { " · bak" } else { "" }; // an old key file beside the keys
     vec![
         ("session", s.session.value.clone(), source(s.session.src, "FATS_SESSION")),
         ("cache", p(&s.cache.value), format!("{} · {swept}", s.cache.src)),
-        ("key_dir", p(&s.key_dir.value), s.key_dir.src.into()),
+        ("key_dir", p(&s.key_dir.value), format!("{}{bak}", s.key_dir.src)),
         ("json", s.json.value.to_string(), source(s.json.src, "FATS_JSON")),
         ("nocache", s.nocache.value.to_string(), source(s.nocache.src, "FATS_NOCACHE")),
         ("chunk", format!("{}tok", s.chunk.value), source(s.chunk.src, "FATS_CHUNK")),
@@ -477,8 +475,8 @@ fn fetch_rows(s: &settings::Settings) -> Vec<Row> {
     );
     let lines = crate::text::LINES;
     let text = format!(
-        "text, json, xml bodies (by content type or start) served as they are, l<N> per line, {lines} lines per \
-         section · never a provider, never a route"
+        "text, json, xml bodies (by content type or start) served as they are, a line a row (no id), {lines} \
+         lines per section · never a provider, never a route"
     );
     let (on, accept) = (if s.accept_md.value { "on" } else { "off" }, crate::provider::MD_ACCEPT);
     let md = format!(
@@ -504,7 +502,11 @@ fn fetch_rows(s: &settings::Settings) -> Vec<Row> {
         ("timeout", "per tier below".into(), "build · timeout:1..300 caps plain, then one wall for paid calls".into()),
         ("cost_cap", format!("${}", fetch::COST_CAP), "default · cost:".into()),
         ("gov_labels", fetch::SITES.gov.join(" "), "build (skip bd): last label, or 2nd under a cc".into()),
-        ("bd_zone", zone(), s.bd_zone.as_ref().map_or("unset", |z| z.src).into()),
+        (
+            "bd_zone",
+            settings::zone().map_or_else(|| format!("none → {b} setup"), String::from),
+            s.bd_zone.as_ref().map_or("unset", |z| z.src).into(),
+        ),
         ("low_balance", format!("${LOW_BALANCE:.2} · a bd balance under it is a ! low_balance row"), "build".into()),
         ("account_ttl", ttl, source(s.account_ttl.src, "FATS_ACCOUNT_TTL") + " · fresh:true reads now"),
         ("mcp", format!("{b} mcp · stdio · one tool fats(cmd) · files: cwd + cache"), "build".into()),
@@ -518,8 +520,9 @@ fn instant_row() -> Row {
     use crate::cli::{POLL, PREFETCH, WAIT};
     let (poll, dns) = (POLL.as_millis(), settings::limit::<u64>("dns_wait"));
     let (doh, doh_wait) = (Api::Doh.row().url, crate::provider::DOH_WAIT.as_secs_f32());
+    let pre = if Tier::Plain.key().is_some() { format!("fetch:{PREFETCH}") } else { "off (free fetch off)".into() };
     let instant = format!(
-        "wait:{WAIT}s then a fetch or a search slower than wait: (bd) is pending, a gh/account/setup call is cut (provider_timeout wait:) · poll {poll}ms · a run lives while it holds its lock, else abandoned · prefetch fetch:{PREFETCH} \
+        "wait:{WAIT}s then a fetch or a search slower than wait: (bd) is pending, a gh/account/setup call is cut (provider_timeout wait:) · poll {poll}ms · a run lives while it holds its lock, else abandoned · prefetch {pre} \
          · dns dns_wait:{dns}s, else dns_timeout $0 (an error in < 1 s: dns_failed), on no address a third party: {doh} (A then AAAA, {doh_wait}s each, the host name only)"
     );
     ("instant", instant, "default · wait:0..300 fetch:N".into())
@@ -543,7 +546,10 @@ pub fn change(cmd: &crate::lang::Cmd) -> Out {
     let what = if cmd.flag("dry") { "would save" } else { "saved" };
     match r {
         Ok(()) => {
-            Out::new(vec![format!("= {head} {} · {what} {} · from the next command", s.join(" "), settings::PREFS)])
+            let row = format!("= {head} {} · {what} {} · from the next command", s.join(" "), settings::PREFS);
+            // a key switched off may have an old copy beside it: where it is, how to delete it
+            let off = matches!(s[..], [_, "off"]) && cmd.has("setup");
+            Out::new([row].into_iter().chain(crate::setup::bak_row().filter(|_| off)).collect())
         }
         Err(e) => Out { rc: 1, ..Out::new(vec![format!("! refused · {e}")]).with("error", "refused") },
     }
@@ -570,7 +576,7 @@ pub struct AccountRead {
 /// What `account` and `account dry:true` start from: the account providers with a key, in row order (Bright
 /// Data's account API needs no zone), their names, and the last read (`ACCOUNT_FILE`).
 fn account_state(c: &Cache) -> (Vec<(Tier, String)>, Vec<&'static str>, Option<AccountRead>) {
-    let keys: Vec<(Tier, String)> = ACCOUNTS.iter().filter_map(|&t| Some((t, key_of(t)?.0))).collect();
+    let keys: Vec<(Tier, String)> = ACCOUNTS.iter().filter_map(|&t| Some((t, t.saved_key()?))).collect();
     let names = keys.iter().map(|k| k.0.spec().short).collect();
     (keys, names, jload(&c.root.join(ACCOUNT_FILE)))
 }
@@ -610,7 +616,6 @@ const READS: [(Api, &str); 4] =
 /// provider's own page when its docs give one (`provider::pages`).
 pub fn account_rows(a: &Account, limits: Option<&str>) -> Vec<String> {
     let p = a.provider.as_str();
-    let env = Tier::parse(p).map_or("", |t| t.spec().env);
     // a read cut at `wait:` (`provider::late`) gets more time
     let arg = if a.why.starts_with("wait:") { "wait:30" } else { "" };
     let at = At { id: "account", arg, ..Default::default() };
@@ -643,7 +648,7 @@ pub fn account_rows(a: &Account, limits: Option<&str>) -> Vec<String> {
             [Some(head), low].into_iter().flatten().collect()
         }
         "no_key" => no_key_rows(p, false),
-        "bad_key" => vec![bang("bad_key", &format!("replace {env}"))],
+        "bad_key" => vec![bang("bad_key", "replace the saved key")],
         // Fetch's row, byte for byte (`fetch::fail_detail` names the account after the code)
         "bad_zone" => vec![crate::lang::bang("", "bad_zone", &format!("{p} {}", a.why), &at)],
         code => vec![bang(code, &a.why)],
@@ -708,43 +713,53 @@ pub fn account(c: &Cache, fresh: bool, wait: Duration) -> Out {
 
 // ---------------------------------------------------------------- `fats setup`
 
-/// `fats setup`: each provider's key (env, else `auth.json`: `settings::key`), checked with its free read
-/// (`provider::check_key`: Oxylabs the scraper list, Bright Data the zone list, Decodo a scrape of a host that does not
-/// exist), saved in `auth.json` (0600) unless it came from there. Bright Data's Web Unlocker zone: `zone:`, else the
-/// configured one, else the account's only one. Never prints a key; `dry:true` makes no call and writes nothing. The
-/// checks run side by side, each given up at `wait`.
-pub fn setup(zone: Option<&str>, dry: bool, wait: Duration) -> Out {
+/// `fats setup`: each provider's key (`auth.json`: `settings::key`; with `import`, `fats setup import-env`, the
+/// environment's where none is saved), checked with its free read (`provider::check_key`: Oxylabs the scraper list,
+/// Bright Data the zone list, Decodo a scrape of a host that does not exist). The check writes nothing it was not
+/// asked to (`keep`). Bright Data's Web Unlocker zone: `zone:`, else the configured one, else the account's only
+/// one. Never prints a key (its tail only); `dry:true` makes no call. The checks run side by side, each given up at
+/// `wait`.
+pub fn setup(zone: Option<&str>, import: bool, dry: bool, wait: Duration) -> Out {
     let b = bin();
     let (mut heads, mut lines, mut ok) = (Vec::new(), Vec::new(), true);
     // the free fetch switched off heads the summary, its move back the first row
     let off = (!settings::on("free")).then(crate::setup::free_off);
     heads.extend(off.as_ref().map(|o| o.0.to_string()));
     lines.extend(off.map(|o| o.1));
-    let found: Vec<_> = KEYS.iter().map(|t| key_of(*t)).collect();
+    let env = |t: Tier| settings::env_key(t.spec().short).filter(|_| import).map(|(var, k)| (k, var));
+    let found: Vec<_> = KEYS.iter().map(|t| t.saved_key().map(|k| (k, settings::AUTH)).or_else(|| env(*t))).collect();
     let keyed = KEYS.iter().zip(&found).filter_map(|(t, k)| Some((*t, k.as_ref()?.0.clone())));
     let calls = if dry { Vec::new() } else { keyed.map(|(t, key)| crate::provider::check_key(t, key)).collect() };
     let mut reads = crate::provider::all_within(calls, wait).into_iter();
     for (t, found) in KEYS.into_iter().zip(found) {
-        let s = t.spec();
-        let (head, rows) = match found {
+        let (s, keyed) = (t.spec(), found.is_some());
+        let (head, mut rows) = match found {
             None => ("none".into(), no_key_rows(s.short, true)),
-            Some((_, at)) if dry => {
+            Some((k, at)) if dry => {
                 let row = crate::provider::check_call(t).0.row();
-                let what = format!("{} key from {at} · would read {} {} · $0", s.short, row.method, row.url);
+                let what = format!("{} key {} {at} · would read {} {} · $0", s.short, tail(&k), row.method, row.url);
                 ("not checked".into(), vec![what])
             }
-            Some((key, at)) => match reads.next().flatten().unwrap_or_else(|| Err(late(wait))) {
-                Ok(j) => keep(t, &key, at, j, zone),
+            Some((k, at)) => match reads.next().flatten().unwrap_or_else(|| Err(late(wait))) {
+                Ok(j) => keep(t, (&k, at), j, zone),
                 Err(f) => (format!("! {}", f.code), account_rows(&failed(t, f), None)),
             },
         };
+        // after the check (an imported key is saved by then): the env's row, which for a missing key IS its
+        // `no_key` row, one row a missing key
+        if let Some(env) = crate::setup::env_row(s.short) {
+            if !keyed {
+                rows.retain(|r| !r.starts_with("! no_key "));
+            }
+            rows.push(env);
+        }
         ok &= !head.starts_with('!');
         heads.push(format!("{} {head}", s.short));
         lines.extend(rows);
     }
     let dir = settings::get().key_dir.value.display().to_string();
-    let tail = if dry { " · spends nothing now".to_string() } else { format!(" · key dir {dir}") };
-    lines.insert(0, format!("={} setup {}{tail} · $0", if dry { " dry" } else { "" }, heads.join(" · ")));
+    let end = if dry { " · spends nothing now".to_string() } else { format!(" · key dir {dir}") };
+    lines.insert(0, format!("={} setup {}{end} · $0", if dry { " dry" } else { "" }, heads.join(" · ")));
     lines.extend(crate::telemetry::row());
     lines.push(format!("status: {b} · balance: {b} account · {}", crate::lang::to_guide()));
     let mut out = Out { rc: i32::from(!ok), ..Out::new(lines) }; // a failed check = rc 1
@@ -752,32 +767,33 @@ pub fn setup(zone: Option<&str>, dry: bool, wait: Duration) -> Out {
     out
 }
 
-/// A key that passed its check: the head and row, with the zone for Bright Data; saved (`settings::save_key`)
-/// unless it and the zone are there already.
-fn keep(t: Tier, key: &str, at: &str, got: (String, Vec<String>), zone: Option<&str>) -> (String, Vec<String>) {
-    let (s, (mut what, zones)) = (t.spec(), got);
-    let zone = match t {
-        Tier::Bd => match crate::setup::pick_zone(&zones, zone) {
-            Ok(z) => Some(z),
+/// A key that passed its check: the head and row, with the zone for Bright Data. Saved only when asked: a key from
+/// the environment (`at` = its variable: `fats setup import-env`) with the zone in use, a new zone `zone:` names; a
+/// zone picked without it is named, unsaved. A check of the saved keys leaves the key dir as it was.
+fn keep(t: Tier, (key, at): (&str, &str), got: (String, Vec<String>), arg: Option<&str>) -> (String, Vec<String>) {
+    let (p, (what, zones)) = (t.spec().short, got);
+    let mut zone = None;
+    if t == Tier::Bd {
+        match crate::setup::pick_zone(&zones, arg) {
+            Ok(z) => zone = Some(z),
             Err(row) => return ("! no_zone".into(), vec![row]),
-        },
-        _ => None,
-    };
-    what = zone.as_ref().map_or(what, |z| format!("zone {z}"));
-    let kept = at == settings::AUTH && zone.as_deref().is_none_or(|z| settings::zone() == Some(z));
-    let saved = if kept {
-        Ok("kept".into())
-    } else {
-        settings::save_key(s.short, key, zone.as_deref())
-            .map(|()| format!("saved {}{} (600)", settings::AUTH, if zone.is_some() { " settings.json" } else { "" }))
-    };
-    match saved {
-        Ok(saved) => (format!("ok {what}"), vec![format!("{} ok {what} · key from {at} · {saved}", s.short)]),
-        Err(e) => {
-            let fix = format!("{} config · FATS_KEY_DIR", bin());
-            ("! cache_write".into(), vec![format!("{} ! cache_write {e} → {fix}", s.short)])
         }
     }
+    let what = zone.as_ref().map_or(what, |z| format!("zone {z}"));
+    let saved = at == settings::AUTH;
+    let end = match zone.as_deref().filter(|z| settings::zone() != Some(*z)) {
+        None if saved => String::new(),
+        Some(z) if saved && arg.is_none() => format!(" · zone not saved → {} setup bd zone:{z}", bin()),
+        _ => match settings::save_key(p, key, zone.as_deref()) {
+            Ok(()) if zone.is_some() => format!(" · saved {} settings.json (600)", settings::AUTH),
+            Ok(()) => format!(" · saved {} (600)", settings::AUTH),
+            Err(e) => {
+                let row = format!("{p} ! cache_write {e} → {} config · FATS_KEY_DIR", bin());
+                return ("! cache_write".into(), vec![row]);
+            }
+        },
+    };
+    (format!("ok {what}"), vec![format!("{p} ok {what} · key {} {at}{end}", tail(key))])
 }
 
 /// A provider's `no_key` row outside a fetch, the fetch row's own text (`fetch::no_key`): what every tier of it
@@ -1127,22 +1143,50 @@ mod tests {
         assert_eq!(month(1_798_761_540.0), ("2026-12-01".into(), "2027-01-01".into()), "2026-12-31 23:59");
     }
 
+    /// A check of a saved Bright Data key names the zone it picked (the account's only one) and saves nothing;
+    /// `zone:` saves the zone it names, with the key's file rewritten as it was.
+    #[test]
+    fn a_check_names_the_zone_it_picked() {
+        let dir = crate::scratch::Scratch::new("keep-zone");
+        settings::tests::KEY_DIR.set(Some(dir.to_path_buf()));
+        let saved = ("bd-key-0123456789abcdef", settings::AUTH);
+        crate::scratch::auth(&dir, &[("bd", saved.0)]);
+        let before = std::fs::read(dir.join(settings::AUTH)).expect("auth.json");
+        let zones = || ("key ok".to_string(), vec!["z_only".to_string()]);
+        let (head, rows) = keep(Tier::Bd, saved, zones(), None);
+        let row = format!("bd ok zone z_only · key …cdef auth.json · zone not saved → {} setup bd zone:z_only", bin());
+        assert_eq!((head.as_str(), rows), ("ok zone z_only", vec![row]));
+        assert_eq!(std::fs::read(dir.join(settings::AUTH)).expect("auth.json"), before, "a check writes nothing");
+        assert!(!dir.join(settings::PREFS).exists(), "no zone saved");
+        let (_, rows) = keep(Tier::Bd, saved, zones(), Some("z_only"));
+        assert!(rows[0].ends_with(" · saved auth.json settings.json (600)"), "{rows:?}");
+        assert_eq!(settings::saved(settings::PREFS).bd_zone.as_deref(), Some("z_only"));
+        settings::tests::KEY_DIR.set(None);
+    }
+
+    /// A key prints as its last 4 chars, only from a key of 16 or more: a short one shows none of itself.
+    #[test]
+    fn a_key_prints_as_its_tail() {
+        assert_eq!((tail("oxyK3y-7f9QzR2mWb5Lp8TnVc"), tail("0123456789abcdef")), ("…TnVc".into(), "…cdef".into()));
+        assert_eq!((tail("sunflower"), tail("0123456789abcde"), tail("")), ("…".into(), "…".into(), "…".into()));
+    }
+
     /// `!` rows: built like every other (`lang::bang` + `FIX`), then the provider's own page when its docs give one.
     #[test]
     fn account_bang_rows_link() {
         let b = bin();
         let row = |p: &str, code: &str| Account { provider: p.into(), code: code.into(), ..Account::default() };
         // The fetch row's text (buys, price, every variable) and its key form; `setup` never pointing at itself
-        let oxy = "! no_key oxy · would try no-JS fetch + JS render ≤$0.0025 · set OXYLABS_WEB_API_KEY";
+        let oxy = "! no_key oxy · would try no-JS fetch + JS render ≤$0.0025";
         assert_eq!(account_rows(&row("oxy", "no_key"), None), [format!("{oxy} → {b} setup oxy")]);
-        let bd = "! no_key bd · would try unblock+JS ≤$0.0015 · set BRIGHTDATA_API_KEY + BRIGHTDATA_UNLOCKER_ZONE";
+        let bd = "! no_key bd · would try unblock+JS ≤$0.0015";
         let page = " · bd https://brightdata.com/cp/start";
         assert_eq!(account_rows(&row("bd", "no_key"), None), [format!("{bd} → {b} setup bd")]);
         assert_eq!(no_key_rows("bd", true), [format!("{bd}{page}")]);
         assert_eq!(
             account_rows(&row("oxy", "bad_key"), None),
             [format!(
-                "oxy ! bad_key replace OXYLABS_WEB_API_KEY → {b} setup · oxy https://dashboard.oxylabs.io (a Web API instance's key)"
+                "oxy ! bad_key replace the saved key → {b} setup · oxy https://dashboard.oxylabs.io (a Web API instance's key)"
             )],
             "the product the key must come from"
         );

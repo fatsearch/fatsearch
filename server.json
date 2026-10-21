@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://fatsearch.com",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "packages": [
     {
       "registryType": "cargo",
       "identifier": "fatsearch",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "transport": {
         "type": "stdio"
       },
@@ -25,31 +25,16 @@
       ],
       "environmentVariables": [
         {
-          "name": "OXYLABS_WEB_API_KEY",
-          "description": "Oxylabs Web API key (optional: blocked and JS pages, web search)",
-          "isSecret": true
-        },
-        {
-          "name": "BRIGHTDATA_API_KEY",
-          "description": "Bright Data API key (optional: blocked and JS pages, web search)",
-          "isSecret": true
-        },
-        {
           "name": "BRIGHTDATA_UNLOCKER_ZONE",
           "description": "Bright Data Web Unlocker zone name (optional; fats setup bd saves the account's zone)",
           "isSecret": false
-        },
-        {
-          "name": "DECODO_AUTH_TOKEN",
-          "description": "Decodo Web Data API token (optional: blocked and JS pages)",
-          "isSecret": true
         }
       ]
     },
     {
       "registryType": "npm",
       "identifier": "fatsearch",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -62,24 +47,9 @@
       ],
       "environmentVariables": [
         {
-          "name": "OXYLABS_WEB_API_KEY",
-          "description": "Oxylabs Web API key (optional: blocked and JS pages, web search)",
-          "isSecret": true
-        },
-        {
-          "name": "BRIGHTDATA_API_KEY",
-          "description": "Bright Data API key (optional: blocked and JS pages, web search)",
-          "isSecret": true
-        },
-        {
           "name": "BRIGHTDATA_UNLOCKER_ZONE",
           "description": "Bright Data Web Unlocker zone name (optional; fats setup bd saves the account's zone)",
           "isSecret": false
-        },
-        {
-          "name": "DECODO_AUTH_TOKEN",
-          "description": "Decodo Web Data API token (optional: blocked and JS pages)",
-          "isSecret": true
         }
       ]
     }

@@ -61,7 +61,7 @@ tell the user (never ask for the key in chat):
 2. Copy the API key shown on the Web Data playground. Do NOT paste it in this chat.
 3. open http://127.0.0.1:59802/k/e0c8baba7a5b058947f4fdab97dabb05/decodo , paste the key, press Save
 then: fats setup   (when the user says done; end your turn, do not poll · checks it, $0)
-browser not on this machine (SSH)? put the key in the agent's environment as DECODO_AUTH_TOKEN=<key> instead
+browser not on this machine (SSH)? the user runs fats setup decodo in a terminal there and pastes the key
 ```
 
 <br>
@@ -124,7 +124,7 @@ u2 en.wikipedia.org · Rust (programming language… · plain 558ms $0.0000 · 4
 ## Setup
 
 **You, at a terminal:** run `fats setup`. It is a menu (↑↓ Enter): the free fetch and each provider with its
-state, then Settings (agent connection, cache, stats, telemetry). Pick a provider, paste its key (hidden), and
+state, then Settings (agent connection, cache, stats, telemetry). Pick a provider, paste its key (shown as `•` and a count), and
 `fats` checks it live before it saves it. `fats setup oxy` jumps
 straight to one (also `bd`, `decodo`, `gh`).
 
@@ -133,16 +133,20 @@ provider's dashboard link and a one-time form on `127.0.0.1`, open for 10 minute
 you paste the key into the form in your browser, never into the chat ([what it prints](#your-key-never-touches-the-chat)).
 Then the agent runs `fats setup` to check it ($0).
 
-Keys go to `auth.json` in the key dir (mode 0600) and are sent only to their provider. **Environment variables
-still work** and win over a saved key, which suits MCP hosts and CI.
+Keys go to `auth.json` in the key dir (mode 0600) and are sent only to their provider. **`auth.json` is the one
+key source:** `fats` never sends a key from the environment, so the key you saved is the key every call uses
+(`fats` shows each one's last 4 characters: `keys oxy …6XBR · bd none · decodo none · gh none · auth.json`). On
+a machine without a browser (CI, SSH), pipe the key in: `printf %s "$KEY" | fats setup oxy` checks it and saves
+it. Keys already exported: run `fats setup import-env` once: it checks them, copies them in where no key is
+saved, and never replaces a saved one. Replacing a key keeps the old file as `auth.json.bak` (0600).
 
 | Provider | Key | Page, no JS | Page, rendered | Web search |
 |:--|:--|--:|--:|--:|
 | free (plain HTTP, your IP) | none | $0 | — | — |
-| [Oxylabs](https://dashboard.oxylabs.io/en/registration) Web API | `OXYLABS_WEB_API_KEY` | $0.0010 | $0.0015 | $0.0010 |
-| [Bright Data](https://brightdata.com/cp/start) Web Unlocker | `BRIGHTDATA_API_KEY` + `BRIGHTDATA_UNLOCKER_ZONE` | — | $0.0015 | $0.0015 |
-| [Decodo](https://dashboard.decodo.com/register) Web Data API | `DECODO_AUTH_TOKEN` | $0.0010 | $0.0015 | — |
-| GitHub (`fats gh`) | `GH_TOKEN`, or `fats setup gh` copies the `gh` CLI's token | $0 | — | — |
+| [Oxylabs](https://dashboard.oxylabs.io/en/registration) Web API | `fats setup oxy` (import: `OXYLABS_WEB_API_KEY`) | $0.0010 | $0.0015 | $0.0010 |
+| [Bright Data](https://brightdata.com/cp/start) Web Unlocker | `fats setup bd` (import: `BRIGHTDATA_API_KEY`; zone `BRIGHTDATA_UNLOCKER_ZONE`) | — | $0.0015 | $0.0015 |
+| [Decodo](https://dashboard.decodo.com/register) Web Data API | `fats setup decodo` (import: `DECODO_AUTH_TOKEN`) | $0.0010 | $0.0015 | — |
+| GitHub (`fats gh`) | `fats setup gh` copies the `gh` CLI's token (import: `GH_TOKEN`) | $0 | — | — |
 
 <sub>List prices per page, the ones `dry:true` and `fats stats` use. Oxylabs and Bright Data spend can be checked
 with `fats account`; Decodo has no usage read for this key, so its `$` is the list price, never reconciled.</sub>
@@ -184,7 +188,7 @@ MCP Registry: `mcp-name: io.github.fatsearch/fats`</sub>
 | `fats stats` | every fetch: provider, ms, cost, tokens |
 | `… dry:true` | what would run, what it would cost |
 
-<sub>mods &nbsp;<samp>limit:20 &nbsp;country:de &nbsp;js:true &nbsp;cost:0.5 &nbsp;wait:30 &nbsp;fresh:true</samp> &nbsp;· &nbsp;one screen of all of it: `fats help` &nbsp;· &nbsp;how to use it well: `fats guide`</sub>
+<sub>mods &nbsp;<samp>limit:20 &nbsp;country:de &nbsp;js:true &nbsp;wait:30 &nbsp;fresh:true</samp> &nbsp;· &nbsp;one screen of all of it: `fats help` &nbsp;· &nbsp;how to use it well: `fats guide`</sub>
 
 <br>
 
@@ -199,7 +203,7 @@ gh skill install fatsearch/fatsearch      # the same through GitHub CLI ≥ 2.90
 ```
 
 An agent without either CLI reads it pinned to a release:
-`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.2/skills/fatsearch/SKILL.md`.
+`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.3/skills/fatsearch/SKILL.md`.
 That way the agent sees versioned text it can review, and nothing it runs comes from a website.
 
 Docs as plain Markdown for agents: [fatsearch.com/llms.txt](https://fatsearch.com/llms.txt).
@@ -236,7 +240,7 @@ with `fats setup telemetry off`, `FATS_TELEMETRY=0` or `DO_NOT_TRACK=1`. Details
 - `match:near` / `match:topic`: needs a local model
 - OCR for scanned PDFs → `! no_text`
 - DOCX / XLSX → `! not_in_v1 zip`
-- OS keychain: keys come from env or `auth.json` (mode 0600)
+- OS keychain: keys live in `auth.json` (mode 0600)
 - Remote MCP: stdio only
 - Logins: a page behind a login stays behind it
 

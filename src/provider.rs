@@ -48,7 +48,8 @@ pub struct Spec {
 /// ~$1.50/1k; Decodo $1.00/1k, $1.50/1k with JS. Timeouts: plain 10 s, Oxylabs without JS 10 s (its wins took
 /// 1.4–5.6 s on 40 hard pages, 6 s cut 2 of 3 Reddit threads; a page rung after plain's captcha with both keys and
 /// on every rung with one key, also files, prefetch, `provider:oxy`), Decodo without JS 15 s, BD, Oxylabs and
-/// Decodo with JS 60 s each (`timeout:` sets the renders).
+/// Decodo with JS 40 s each (`timeout:` sets the renders; of 131 renders that served, 8 took 40–60 s and none
+/// longer; Decodo's measured renders took 35.5 and 38.9 s).
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields, bound(deserialize = "'de: 'static"))]
 pub struct Providers {
@@ -93,16 +94,20 @@ impl Tier {
         if self == Tier::Plain { "free" } else { self.owner().spec().short }
     }
 
-    /// The key this tier sends (`settings::key`; Bright Data's needs the zone too); None = not configured, or
+    /// The key this tier sends (`saved_key`; Bright Data's needs the zone too); None = not configured, or
     /// switched off (`settings::on`). Plain needs none: an empty key.
     pub fn key(self) -> Option<String> {
-        let key = || crate::settings::key(self.switch()).map(|k| k.0);
         match self {
-            _ if !crate::settings::on(self.switch()) => None,
-            Tier::Plain => Some(String::new()),
-            Tier::Bd => crate::settings::zone().and_then(|_| key()),
-            _ => key(),
+            Tier::Plain => crate::settings::on(self.switch()).then(String::new),
+            Tier::Bd => crate::settings::zone().and_then(|_| self.saved_key()),
+            _ => self.saved_key(),
         }
+    }
+
+    /// Its owner's saved key as `setup`, `account` and `config` read it (`settings::key`): switched off = none;
+    /// Bright Data's needs no zone here.
+    pub fn saved_key(self) -> Option<String> {
+        crate::settings::on(self.switch()).then(|| crate::settings::key(self.switch())).flatten()
     }
 }
 
@@ -833,9 +838,9 @@ async fn api(to: Api, key: &str, req: Value, cap: u64, wait: Duration) -> Result
         let r = f(to, key, &req);
         let ms = r.header("x-fake-delay-ms").and_then(|v| v.parse().ok()).unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(ms).min(wait)).await;
-        return if ms > wait.as_millis() as u64 { Err("provider_timeout".into()) } else { read(to, r) };
+        return if ms > wait.as_millis() as u64 { Err("provider_timeout".into()) } else { read(to, key, r) };
     }
-    read(to, send(to, key, req, cap, wait).await?)
+    read(to, key, send(to, key, req, cap, wait).await?)
 }
 
 /// The only request that carries a key (`bearer_auth`; none when empty), to `to.url()` only: a POST with `req` as
@@ -865,11 +870,12 @@ async fn send(to: Api, key: &str, req: Value, cap: u64, wait: Duration) -> Resul
 /// `x-brd-status-code` (docs.brightdata.com products/web-unlocker/error-codes, "Direct API").
 type Answer = (Vec<u8>, Option<Limit>, Option<u16>);
 
-/// A reply → the 200 body, or the code + the masked body for `error.txt`.
+/// A reply → the 200 body, or the code + the body for `error.txt`, masked with the saved keys and `key`, the one
+/// sent (a key `fats setup` checks is saved by none yet).
 /// A 200 with an empty body is a failure too: no API answers a good call with nothing. A rate limit that says
 /// when to retry (`Reply::retry_in`) gets `retry in Ns`; another 429 may be an exhausted quota (Oxylabs' docs give
 /// no title for it), so it gets no retry time; another 403 is a refused key.
-fn read(to: Api, r: Reply) -> Result<Answer, Fail> {
+fn read(to: Api, key: &str, r: Reply) -> Result<Answer, Fail> {
     let limit = r.limit();
     let target = r.header("x-brd-status-code").and_then(|s| s.trim().parse().ok());
     // our setup: Bright Data's 400 naming the zone we sent (`zone "nozone" not found`:
@@ -892,7 +898,8 @@ fn read(to: Api, r: Reply) -> Result<Answer, Fail> {
         (_, 429) => ("rate_limited", String::new()),
         _ => ("provider_error", String::new()),
     };
-    let secrets = crate::settings::secrets();
+    let mut secrets = crate::settings::secrets();
+    secrets.extend(Some(key.to_string()).filter(|k| !k.is_empty()));
     let why = if code == "provider_error" && why.is_empty() { reason(r.status, &r.body, &secrets) } else { why };
     // a JSON answer is read as decoded (a key spelled in `\u00XX` escapes is a key), then masked
     let text = serde_json::from_slice::<Value>(&r.body)
@@ -1091,6 +1098,12 @@ pub fn bill(cost: f64, upto: f64) -> String {
     if upto > 0.0 { format!("${cost:.4} + ≤${upto:.4} unverified") } else { format!("${cost:.4}") }
 }
 
+/// An `=` line's spend after `glue`: `spent $0.0015`, nothing when the answer cost nothing (a free fetch ends
+/// `plain 76ms`), so a price on screen always means money.
+pub fn spent(glue: &str, cost: f64, upto: f64) -> String {
+    if cost > 0.0 || upto > 0.0 { format!("{glue}spent {}", bill(cost, upto)) } else { String::new() }
+}
+
 /// The request for one search: (endpoint, body). Oxylabs (developers.oxylabs.io products/web-api/search):
 /// `{query, max_results, location}`, `location` = ISO alpha-2, unknown fields are a 400. Bright Data: a Google
 /// URL with `brd_json=1` (parsed JSON, as the BD CLI's `search` sends it) and `gl` for the country, through the
@@ -1164,7 +1177,7 @@ pub async fn search(
 /// note (the search's, then the account's: ` · no user <q>`, ` · user lookup: rate_limited retry in 60s`); the
 /// account's failure with no hit at all is the answer's (`! rate_limited gh user <q> …`), never `0 results`.
 pub async fn gh_repos(q: String, limit: usize) -> Result<(Vec<Hit>, Vec<(&'static str, String)>), Fail> {
-    let (key, per) = (crate::settings::key("gh").unwrap_or_default().0, limit.min(crate::settings::limit("gh_max")));
+    let (key, per) = (crate::settings::key("gh").unwrap_or_default(), limit.min(crate::settings::limit("gh_max")));
     let call = |to: Api, req: Value| api(to, &key, req, 4 << 20, SEARCH_TIMEOUT);
     let login = q.len() <= 39 && !q.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-');
     let user = login.then_some(async {
@@ -1478,11 +1491,15 @@ mod tests {
                 ("x-brd-error-code", "proxy_error"),
             ];
             let headers = h.iter().filter(|_| refused).map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            read(Api::BdRequest, Reply { status, headers, body: body.into() })
+            read(Api::BdRequest, "", Reply { status, headers, body: body.into() })
         };
         assert_eq!(r(200, false, "{}"), Ok((b"{}".to_vec(), None, None)));
         let raw = Reply { status: 200, headers: vec![("x-brd-status-code".into(), "404".into())], body: b"<p>".into() };
-        assert_eq!(read(Api::BdRequest, raw), Ok((b"<p>".to_vec(), None, Some(404))), "Bright Data's target status");
+        assert_eq!(
+            read(Api::BdRequest, "", raw),
+            Ok((b"<p>".to_vec(), None, Some(404))),
+            "Bright Data's target status"
+        );
         let empty = r(200, false, "").expect_err("200 + empty body");
         assert_eq!((empty.code, empty.why.as_str()), ("provider_error", "empty"));
         let gov = r(200, true, "").expect_err("Bright Data refusal");
@@ -1494,10 +1511,8 @@ mod tests {
         // A status bd relayed is the site's block, a rate limit a wait; neither is bd's policy
         let brd = |code: &str, site: &str| {
             let h = [("x-brd-error", "rejected"), ("x-brd-error-code", code), ("x-brd-status-code", site)];
-            let f = read(
-                Api::BdRequest,
-                Reply { status: 200, headers: h.map(|(k, v)| (k.into(), v.into())).to_vec(), body: vec![] },
-            );
+            let reply = Reply { status: 200, headers: h.map(|(k, v)| (k.into(), v.into())).to_vec(), body: vec![] };
+            let f = read(Api::BdRequest, "", reply);
             f.map_err(|f| (f.code, f.why)).expect_err("refused")
         };
         assert_eq!(brd("http_status", "403"), ("blocked_403", "http_status".into()), "a relayed site 403");
@@ -1522,12 +1537,12 @@ mod tests {
             ("x-ratelimit-search_total_dynamic_europe-1234567-remaining", "0"),
             ("x-ratelimit-system_search_total_dynamic_europe-remaining", "9999"),
         ];
-        let f = read(Api::OxyScrape, acct(&h)).expect_err("429");
+        let f = read(Api::OxyScrape, "", acct(&h)).expect_err("429");
         assert_eq!((f.why.as_str(), f.limit), ("retry in 5s", Some(Limit { limit: 10, remaining: 0 })));
-        let f = read(Api::OxyScrape, acct(&[("retry-after", "7")])).expect_err("429");
+        let f = read(Api::OxyScrape, "", acct(&[("retry-after", "7")])).expect_err("429");
         assert_eq!((f.why.as_str(), f.limit), ("retry in 7s", None), "retry-after wins; no budget sent");
         assert_eq!(
-            read(Api::OxyScrape, acct(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")])).map_err(|f| f.why),
+            read(Api::OxyScrape, "", acct(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")])).map_err(|f| f.why),
             Err("retry in 5s".into())
         );
         assert_eq!(r(500, false, "<html>oops").map_err(|f| (f.code, f.why)), Err(("provider_error", "500".into())));
@@ -1538,7 +1553,7 @@ mod tests {
     fn a_refusal_keeps_its_reason() {
         let why = |status, body: &str| {
             let r = Reply { status, headers: vec![], body: body.into() };
-            read(Api::OxyScrape, r).map_err(|f| f.why).expect_err("refused")
+            read(Api::OxyScrape, "", r).map_err(|f| f.why).expect_err("refused")
         };
         let url =
             r##"{"title":"INVALID_BODY_PROPERTY","errors":[{"detail":"Value not supported.","pointer":"#/url"}]}"##;

@@ -1,6 +1,7 @@
 //! Text documents (`clean::Lists::text`: plain text, CSV, Markdown, JSON, XML incl. RSS/Atom/sitemaps) → Doc, served as
-//! they are: one `lN` row per line, 300 lines per section (`u1#2` = lines 301-600). Never the page path: a text body
-//! judged as a page reads as a JS shell and goes to every provider.
+//! they are: each line one row, no id (`lN` names a link, so a numbered line read as one: `? lN unknown`), 300 lines
+//! per section (`u1#2` = lines 301-600). Never the page path: a text body judged as a page reads as a JS shell and goes
+//! to every provider.
 
 use crate::clean::{Doc, Section, collapse};
 use serde_json::Value;
@@ -18,7 +19,7 @@ pub fn build(raw: &[u8], kind: &str, url: &str, fin: &str) -> Doc {
     let chunk = |(i, c): (usize, &[&str])| Section {
         level: 1,
         title: format!("lines {}-{}", i * LINES + 1, i * LINES + c.len()),
-        lines: c.iter().enumerate().map(|(j, l)| format!("l{} {l}", i * LINES + j + 1).trim_end().into()).collect(),
+        lines: c.iter().map(|l| l.trim_end().into()).collect(),
     };
     let sections: Vec<Section> = all.chunks(LINES).enumerate().map(chunk).collect();
     let outline = match kind {
@@ -115,13 +116,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lines_get_ids_and_sections_of_300() {
+    fn lines_get_no_ids_and_sections_of_300() {
         let body: String = (1..=301).map(|i| format!("row {i}\n")).collect();
         let d = build(body.as_bytes(), "text", "https://a.example/x.csv", "https://a.example/x.csv");
         assert_eq!((d.sections.len(), d.title.as_str(), d.mode.as_str()), (2, "x.csv", "text"));
-        assert_eq!((d.sections[0].lines[0].as_str(), d.sections[1].title.as_str()), ("l1 row 1", "lines 301-301"));
-        assert_eq!(d.sections[1].lines, vec!["l301 row 301".to_string()]);
-        assert_eq!(build(b"a\n\nb", "text", "u", "u").sections[0].lines, vec!["l1 a", "l2", "l3 b"]);
+        assert_eq!((d.sections[0].lines[0].as_str(), d.sections[1].title.as_str()), ("row 1", "lines 301-301"));
+        assert_eq!(d.sections[1].lines, vec!["row 301".to_string()]);
+        assert_eq!(build(b"a \n\nb", "text", "u", "u").sections[0].lines, vec!["a", "", "b"]);
     }
 
     #[test]

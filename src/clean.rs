@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// Doc schema version: a cached doc.json with another `v` is rebuilt from raw.html.
-pub const DOC_V: u32 = 16;
+pub const DOC_V: u32 = 17;
 /// A comment's section level: `COMMENT` + its depth in the thread (beyond `h6`, so no heading is one).
 pub const COMMENT: usize = 7;
 
@@ -33,8 +33,7 @@ pub struct Lists {
     skip_link: Vec<&'static str>,
     /// DETECT by magic bytes (`sniff`): the files this build has no text converter for (pdf, zip = docx/xlsx/pptx).
     magic: Vec<(String, &'static str)>,
-    /// Text documents (`kind_of`): served as they are, a line per `lN` row (`text::build`), never cleaned as a
-    /// page.
+    /// Text documents (`kind_of`): served as they are, a line a row (`text::build`), never cleaned as a page.
     pub text: Vec<&'static str>,
     /// Media (`body_media`, `add`, `rank`): words in a `data-*` attribute that holds the real source; in a GIF's
     /// name that make it a filler; picture file types; a link folder of a picture's own page (`links`); in an alt,
@@ -51,9 +50,16 @@ pub struct Lists {
     tracking: Vec<&'static str>,
     /// Whole words (or their plural) of a tag, class or id that name an ad slot (`ad_slot`).
     ad_slot: Vec<&'static str>,
-    /// A thread's stated size (`declared`): a number before a first word (`726 comments`), or in an attribute
-    /// whose name holds a first word and a second (`comment-count="301"`; `comment-id` is no size).
-    said: [Vec<&'static str>; 2],
+    /// The post's own counts (`post`): an `info` key and the count words of an attribute name that give it
+    /// (`comment-count` → `comments`; the `comments` words also read a thread's stated `726 comments`,
+    /// `declared`), the count markers one of its words must be, the words that make it no count of the post
+    /// (`remaining-comments-count`), and the attribute names read from that element only (`score`, `posted`);
+    /// the posted time also from a name that holds a word of each `post_time` list (`created-timestamp`).
+    post_counts: Vec<(&'static str, Vec<&'static str>)>,
+    post_marker: Vec<&'static str>,
+    post_skip: Vec<&'static str>,
+    post_facts: Vec<(&'static str, Vec<&'static str>)>,
+    post_time: (&'static str, Vec<&'static str>, Vec<&'static str>),
     /// `info` keys read from `<meta>` names, the first name present wins (`meta_info`).
     info: Vec<(&'static str, Vec<&'static str>)>,
     /// Currency marks a price number sits next to (`facts`, `Loss::price_pruned`).
@@ -456,23 +462,55 @@ impl Render<'_> {
         if depths.len() >= limit("thread_rows") && (2..depths.len()).contains(&tops) { depths } else { HashMap::new() }
     }
 
-    /// The thread's size as the page states it (the story's own line, its `<meta>`, a count attribute): the count
-    /// nearest the thread before it, shown, never in a list item (a related post's, a sidebar card's) nor on an
-    /// element around the thread (its text may follow it); its scope = the deepest of those elements at or before
-    /// it, and two counts in that scope claim none.
+    /// THE place rule of the post's counts (`post`, `declared`): `x` is a list item (a related post's card, a
+    /// sidebar's) or chrome (`chrome`, scoped: nav, aside, a banner), where no count is the post's.
+    fn listed(&self, x: usize) -> bool {
+        self.tree.nodes[x].tag == "li" || self.chrome(x, true)
+    }
+
+    /// The post's own counts: the first element in document order with a count attribute (`count`) that is in no
+    /// list item or chrome (`listed`) = the post: `comments 296`; its `post_facts` attributes and its posted time
+    /// (`post_time`) from that element only (`score 26`, `posted 2025-12-11`). Later elements (the comments, each
+    /// with its own score) never. A shape, no site: runs on every page, a thread recognised or not (its comments
+    /// may sit in a `<template>`).
+    fn post(&self) -> Info {
+        let t = self.tree;
+        let counts = |i: usize| (i, t.nodes[i].attrs.iter().filter_map(count).collect::<Vec<_>>());
+        let placed = |c: &(usize, Vec<(String, String)>)| !c.1.is_empty() && !up(t, c.0).any(|a| self.listed(a));
+        let Some((i, found)) = (0..t.nodes.len()).map(counts).find(placed) else {
+            return Info::new();
+        };
+        let (key, when, unit) = &LISTS.post_time;
+        let named = |(k, v): &(String, String)| {
+            let name = bare(k);
+            let words: Vec<&str> = name.split(['-', '_', ':']).collect();
+            let has = |list: &[&str]| words.iter().any(|w| list.contains(w));
+            let fact = LISTS.post_facts.iter().find(|r| r.1.contains(&name.as_str())).map(|r| r.0);
+            let key = if has(when) && has(unit) { Some(*key) } else { fact };
+            Some((key?.to_string(), fact_value(v)?))
+        };
+        let mut info = Info::new();
+        for (k, v) in found.into_iter().chain(t.nodes[i].attrs.iter().filter_map(named)) {
+            info.entry(k).or_insert(v); // the first attribute of a key wins
+        }
+        info
+    }
+
+    /// The thread's size as the page states it in words (`726 comments`: the story's own line, an attribute's
+    /// value; a count attribute's name is the post's, `post`): the count nearest the thread before it, shown, never
+    /// in a list item or chrome (`listed`) nor on an element around the thread (its text may follow it); its scope
+    /// = the deepest of those elements at or before it, and two counts in that scope claim none.
     fn declared(&self) -> Option<usize> {
         let (t, path) = (self.tree, up(self.tree, *self.thread.keys().min()?).collect::<Vec<_>>());
-        let [words, counts] = &LISTS.said;
+        let words = count_words("comments");
         let said = |s: &str| match s.split_whitespace().collect::<Vec<_>>()[..] {
             [n, w] if words.contains(&w.to_lowercase().as_str()) => n.replace(',', "").parse().ok(),
             _ => None,
         };
-        let has = |list: &[&str], k: &str| list.iter().any(|w| k.contains(w));
-        let named = |k: &str, v: &str| (has(words, k) && has(counts, k)).then(|| v.parse().ok()).flatten();
-        let attr = |(k, v): &(String, String)| said(v).or_else(|| named(k, v));
+        let attr = |(_, v): &(String, String)| said(v);
         let text = |k: &Kid| if let Kid::Text(s) = k { said(s) } else { None };
-        let (p, off) = (&path, |x: usize| t.nodes[x].tag == "li" || self.chrome(x, true));
-        let shown = |i: &usize| !p.contains(i) && !up(t, *i).take_while(|a| !p.contains(a)).any(off);
+        let p = &path;
+        let shown = |i: &usize| !p.contains(i) && !up(t, *i).take_while(|a| !p.contains(a)).any(|a| self.listed(a));
         let found = |i: usize| t.nodes[i].attrs.iter().filter_map(attr).chain(t.nodes[i].kids.iter().filter_map(text));
         let mut near =
             (0..path[0]).rev().filter(shown).flat_map(|i| found(i).map(move |n| (p.iter().find(|&&a| a <= i), n)));
@@ -1349,6 +1387,71 @@ fn commonest<T: Ord + Copy>(mut v: Vec<T>) -> Option<T> {
     v.chunk_by(|a, b| a == b).max_by_key(|g| g.len()).map(|g| g[0])
 }
 
+/// The count words of a `post_counts` key (`comments` → comment, comments).
+fn count_words(key: &str) -> Vec<&'static str> {
+    LISTS.post_counts.iter().filter(|r| r.0 == key).flat_map(|r| r.1.iter().copied()).collect()
+}
+
+/// The `info` keys `post` may write, in table order (`outline::info_line` prints them).
+pub fn post_keys() -> impl Iterator<Item = &'static str> {
+    LISTS.post_counts.iter().chain(&LISTS.post_facts).map(|r| r.0)
+}
+
+/// An attribute's name as the post's counts read it: lowercased, `data-` stripped.
+fn bare(k: &str) -> String {
+    let k = k.to_lowercase();
+    match k.strip_prefix("data-") {
+        Some(rest) => rest.to_string(),
+        None => k,
+    }
+}
+
+/// A count attribute of the post: its name (`data-` stripped, split on `-_:`) holds a `post_counts` word and a
+/// `post_marker` word and no `post_skip` word (`remaining-comments-count`: what the page does not show), its value
+/// a whole number (`whole`) → (`comments`, `296`).
+fn count((k, v): &(String, String)) -> Option<(String, String)> {
+    let k = bare(k);
+    let words: Vec<&str> = k.split(['-', '_', ':']).collect();
+    let has = |list: &[&str]| words.iter().any(|w| list.contains(w));
+    if !has(&LISTS.post_marker) || has(&LISTS.post_skip) {
+        return None;
+    }
+    let key = LISTS.post_counts.iter().find(|r| has(&r.1))?.0;
+    Some((key.to_string(), whole(v)?.to_string()))
+}
+
+/// A count as a page writes it: `296`, `1,234`, `2.1k`, `3M` (a fraction only before `k`/`m`); none else.
+fn whole(v: &str) -> Option<u64> {
+    let v = v.trim().replace(',', "").to_lowercase();
+    let suffix = [("k", 1e3), ("m", 1e6)].iter().find_map(|(s, m)| Some((v.strip_suffix(s)?, *m)));
+    let (num, times) = suffix.unwrap_or((&v, 1.0));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let fine = match num.split_once('.') {
+        Some((a, b)) => times > 1.0 && digits(a) && digits(b),
+        None => digits(num),
+    };
+    if !fine {
+        return None;
+    }
+    Some((num.parse::<f64>().ok()? * times).round() as u64)
+}
+
+/// A fact's value: its leading date (`2025-12-11T09:49:02+0000` → `2025-12-11`), else a number as written (`26`,
+/// `-3`); none else.
+fn fact_value(v: &str) -> Option<String> {
+    let v = v.trim();
+    let d = v.as_bytes();
+    let date = d.len() >= 10
+        && d[4] == b'-'
+        && d[7] == b'-'
+        && [0, 1, 2, 3, 5, 6, 8, 9].iter().all(|&i| d[i].is_ascii_digit());
+    if date {
+        return Some(v[..10].to_string());
+    }
+    let number = v.bytes().any(|b| b.is_ascii_digit()) && v.bytes().all(|b| b.is_ascii_digit() || b"+-.,".contains(&b));
+    v.replace(',', "").parse::<f64>().ok().filter(|_| number).map(|_| v.to_string())
+}
+
 /// `i` and its ancestors, nearest first.
 fn up(t: &Tree, i: usize) -> impl Iterator<Item = usize> + '_ {
     std::iter::successors(Some(i), |&p| t.nodes[p].parent)
@@ -1389,8 +1492,11 @@ pub fn build_doc(tree: &Tree, url: &str, final_url: &str, js: bool) -> Doc {
     let loss = Loss { vs_light_lost, light_facts: fl.len(), pruned_chars, visible_chars, price_pruned };
     let title = if title.is_empty() { crate::lang::short(final_url, 60) } else { title };
     let islands = islands(tree, &mut used, final_url);
-    // the size the page states for its thread (`outline::tally` prints `25 of 301`)
-    info.extend(used.declared().map(|n| ("comments".into(), n.to_string())));
+    // the post's own counts, else the size the page states for its thread (`outline::tally` prints `25 of 301`)
+    let post = used.post();
+    let stated = used.declared().filter(|_| !post.contains_key("comments"));
+    info.extend(post);
+    info.extend(stated.map(|n| ("comments".into(), n.to_string())));
     let mut doc = Doc {
         info,
         top,
@@ -1415,6 +1521,55 @@ pub fn paragraph(t: &str) -> bool {
 mod tests {
     use super::*;
     use crate::html::parse;
+
+    /// The post's own counts come from the first element with a count attribute in no list item or chrome, its
+    /// score and posted time from that element only: a custom element's plain attributes, a `data-num-comments`
+    /// post, a `2.1k` count; never a count of what is not shown, a score with no count beside it (review bars), a
+    /// ratio, a nav's or a list card's count, nor a later element's.
+    #[test]
+    fn the_post_counts_come_from_its_own_element() {
+        let info = |h: &str| {
+            let i = build_doc(&parse(h), "https://a.example/", "https://a.example/", false).info;
+            post_keys().filter_map(|k| Some(format!("{k} {}", i.get(k)?))).collect::<Vec<_>>().join(" · ")
+        };
+        let post_el = r#"<x-post id=t3_1 comment-count="296" score="26" upvote-ratio="0.9265"
+            created-timestamp="2025-12-11T09:49:02.123000+0000"><h1>What finally pushed you</h1></x-post>"#;
+        let comments = r#"<template><x-comment score="40" created-timestamp="2025-12-12T01:00:00"
+            comment-count="3"><p>A reply</p></x-comment></template>"#;
+        let reddit = format!("<body>{post_el}{comments}</body>");
+        assert_eq!(info(&reddit), "comments 296 · score 26 · posted 2025-12-11");
+        // a nav's count and a list card's (a related post) are never the post's; the post after them is
+        let text = "<p>The post itself, long enough to be the page's main text for the reader here.</p>";
+        let nav = r#"<nav><a href="/hot" data-comment-count="812">Hot</a></nav>"#;
+        let cards = r#"<ul><li data-comment-count="57"><a href="/r">Related</a></li></ul>"#;
+        let post = format!(r#"<article data-comment-count="4" data-published-date="2024-05-01">{text}</article>"#);
+        assert_eq!(info(&format!("<body>{nav}{cards}{post}</body>")), "comments 4 · posted 2024-05-01");
+        assert_eq!(info(&format!("<body>{nav}{cards}{text}</body>")), "");
+        // posted = a {created, published, posted} word with a {time, timestamp, date} word, or `datetime`
+        let when = |a: &str| info(&format!(r#"<div data-comment-count="1" {a}="2024-03-01T10:00">x</div>"#));
+        assert_eq!(when("data-posted-time"), "comments 1 · posted 2024-03-01");
+        assert_eq!(when("created_date"), "comments 1 · posted 2024-03-01");
+        assert_eq!(when("datetime"), "comments 1 · posted 2024-03-01");
+        for other in ["data-created-by", "data-update-time", "data-date"] {
+            assert_eq!(when(other), "comments 1", "{other}");
+        }
+        let linkedin =
+            r#"<div class="feed"><article data-num-comments="3" data-num-likes="1,204"><p>Post</p></article>"#;
+        assert_eq!(info(linkedin), "comments 3 · likes 1204");
+        assert_eq!(
+            info(r#"<div data-answer-count="2.1k" data-datetime="2024-03-01">Q</div>"#),
+            "answers 2100 · posted 2024-03-01"
+        );
+        // a count of what is not shown, a score alone, a word that only holds a count word, no whole number
+        let stack = r#"<div data-score="2"><span data-remaining-comments-count="6"></span></div>"#;
+        assert_eq!(info(stack), "");
+        assert_eq!(info(r#"<li data-score="92">Staff</li><li data-score="96">Comfort</li>"#), "");
+        assert_eq!(info(r#"<a data-comment-id="99999" data-comment-count="many" data-commentcount="5">x</a>"#), "");
+        assert_eq!(info(r#"<p data-like-count="2.5" data-unread-count="4" data-total-comments="-1">x</p>"#), "");
+        // the first counted element is the post; a later one's score never joins it
+        let later = r#"<p data-comment-count="40">40 comments</p><div data-score="7" data-comment-count="1"></div>"#;
+        assert_eq!(info(later), "comments 40");
+    }
 
     /// A `<title>` that is only the site's name and tagline (Reddit's on every thread) yields to the first `h1`;
     /// a title of the page's own words, a bare word, an error's, one that holds the `h1` already and `og:title` stay.

@@ -61,12 +61,14 @@ fats u1#2 vat match:exact   filter one section, exact phrase only
 fats l4                     the link a fetch would follow
 fats j8                     job 8: its command, when it ran, its pages
 fats j8.u3                  a page from another session (job 8)
-fats                        status: session, cache, keys present (never their values), providers
+fats                        status: session, cache, keys (last 4 chars + source, never the key), providers
 fats stats                  the session index: one row per search and fetch (host · title · provider ms cost · tok), last 20
 fats stats rust limit:5     the rows whose host or title holds the words · `all` every row · `full` every field
 fats config                 every setting and every threshold, and where each came from
-fats setup                  a terminal: the setup menu; piped: check every key, $0
+fats setup                  a terminal: the setup menu; piped: check every saved key, $0, writes nothing
+fats setup import-env       copy exported keys into auth.json (CI, SSH), checked, never over a saved key
 fats setup oxy              add one key (also bd, decodo, gh): the menu on a terminal, else a local key form
+printf %s "$KEY" | fats setup oxy   the same, no browser (SSH, CI): one piped line, checked ($0), saved
 fats setup oxy off          turn a provider off, key kept (on = back; free = the plain fetch)
 fats config set NAME VALUE  save a setting to settings.json (unset NAME = back to the built-in)
 fats account                provider balance, spend this month, usage, zones (free reads, cached 15 min)
@@ -92,7 +94,10 @@ Fetch modifiers: `provider:auto|plain|bd|oxy|decodo` (`oxy` = Oxylabs without, t
 same on Decodo; `auto` written
 out = the whole ladder in table order, ignoring the site's kept `js:true` runs), `js:true` (skip the
 plain request and render JavaScript, one provider at a time), `cost:0.05` (most a fetch may spend, in USD;
-`cost:0` = the free plain request only; a batch's `cost:` is one pool for all its pages: a paid call takes its
+`cost:0` = the free plain request only; a `budget_hit` row ends with the cap that would do and, with two
+provider keys, one provider's ask for a user who asked to pay: `→ fats u1 fresh:true cost:0.004 ≤$0.0040 · if
+the user said pay, fats u1 fresh:true provider:oxy ≤$0.0025` (Oxylabs, then Decodo, then Bright Data; the price
+is that provider's whole path); a batch's `cost:` is one pool for all its pages: a paid call takes its
 price from it before it starts, a page short only of what pages already running will give back waits for them, a
 page left without its cheapest rung fails `budget_hit` naming who spent the cap,
 `! budget_hit bd oxyjs not tried · $0.0030 > cost:0.002 (spent $0.0015 by u1) → …`, and `dry:true` adds `batch up to
@@ -119,14 +124,15 @@ The Oxylabs Web API is asked first; when it fails or has not answered within the
 the same query on Google through the Web Unlocker zone, billed as one unlocker request ($0.0015; the zone
 counter shows it). A search waits up to `wait:` (30 s); when its first keyed provider usually takes
 longer (Bright Data alone: 10 s, so under a `wait:` below 10), it goes on in the background, `pending`, and `fats j1`
-lists its results once they land. A search is never cached; its results are ids like any page, and
+lists its results once they land. The list prints every result that fits `read_cap` (1000 tokens; `limit:N` = at
+most N rows), and `fats more` goes on past it. A search is never cached; its results are ids like any page, and
 `fats stats` lists them as `search→u3`. `fetch:1` (the default; 0–50, `fetch:0` = none) starts fetching the top
 result in the background right after the list prints, within `cost:` (the search's own cost counts first), so
 `fats u1` a moment later is usually a cache hit.
 
 `fats gh <words>` searches GitHub repositories, most stars first (REST `search/repositories`; free; `limit:` up
-to 50). It sends `GH_TOKEN`, else the token saved by `fats setup gh` (which copies `gh auth token` once), else
-none (GitHub allows 30 searches a
+to 50). It sends the token saved by `fats setup gh` (which copies `gh auth token` once; `fats setup import-env`
+copies an exported `GH_TOKEN`), else none (GitHub allows 30 searches a
 minute with a token, 10 without; the `=` line says `no token: 10 searches/min`). A word shaped like a GitHub
 login also lists that account's top 100 repositories by stars (a second free search, `user:<login>`; an account
 GitHub's search leaves out falls back to its 100 last pushed), merged by stars.
@@ -135,7 +141,8 @@ unfetched id like a web result; `fats u1` opens its page through the usual tiers
 
 Output is line-shaped. The first line starts with `=` and summarises the result. Rows follow, then the next move.
 A line starting with `!` is an error record, a line starting with `?` is a question, a last line starting with
-`~` names background runs. Exit codes: `0` ok, `1` failure, `2` usage.
+`~` names background runs. Exit codes: `0` ok, `1` failure, `2` usage. A page whose paid try the `cost:` cap
+stopped while a copy is shown exits `0`: the `! budget_hit` row carries the move.
 
 On a terminal, `fats`, `fats help`, `fats help setup|mcp|search`, `fats setup` and a page that failed print
 short screens for a person instead. Piped output and `fats mcp` are always the lines described here;
@@ -150,7 +157,8 @@ short screens for a person instead. Piped output and `fats mcp` are always the l
 - **`tok`** is what the answer costs a model: an outline's figure is the whole page, a read's figure is what it
   printed.
 - **A word** says how it came: `plain`, `og` (the page's card), `md` (the server's Markdown), the providers
-  tried with their price (`bd:js_shell✗ oxyjs✓`), `hedge:off`, `cache 5m`.
+  tried with their price (`bd:js_shell✗ oxyjs✓`), `hedge:off`, `cache 5m`, then `spent $0.0015` when the
+  answer cost money (a free one ends at its time: `plain 76ms`).
 - **`!`** says what you asked for and did not get, with the next step last:
   `! js_shell → fats u1 js:true · bd, then oxyjs ≤$0.0030 ≈25s` (`≤$` = the most it can spend, `dry:true`'s "up to"; `≈25s` = a
   render's usual time).
@@ -164,7 +172,9 @@ A fetch that has not finished after `wait:` (default 30 s, one deadline for the 
 run under it in at most `batch_parallel` (8) processes, the rest `queued after u1`; ids follow the input order,
 as `dry:true` prints them, and a URL named twice is one run, its second row `uN (same as above)`)
 prints a `pending` line and exits 0; the fetch goes on as a detached process and
-`fats u3` reads the page once it is stored. The line's move is free, `fats u3 wait:30 (free, usually ready in
+`fats u3` reads the page once it is stored. `fats u3`, or the same URL asked again while that fetch runs, waits
+for it within its own `wait:` and prints the page the moment it lands (never a second fetch of the URL; a search's
+background prefetch is the one exception: asking its URL starts the full fetch). The line's move is free, `fats u3 wait:30 (free, usually ready in
 ~12s)`: the estimate is the median time of this session's calls to the same host on the same providers, counted
 from when the running call started and never past that call's own deadline (its `timeout:` or tier default); with
 fewer than 3 such calls it reads `· free, check again in 30 s` instead. Every later CLI answer ends with one
@@ -178,6 +188,16 @@ line naming those runs until each has been reported once:
 The line is printed on the command line only, never through `fats mcp` or with `json:true`. A run is alive
 while it holds its lock, taken at launch before the run starts, so a run slow to start on a busy machine is
 `pending`; a run whose process died answers `! abandoned`.
+
+While a command waits for a run past 5 s, a terminal shows it working on stderr, at 5 s and every 5 s:
+
+```text
+~ still working · bd, oxyjs running · 10 s
+```
+
+Only when stderr is a terminal: a pipe gets no byte of it, nor does `fats mcp`. There, a `tools/call` that sends
+`_meta.progressToken` gets a `notifications/progress` with that token every 5 s, `progress` = the seconds and
+`message` = `still working · 10 s`, so the host can show its own spinner.
 
 ## Any one key
 
@@ -193,6 +213,9 @@ nytimes.com/ fetch plain → oxy (after a captcha) → decodo (after a captcha) 
 $ fats https://www.nytimes.com/ dry:true                # Oxylabs + Bright Data
 nytimes.com/ fetch plain → oxy (after a captcha) → bd ∥ oxyjs after 5s → new u1 · up to $0.0040
 
+$ fats https://www.nytimes.com/ dry:true                # Oxylabs + Bright Data, free fetch off
+nytimes.com/ fetch oxy → bd ∥ oxyjs after 5s → new u1 · up to $0.0040
+
 $ fats https://www.nytimes.com/ dry:true                # Oxylabs key only
 nytimes.com/ fetch plain → oxy → oxyjs → new u1 · up to $0.0025
 
@@ -203,7 +226,7 @@ $ fats https://www.nytimes.com/ dry:true                # Decodo token only
 nytimes.com/ fetch plain → decodo → decodojs → new u1 · up to $0.0025
 
 $ fats https://rust-lang.org/tools/install dry:true     # no key
-rust-lang.org/tools/install fetch plain → new u1 · up to $0.0000 · ! no_key bd · would try unblock+JS ≤$0.0015 · set BRIGHTDATA_API_KEY + BRIGHTDATA_UNLOCKER_ZONE → fats setup bd · ! no_key oxy · would try no-JS fetch + JS render ≤$0.0025 · set OXYLABS_WEB_API_KEY → fats setup oxy · ! no_key decodo · …
+rust-lang.org/tools/install fetch plain → new u1 · up to $0.0000 · ! no_key bd · would try unblock+JS ≤$0.0015 → fats setup bd · ! no_key oxy · would try no-JS fetch + JS render ≤$0.0025 → fats setup oxy · ! no_key decodo · …
 
 $ fats rust async runtime dry:true                      # Bright Data key only
 search "rust async runtime" via bd → bd retry · limit:10 · wait:30s → new u1-u10 · up to $0.0030
@@ -212,11 +235,13 @@ search "rust async runtime" via bd → bd retry · limit:10 · wait:30s → new 
 Decodo has no web search here: with only a Decodo token a search is `nothing can search · $0` and names the
 Oxylabs and Bright Data keys.
 
-- With one key, a call `fats` cut at its own timeout (or lost to a network error) gets **one retry**, inside
-  `cost:`, only when what is left of 90 s from the run's first call (`one_key_wall_s` in `fats config`) is at least
-  the time the failed call had; never after a provider's own refusal, a site's status, a wall or a JavaScript shell. A
-  60 s render timeout therefore ends the run; with no other keyed provider left its row is the end, no arrow:
-  `! provider_timeout … · oxyjs cut at 60 s · failed 1/1 here` (no saved render answered between 60 and 150 s).
+- With one key, a call without JavaScript that `fats` cut at its own timeout, or any call lost to a network error,
+  gets **one retry**, inside `cost:`, only when what is left of 90 s from the run's first call (`one_key_wall_s` in
+  `fats config`) is at least the time the failed call had; never after a provider's own refusal, a site's status, a
+  wall or a JavaScript shell. A render (bd, oxyjs, decodojs) cut at its own 40 s is never retried: a second render
+  would take up to twice the time at twice the price for the few pages that need more than 40 s. A cut with no
+  other keyed provider left is the end, no arrow:
+  `! provider_timeout … · oxyjs cut at 40 s · failed 1/1 here` (of 131 saved renders that served, 8 took 40–60 s, none longer).
   Your own `timeout:` is a hard
   budget: each call stops there and nothing is retried; the next step is `→ fats u1 fresh:true` (the default
   time). A Bright Data search running in the background is one call at twice the search timeout, no retry.
@@ -252,7 +277,7 @@ code. The first block ran with no provider keys.
 
 ```text
 $ fats https://doc.rust-lang.org/book/ch01-01-installation.html
-= jN.u1 Installation - The Rust Programming Language · doc.rust-lang.org · 11 sections · 0 photos · 1.9ktok · plain Nms spent $0.0000
+= jN.u1 Installation - The Rust Programming Language · doc.rust-lang.org · 11 sections · 0 photos · 1.9ktok · plain Nms
 u1#1 Keyboard shortcuts (65) | Press ← or → to navigate between chapters Press S or / to search in the book…
 u1#2 The Rust Programming Language (1.9k, 9 sub) | → Installation · Command Line Notation · Installing rustup on Linux or macOS
 u1#3 Installation (1.9k, 8 sub) | The first step is to install Rust. We’ll download Rust through rustup, a…
@@ -281,11 +306,11 @@ l2 rust-lang.org/tools/install
 
 $ fats u1 l2 dry:true
 = dry u1 l2 dry:true · spends nothing now
-u1 l2 rust-lang.org/tools/install fetch plain → new u2 · up to $0.0000 · ! no_key bd · would try unblock+JS ≤$0.0015 · set BRIGHTDATA_API_KEY + BRIGHTDATA_UNLOCKER_ZONE → fats setup bd · ! no_key oxy · … · ! no_key decodo · …
+u1 l2 rust-lang.org/tools/install fetch plain → new u2 · up to $0.0000 · ! no_key bd · would try unblock+JS ≤$0.0015 → fats setup bd · ! no_key oxy · … · ! no_key decodo · …
 run it: fats u1 l2
 
 $ fats ./report.pdf
-= jN.u2 Tiny Test Doc · pdf · 2 pages · read 0ms/page · 141tok · local Nms spent $0.0000 · ! no_text
+= jN.u2 Tiny Test Doc · pdf · 2 pages · read 0ms/page · 139tok · local Nms · ! no_text
 u2 ! no_text 1 of 2 pages have no text layer (pages 2) · no OCR in this build → fats u2 all
 [u2#1] # page 1
 Tiny test doc: tuna tartare 23
@@ -294,7 +319,7 @@ served daily
 filter: fats u2 <words> · links: fats u2 links
 
 $ fats ./hn-thread.html                      # a saved 370-comment Hacker News thread
-= jN.u3 German Rheinmetall open-sources its Battlesuite connected weapon… · hn-thread.html · 110 sections · 0 photos · 10.1ktok · local Nms spent $0.0000
+= jN.u3 German Rheinmetall open-sources its Battlesuite connected weapon… · hn-thread.html · 110 sections · 0 photos · 10.1ktok · local Nms
 u3#2 Stitch4223 24 days ago | next [–] “Hi Codex, please (273) | | | | Stitch4223 24 days ago | next [–] “Hi Codex…
 u3#3 pstadler 24 days ago | parent | next [–] "The (169) | | | | pstadler 24 days ago | parent | next [–] "The…
 …
@@ -303,7 +328,7 @@ u3#3 pstadler 24 days ago | parent | next [–] "The (169) | | | | pstadler 24 d
 $ fats
 = s:demo 3 ids · last u3 file:///…/hn-thread.html
 cache … (mode 700) · 229.8kB (0B pictures) · 3 pages · 0 searches · 3 jobs
-keys none → fats setup · network on
+keys none → fats setup
 health (last 10 calls, whole cache): provider ok/n p50ms outcomes (– cancelled)
 plain 1/1 Nms ✓
 bd no key
@@ -332,7 +357,7 @@ With both keys set (this session spent $0.0055 on Mastodon's render and one sear
 
 ```text
 $ fats https://mastodon.social/@Gargron/117433450473905580
-= jN.u1 Eugen Rochko (@Gargron@mastodon.social) · mastodon.social · 0 sections · 1 photo · 330tok · og plain Nms spent $0.0000 · ! js_shell → fats u1 js:true · bd, then oxyjs ≤$0.0030 ≈25s
+= jN.u1 Eugen Rochko (@Gargron@mastodon.social) · mastodon.social · 0 sections · 1 photo · 351tok · og plain Nms · ! js_shell → fats u1 js:true · bd, then oxyjs ≤$0.0030 ≈25s
 u1#0 info | author Eugen Rochko · published 2026-10-13T11:50:49Z · Attached: 1 image Another discard from Tuscany. …
 m1 photo 2225x3356 jpeg | A seagull with his beak agape, standing on top of a lamp post. … → https://files.mastodon.social/…/919c0782bdd56173.jpg
 (card only) · filter: fats u1 <words> · links: fats u1 links
@@ -340,19 +365,19 @@ m1 photo 2225x3356 jpeg | A seagull with his beak agape, standing on top of a la
 $ fats u1 m1
 = jN.u1 m1 photo 2225x3356 jpg 897.7kB · saved <cache>/<session>/u1/assets/m1.jpg · ~1.6–4.8k tok if viewed · plain Nms $0
 
-$ fats u1 js:true wait:90
+$ fats u1 js:true
 = jN.u2 Eugen Rochko (@Gargron@mastodon.social) · mastodon.social · 3 sections · 1 photo · 688tok · bd:js_shell✗ oxyjs✓ Nms spent $0.0030 · hedge:off ← u1 fresh
 
 $ fats u1 js:true dry:true
 u1 mastodon.social/@Gargron/117433450473905580 fetch bd → oxyjs → new u3 · up to $0.0030 · ≈25s · hedge:off, one provider at a time
 
 $ fats tokio rust async runtime limit:5
-= jN search "tokio rust async runtime" · 5 results · 4 shown u3-u6 · oxylabs · N.Ns · spent $0.0010
+= jN search "tokio rust async runtime" · 5 results · oxylabs · N.Ns · spent $0.0010
 u3  tokio.rs/  Tokio - An asynchronous Rust runtime — "Tokio is a runtime for writing reliable asynchronous applications with Rust. It provides …"
 u4  github.com/tokio-rs/tokio  GitHub - tokio-rs/tokio: A runtime for writing reliable asy… — "Tokio is an event-driven, non-blocking I/O platform…"
 …
 prefetching u3 free, plain only (detached; fetch:0 = none) · status: fats
-open one: fats u3 · filter: fats u3 <words> · more: fats more
+open one: fats u3 · filter: fats u3 <words>
 ~ u3 pending 0s
 
 ```
@@ -363,8 +388,8 @@ caption sits in the page record):
 ```text
 $ fats u1
 = jN.u1 TikTok - Make Your Day · www.tiktok.com · 0 sections +2 island · 349tok · cache 1h · ! provider_timeout · thin 0 of ~41.1k visible → fats u1#2ft (page record) · 982 tok · $0
-u1 ! provider_timeout tiktok.com/@hildabaci/video/7557346961225944328 · tried plain:js_shell✗ oxyjs:provider_timeout✗≤$0.0015 (unverified) · showing the best copy · oxyjs cut at 60 s (2m ago) → fats u1#2ft (page record) · 982 tok · $0
-u1 ! no_key bd · would try unblock+JS ≤$0.0015 · set BRIGHTDATA_API_KEY + BRIGHTDATA_UNLOCKER_ZONE → fats setup
+u1 ! provider_timeout tiktok.com/@hildabaci/video/7557346961225944328 · tried plain:js_shell✗ oxyjs:provider_timeout✗≤$0.0015 (unverified) · showing the best copy · oxyjs cut at 40 s (2m ago) → fats u1#2ft (page record) · 982 tok · $0
+u1 ! no_key bd · would try unblock+JS ≤$0.0015 → fats setup
 [u1#1] island script#chunk-manifest 73 KB · 66.3k tok → fats u1#1
 [u1#2] island script#__UNIVERSAL_DATA_FOR_REHYDRATION__ 294 KB · 194.1k tok → fats u1#2
 filter: fats u1 <words> · links: fats u1 links
@@ -381,7 +406,7 @@ $ fats u1 hilda
 
 $ fats u1                                    # the record is read: nothing left to try
 = jN.u1 TikTok - Make Your Day · www.tiktok.com · 0 sections +2 island · 358tok · cache 1h · thin 0 of ~41.1k visible · ! provider_timeout
-u1 ! provider_timeout tiktok.com/@hildabaci/video/7557346961225944328 · tried plain:js_shell✗ oxyjs:provider_timeout✗≤$0.0015 (unverified) · showing the best copy · oxyjs cut at 60 s (5m ago) · failed 1/1 here
+u1 ! provider_timeout tiktok.com/@hildabaci/video/7557346961225944328 · tried plain:js_shell✗ oxyjs:provider_timeout✗≤$0.0015 (unverified) · showing the best copy · oxyjs cut at 40 s (5m ago) · failed 1/1 here
 …
 ```
 
@@ -425,15 +450,17 @@ The session is `FATS_SESSION` if the client sets it, else a hash of the server's
    must list at least five results. A 404 or 410 is never the page, even when it repeats the URL's words.
 3. **Providers**, only for the keys that are set (see [Any one key](#any-one-key)):
    - **Both keys:** Bright Data's Web Unlocker starts; when it has not answered after 5 s, the Oxylabs Web API
-     with JavaScript rendering (`oxyjs`) starts beside it (`hedge:0` starts both at once; 60 s each,
+     with JavaScript rendering (`oxyjs`) starts beside it (`hedge:0` starts both at once; 40 s each,
      `timeout:` changes these two). The first good page wins and the other call is cancelled as `abandoned`
      (`oxyjs:abandoned✗≤$0.0015 (unverified)`: a provider may still bill a call `fats` hung up on). When the first good page is thin and the other call is
      still running, `fats` waits for it, within the hedge window, and serves the fuller copy.
+   - **Both keys, free fetch off** (`fats setup free off`): no plain request to wait for, so `oxy` without
+     JavaScript (10 s) runs first, then Bright Data and `oxyjs` as above.
    - **Oxylabs key only:** Oxylabs without JavaScript (`oxy`, 10 s), then with it (`oxyjs`). After a JavaScript
      challenge, shell or empty search page from the plain request, `oxyjs` goes first.
    - **Bright Data key only:** Bright Data.
    - **Decodo token only:** Decodo's Web Data API without JavaScript (`decodo`, 15 s), then with it
-     (`decodojs`, 60 s).
+     (`decodojs`, 40 s).
    - **Decodo beside other keys:** `decodo` without JavaScript runs after `oxy` (both only after the plain
      request met a captcha or wall), and `decodojs` is the last render: one hedge after Bright Data and
      `oxyjs` with all three keys, beside the other render with two (`dry:true` prints the exact order).
@@ -442,9 +469,9 @@ The session is `FATS_SESSION` if the client sets it, else a hash of the server's
      (see [Any one key](#any-one-key)).
    - A provider is skipped only after it failed in this run; no past run takes it off the next visit's ladder
      (keeping such skips lost more served pages than the ~2 s a fetch they saved).
-   - Oxylabs without JavaScript is otherwise used for a PDF's bytes, a search's prefetch and `provider:oxy`.
+   - Oxylabs without JavaScript is otherwise used for a PDF's bytes and `provider:oxy`.
      Decodo is not used for PDF bytes or web search.
-     With the Bright Data key only, a search's prefetch is the free plain request only.
+     A search's prefetch is the free plain request only, whatever the keys; with the free fetch off there is none.
      Government hosts skip Bright Data.
 4. **App pages.** A JavaScript shell from the plain request plus shells or timeouts from two different
    providers is an app page: `fats` stops with `! no_copy`, keeps the best copy, and points first at the
@@ -594,15 +621,37 @@ row is `! off oxy · turned off (key kept) → fats setup oxy on` and its status
 the free fetch off, `fats setup free` reads `= setup free · free off (turned off) → fats setup free on` and the
 `fats setup` summary starts `= setup free off (turned off) · …` with that row first. A
 Bright Data key saved without a zone reads `! no_zone bd · key saved, no Web Unlocker zone yet → fats setup bd
-zone:<name>`. `fats setup` takes only a switch name (`plain` = `free`), `on|off` and mods; any other word is a
-repair at $0, never a search: `fats setup oxi` → `? setup oxi → fats setup oxy`.
+zone:<name>`. `fats setup` takes only a switch name (`plain` = `free`), `on|off`, `import-env` and mods; any
+other word is a repair at $0, never a search: `fats setup oxi` → `? setup oxi → fats setup oxy`.
+
+`fats setup` with no name checks every saved key (one free read each) and writes nothing: a zone it would pick
+is named (`· zone not saved → fats setup zone:<name>`), saved only when `zone:` names it. Each row names the
+key by its last 4 characters and its source: `oxy ok 351 scrapers · key …6XBR auth.json`. A key exported in the
+environment is never sent; `fats` and `fats setup` name it by its tail on one row: beside a different saved key
+`env OXYLABS_WEB_API_KEY …SEDm ≠ saved …6XBR · not used · replace: fats setup oxy`, where none is saved `! no_key
+oxy · env OXYLABS_WEB_API_KEY …SEDm not imported → fats setup import-env` (in `fats setup` it replaces the
+provider's plain `no_key` row: one row a missing key). The status line names every key by its
+tail, Bright Data's zone and the file: `keys oxy …6XBR · bd …k2Qf zone fatsrc · decodo none · gh none ·
+auth.json` (` · network off` under `FATS_OFFLINE`). `fats setup import-env` is that same check
+with each exported key (`OXYLABS_WEB_API_KEY`, `BRIGHTDATA_API_KEY`, `DECODO_AUTH_TOKEN`, `GH_TOKEN`) where no
+key is saved, and saves the ones that pass (`· key …Vz5J OXYLABS_WEB_API_KEY · saved auth.json (600)`). A different
+saved key is never replaced by it; replacing one (`fats setup oxy`, the form, the menu, the pipe) keeps the old file
+as `auth.json.bak` (0600).
+
+`printf %s "$KEY" | fats setup oxy` (stdin not a terminal) reads ONE line, strips its trailing CR/LF, runs the
+menu's check ($0) and saves the key when it passes: `= setup oxy ok 351 scrapers · key …6XBR saved auth.json
+(600) · $0`, or `= ! bad_key setup oxy · … · not saved → …`, rc 1. It never starts the key form. Nothing on
+stdin within 2 s (an agent's shell) = the key form, as before. A key typed on a `fats setup` command line
+(`fats setup oxy <key>`, or after a word for setup: `fats login <key>`, `keys`, `auth`, `signin`, `credentials`)
+is refused, never echoed or searched: `! key_in_argv · never on the command line (shell history,
+ps) · paste: fats setup oxy · pipe: printf %s "$KEY" | fats setup oxy`.
 
 | setting | default | set with |
 |---|---|---|
 | session | a hash of the working directory | `FATS_SESSION`: letters, digits, `-`, `_`, ≤ 64; any other name prints a `!` row and gets a session hashed from it |
 | cache | the OS cache dir + `/fatsearch`. A page or search dir is never read 30 min after its last read or 60 min after its fetch (`cache_idle_s`, `cache_ttl_s`), and is deleted then: this session's after every answer, every session's at most every 5 min (`sweep_every_s`, the root's `swept` file). Only a root fats made, or the default one, is swept (it holds `.fatsearch-cache`; `config` says `swept`, else `not swept (dir not created by fats)`), and in it only the `u<N>`/`j<N>` dirs holding a `meta.json` and `run/` of a real session dir; a symlink is never followed | `FATS_CACHE`, made absolute once at start (a relative dir is the working dir's; `config` shows the result); `~/…` (no shell expanded it), `/`, `$HOME` or a dir fats cannot make is refused with `! bad_setting` and the default is used; swept, and sized by status, only when fats created it, so a project dir is never swept or walked (status: `not swept (dir not created by fats)`) |
 | key_dir | the OS config dir + `/fatsearch` (`auth.json` = keys, `settings.json` = switches, the Bright Data zone and set values; each 0600). The 0.1 files `oxylabs.key`, `brightdata.key`, `brightdata.zone` move in once | `FATS_KEY_DIR` |
-| keys | none | `fats setup` saves them in `auth.json`; `OXYLABS_WEB_API_KEY`, `BRIGHTDATA_API_KEY` + `BRIGHTDATA_UNLOCKER_ZONE`, `DECODO_AUTH_TOKEN`, `GH_TOKEN` win over it. Nothing else is read: no `./.env`, no other tool's files; `fats setup gh` copies the `gh` CLI's token once |
+| keys | none | `auth.json` only: `fats setup` saves them there (a replaced key leaves `auth.json.bak`); `fats setup import-env` copies `OXYLABS_WEB_API_KEY`, `BRIGHTDATA_API_KEY`, `DECODO_AUTH_TOKEN`, `GH_TOKEN` in where none is saved. A key in the environment is never sent; nothing else is read: no `./.env`, no other tool's files; `fats setup gh` copies the `gh` CLI's token once. The Bright Data zone: `BRIGHTDATA_UNLOCKER_ZONE`, else `settings.json` |
 | json | false | `FATS_JSON=1`, `json:true` |
 | nocache | false | `FATS_NOCACHE=1` (ignore cached pages) |
 | network | on | `FATS_OFFLINE=1` (cached pages and local files only; telemetry off too) |
@@ -618,7 +667,7 @@ repair at $0, never a search: `fats setup oxi` → `? setup oxi → fats setup o
 | hedge | fetch 5 s, search 2.5 s; a paid ask (`js:true`, `provider:`) is not hedged | `hedge:0` (race) to `hedge:60` (seconds) |
 | wait | 30 s, then `pending` (a search past it: in the background, `fats jN`) | `wait:0..300` |
 | cost_cap | $0.05 per command | `cost:` |
-| plain · bd · oxy · oxyjs · decodo · decodojs | 10 s $0 · 60 s $1.50/1k · 10 s $1.00/1k · 60 s $1.50/1k · 15 s $1.00/1k · 60 s $1.50/1k; a one-key retry after a timeout gets min(2× the timeout, 90 s − the run's time so far), none when that is less than the failed call had | `timeout:` = ONE wall for every provider call together (bd, oxyjs, oxy no-JS, decodo, decodojs), 1–300 s, one at a time (no hedge), a hard budget: no retry (list prices, estimates) |
+| plain · bd · oxy · oxyjs · decodo · decodojs | 10 s $0 · 40 s $1.50/1k · 10 s $1.00/1k · 40 s $1.50/1k · 15 s $1.00/1k · 40 s $1.50/1k; a one-key retry after a no-JS timeout gets min(2× the timeout, 90 s − the run's time so far), none when that is less than the failed call had | `timeout:` = ONE wall for every provider call together (bd, oxyjs, oxy no-JS, decodo, decodojs), 1–300 s, one at a time (no hedge), a hard budget: no retry (list prices, estimates) |
 | max_bytes | 16 MiB per page (cleaning takes ~17× the input in memory); ceiling 64 MiB | `max_bytes:32m` |
 | loss_max · thin_share · … · gh_max · batch_parallel | 44 behaviour thresholds (`src/data/limits.json`), one `fats config` row each: the share of numbers a prune may lose (0.3), the `thin` share and floor, the pruned-numbers count bar, prose and thread sizes, island sizes (an island pointer needs 5 paragraphs), icon/avatar sizes, parse and PDF budgets (2 s, 10 s), max depth 512, the one-key wall (90 s), a batch's processes (`batch_parallel`, 8: a RAM guard, not a provider limit), the plain brake (`plain_host_pace_ms`, 1000), the host check's wait (`dns_wait`, 5 s), … | `name:value`, `FATS_<NAME>`, `fats config set` |
 | gov_hosts | by label, no host list: `sec.gov`, `data.gov.uk`, `x.gouv.fr` (skip Bright Data) | build |
@@ -652,7 +701,7 @@ version is out.
 - **Semantic matching.** `match:near` and `match:topic` need a local model; they answer `! not_in_v1`.
 - **OCR.** Scanned PDF pages are counted in a `! no_text` row, not read.
 - **DOCX / XLSX.** Saved and reported as `! not_in_v1 zip`.
-- **OS keychain.** Keys come from the environment or `auth.json` (0600).
+- **OS keychain.** Keys come from `auth.json` (0600) only.
 - **Remote MCP.** `fats mcp` speaks stdio only; no HTTP transport, no OAuth.
 - **Filters across pages.** A filter reads one page (`j3.u1 price`); a job-wide filter answers `! not_in_v1`.
 - **Logins.** A page behind a login stays behind it; providers are called only with your own keys.

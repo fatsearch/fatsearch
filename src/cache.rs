@@ -299,7 +299,7 @@ impl Meta {
         self.path(false)
     }
 
-    /// `tried` with each paid call's request shape (`stats`): `oxyjs@US/60s✓`, `bd/60s` = no country sent.
+    /// `tried` with each paid call's request shape (`stats`): `oxyjs@US/40s✓`, `bd/40s` = no country sent.
     pub fn path(&self, shape: bool) -> String {
         // the failures a paid provider does not bill, said so (a refused key is no call: no `$`); a paid tier's
         // site block with no cost is one bd relayed (`provider::bd_refused`), a billed one shows its `$` above

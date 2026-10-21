@@ -12,6 +12,7 @@
 #![cfg(unix)]
 
 #[path = "../src/scratch.rs"]
+#[expect(dead_code, reason = "parity runs keyless: no auth.json")]
 mod scratch;
 
 use serde_json::Value;

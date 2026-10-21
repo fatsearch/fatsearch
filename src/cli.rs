@@ -88,6 +88,9 @@ fn json_of(cmd: &Cmd) -> bool {
 /// on user input.
 pub fn run(argv: &[String]) -> (String, i32, Option<String>) {
     let cmd = parse(argv);
+    if let Some(o) = crate::setup::key_in_argv(&cmd, argv) {
+        return (emit(&o, json_of(&cmd)), o.rc, None);
+    }
     settings::mods(&cmd.mods);
     let set = settings::get();
     let json = json_of(&cmd);
@@ -99,7 +102,7 @@ pub fn run(argv: &[String]) -> (String, i32, Option<String>) {
         return (s, 0, None);
     }
     let mut out = if let Some(q) = &cmd.ask {
-        Out::ask(q.clone())
+        Out::ask(q)
     } else if cmd.flag("dry") {
         plan(&cmd, &c)
     } else {
@@ -147,9 +150,7 @@ fn footer(c: &Cache, lines: &[String], show: bool) -> String {
         // a failed run says why (its code) and what it cost: its own bill (`provider::charged`), the calls it cut
         // from its stored copy (`upto`), as `stats` prints them
         let m: Meta = c.st.u.get(n - 1).and_then(|e| jload(&c.dir(e)?.join("meta.json"))).unwrap_or_default();
-        let bill =
-            |cost: f64| if cost + m.upto() > 0.0 { provider::bill(cost, m.upto()) } else { "not charged".into() };
-        let fail = |d: Done| format!("failed · {} · {}", d.code, bill(d.cost));
+        let fail = |d: Done| format!("failed · {}{}", d.code, provider::spent(" · ", d.cost, m.upto()));
         let end = r.done.map_or("! abandoned".into(), |d| if d.ok { "done".into() } else { fail(d) });
         over.extend((!named(n)).then(|| format!("{id} {end}")));
         if show || named(n) {
@@ -230,11 +231,11 @@ struct Search {
 fn search_of(cmd: &Cmd) -> Result<Search, Out> {
     let b = bin();
     if let Some(l) = cmd.links.first() {
-        return Err(Out::ask(format!("? l{l} needs a page: {b} u1 l{l} · search: {b} {}", cmd.words.join(" "))));
+        return Err(Out::ask(&format!("? l{l} needs a page: {b} u1 l{l} · search: {b} {}", cmd.words.join(" "))));
     }
     if cmd.urls.len() > 1 {
         let (site, words) = (short(&cmd.urls[0], 60), cmd.words.join(" "));
-        return Err(Out::ask(format!("? one site per search: {b} {site} {words}")));
+        return Err(Out::ask(&format!("? one site per search: {b} {site} {words}")));
     }
     let gh = is_gh(cmd);
     let site =
@@ -250,10 +251,10 @@ fn search_of(cmd: &Cmd) -> Result<Search, Out> {
         return Err(refused("key_in_query", "", what, &At::default()));
     }
     if q.chars().count() > 2048 {
-        return Err(Out::ask(format!("? query is {} chars · a search takes 2048 at most", q.chars().count())));
+        return Err(Out::ask(&format!("? query is {} chars · a search takes 2048 at most", q.chars().count())));
     }
     if let Some(p) = cmd.get("provider").filter(|p| !gh && !matches!(*p, "oxy" | "bd" | "auto")) {
-        return Err(Out::ask(format!("? provider:{p} cannot search · provider:oxy|bd|auto")));
+        return Err(Out::ask(&format!("? provider:{p} cannot search · provider:oxy|bd|auto")));
     }
     let max = if gh { settings::limit("gh_max") } else { provider::SEARCH_MAX };
     let (p, asked) = (plan_of(cmd, None), wait_of(cmd));
@@ -326,7 +327,7 @@ const PATIENCE: Duration = provider::SEARCH_TIMEOUT.saturating_mul(2);
 fn searching(c: &mut Cache, cmd: &Cmd) -> Result<Out, Out> {
     let job = c.job_of(&cmd.raw).map_err(cache_write)?;
     detach(format!("j{job}"), &c.root.join(&c.session).join(format!("run/j{job}.log")), None).map_err(cache_write)?;
-    poll_until(c.born, wait_of(cmd), || c.serp(job).is_some());
+    poll_until(c.born, wait_of(cmd), || c.serp(job).is_some(), || "search running".into());
     match c.serp(job) {
         Some(m) if m.ok => Ok(serp_list(c, job, 0, true)),
         Some(m) => search_out(c, cmd, job, &m),
@@ -391,8 +392,11 @@ fn prefetched(c: &mut Cache, cmd: &Cmd, job: usize, mut o: Out) -> Out {
 /// How many results a search fetches detached (`fetch:N`).
 pub const PREFETCH: usize = 1;
 
+/// `fetch:N`, none while the free fetch is off: a prefetch is plain only (`Plan::prefetch`), so it would only store
+/// a failure, never a page.
 fn prefetch_n(cmd: &Cmd) -> usize {
-    cmd.get("fetch").and_then(|v| v.parse().ok()).unwrap_or(PREFETCH)
+    let n = cmd.get("fetch").and_then(|v| v.parse().ok()).unwrap_or(PREFETCH);
+    if Tier::Plain.key().is_some() { n } else { 0 }
 }
 
 /// Drop the hits off `host` (not it, not under it): Google may ignore `site:` when the words are common (5 of 10
@@ -414,7 +418,7 @@ fn is_prefetch(r: &Detached) -> bool {
 /// happen today) = the code's own fix.
 fn nothing_searched(s: &Search, what: &str, mut rows: Vec<String>) -> Out {
     let code = if s.plan.keys.is_empty() { "no_key" } else { "budget_hit" };
-    let eq = format!("= ! {code} {what} · no search provider can run · 0ms spent $0");
+    let eq = format!("= ! {code} {what} · no search provider can run · 0ms");
     let first = if rows.is_empty() { bang("", code, "", &At::default()) } else { rows.remove(0) };
     let mut o = Out::fail(code, eq, first);
     o.warn(rows);
@@ -442,7 +446,7 @@ fn search_meta(s: &Search, hops: Vec<HopRow>, served: &str, t0: Instant) -> Meta
 /// A failed search's answer from its record.
 fn search_out(c: &Cache, cmd: &Cmd, job: usize, m: &Meta) -> Result<Out, Out> {
     let q = m.url.strip_prefix("search:").unwrap_or(&m.url);
-    let detail = format!("· tried {} · {}ms spent {}", m.tried(), m.ms, provider::bill(m.cost, m.upto()));
+    let detail = format!("· tried {} · {}ms{}", m.tried(), m.ms, provider::spent(" ", m.cost, m.upto()));
     // a slow provider gets more time (cut at `wait:`, or past its own timeout), never a time its call already had
     // (a detached bd search ran 30 s, `one_call`); `fresh:true` changes nothing
     let last = m.hops.last();
@@ -482,15 +486,15 @@ fn searched(rec: &Meta) -> String {
     let tried = if rec.hops.len() > 1 && !gh { format!(" after {}", rec.tried()) } else { String::new() };
     let mut note: String = rec.hops.iter().filter(|h| gh && h.code != "ok").map(|h| h.why.as_str()).collect();
     note += if gh && settings::key("gh").is_none() { " · no token: 10 searches/min" } else { "" };
-    let usd = provider::bill(rec.cost, rec.upto());
-    format!("{}{cc}{tried}{note} · {:.1}s · spent {usd}", rec.provider, rec.ms as f64 / 1e3)
+    let usd = provider::spent(" · ", rec.cost, rec.upto());
+    format!("{}{cc}{tried}{note} · {:.1}s{usd}", rec.provider, rec.ms as f64 / 1e3)
 }
 
-/// Search `job`'s results from hit `off`, up to the list cap; the cursor remembers where `more` goes on. `new` =
+/// Search `job`'s results from hit `off`, up to the read cap; the cursor remembers where `more` goes on. `new` =
 /// this command ran the search (its cost and time on the `=` line), else the record's age.
 fn serp_list(c: &mut Cache, job: usize, off: usize, new: bool) -> Out {
     let b = bin();
-    let Some(rec) = c.serp(job) else { return Out::ask(format!("? j{job} has no search record · {b} <words>")) };
+    let Some(rec) = c.serp(job) else { return Out::ask(&format!("? j{job} has no search record · {b} <words>")) };
     let hits: Vec<Hit> = rec.extra.get("hits").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
     let first = rec.extra.get("first").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
     let query = rec.url.strip_prefix("search:").unwrap_or(&rec.url);
@@ -515,10 +519,10 @@ fn serp_list(c: &mut Cache, job: usize, off: usize, new: bool) -> Out {
         parts.push(part);
         rows.push(row);
     }
-    // a search's own `limit:N` = at most N rows a page (20 at most, `more` goes on) within a read's token cap; else
-    // what fits the list cap. A cut by tokens says so: `14 shown u1-u14 of limit:20 (1000 tok cap)`
+    // every row within a read's token cap (`more` goes on), a search's own `limit:N` at most N of them (20 at most).
+    // A cut by tokens under `limit:` says so: `14 shown u1-u14 of limit:20 (1000 tok cap)`
     let n = c.job(job).and_then(|j| parse(&[j.cmd]).count("limit")).map(|n| n.min(provider::SEARCH_MAX));
-    let (mut lines, cap) = (Vec::new(), settings::limit::<usize>(if n.is_some() { "read_cap" } else { "list_cap" }));
+    let (mut lines, cap) = (Vec::new(), settings::limit::<usize>("read_cap"));
     let next = off + outline::cap_rows(&mut lines, &rows, 0, (cap, 1, n));
     let cut = n.filter(|&n| lines.len() < n && next < hits.len());
     let cut = cut.map_or(String::new(), |n| format!(" of limit:{n} ({cap} tok cap)"));
@@ -618,11 +622,8 @@ pub fn plan(cmd: &Cmd, c: &Cache) -> Out {
     if cmd.has("account") {
         return stats::account_dry(c, cmd.flag("fresh"));
     }
-    if !cmd.sub.is_empty() && cmd.get("zone").is_none() {
-        return stats::change(cmd);
-    }
-    if cmd.has("setup") {
-        return stats::setup(cmd.get("zone"), true, wait_of(cmd));
+    if let Some(out) = setup_move(cmd, true) {
+        return out;
     }
     if is_search(cmd) {
         return merged(search_dry(cmd, c));
@@ -703,6 +704,10 @@ impl Dry<'_> {
         if let Some((_, age)) = self.c.lookup(u).filter(|_| !self.cmd.fresh()) {
             return format!("{what} cache hit, cache {} → {} · $0", outline::fmt_age(age), self.to(slot));
         }
+        // the run already fetching it is waited for (`id_of`), never a second one
+        if let Some(n) = running(self.c, u) {
+            return format!("{what} = u{n} (running) · waits up to {}s for it · $0", wait_of(self.cmd).as_secs());
+        }
         if provider::private_host(u) {
             self.refused += 1;
             return format!("{what} ! private_address → {}", fix("private_address", &At { url: u, ..At::default() }));
@@ -775,7 +780,7 @@ fn dry_mods(cmd: &Cmd, u: &str, tiers: &[(Tier, Option<Duration>)]) -> String {
 /// `fats j<N>`: a search's list, its failure (its `!` row and tried path, as when it ran) or `pending`; a search
 /// still running is waited for within `wait:`, as a page (`wait_for`), then the read lists the ids its run stored.
 fn job_read(cmd: &Cmd, c: &mut Cache, j: usize) -> Out {
-    poll_until(c.born, wait_of(cmd), || search_pending(c, j).is_none());
+    poll_until(c.born, wait_of(cmd), || search_pending(c, j).is_none(), || "search running".into());
     c.reload();
     let failed = c.serp(j).filter(|m| !m.ok).zip(c.job(j)).map(|(m, x)| search_out(c, &parse(&[x.cmd]), j, &m));
     let mut o = failed.map(merged).or_else(|| search_pending(c, j)).unwrap_or_else(|| job_view(c, j));
@@ -790,7 +795,7 @@ fn job_read(cmd: &Cmd, c: &mut Cache, j: usize) -> Out {
 fn nothing_to_do(cmd: &Cmd, u: usize) -> Out {
     let (b, list) = (bin(), WORDS.lists.iter().chain(&["media", "comments"]).find(|w| cmd.has(w)));
     let page = list.map(|w| format!("? {w} needs a page: {b} u{} {w}", u.max(1)));
-    Out::ask(page.unwrap_or(format!("? nothing to do · {b} <url> · {b} u1#2 · {b} u1 <words>")))
+    Out::ask(&page.unwrap_or(format!("? nothing to do · {b} <url> · {b} u1#2 · {b} u1 <words>")))
 }
 
 fn dispatch(cmd: &Cmd, c: &mut Cache) -> Out {
@@ -829,7 +834,7 @@ fn dispatch(cmd: &Cmd, c: &mut Cache) -> Out {
     let mut ids = cmd.ids.clone();
     if ids.is_empty() && (!cmd.links.is_empty() || cmd.has("more") || cmd.has("up")) {
         if cur.u == 0 {
-            return Out::ask(format!("? no current page · {b} <url> first"));
+            return Out::ask(&format!("? no current page · {b} <url> first"));
         }
         // a bare `more` goes on with a search list, else with the current page (`read`)
         if let Some((j, off)) = cur.serp.filter(|_| cmd.links.is_empty() && cmd.has("more")) {
@@ -848,6 +853,17 @@ fn dispatch(cmd: &Cmd, c: &mut Cache) -> Out {
     out
 }
 
+/// A `setup` / `config` command's move, run or `dry` (`dry:true`, `FATS_OFFLINE`: the check spends and saves
+/// nothing): a switch or a setting changed (`stats::change`), else `fats setup [zone:<name>] [import-env]`'s check
+/// (`import-env` copies the environment's keys in). None = neither.
+fn setup_move(cmd: &Cmd, dry: bool) -> Option<Out> {
+    let import = cmd.sub == ["import-env"];
+    if !cmd.sub.is_empty() && cmd.get("zone").is_none() && !import {
+        return Some(stats::change(cmd));
+    }
+    cmd.has("setup").then(|| stats::setup(cmd.get("zone"), import, dry, wait_of(cmd)))
+}
+
 /// The commands that read no page: status (also `fats` alone), version, stats, config, account, setup, telemetry,
 /// help (the card), guide (`lang::GUIDE`);
 /// `routes` (gone) a `?`, `install` a `!` with the install page.
@@ -861,13 +877,13 @@ fn command(cmd: &Cmd, c: &mut Cache) -> Option<Out> {
         _ if cmd.has("stats") => stats::stats(c, cmd, json_of(cmd)),
         _ if cmd.has("telemetry") => crate::telemetry::show(),
         _ if cmd.has("setup") && cmd.sub == ["telemetry"] => Out::new(crate::telemetry::row()),
-        _ if !cmd.sub.is_empty() && cmd.get("zone").is_none() => stats::change(cmd),
+        _ if let Some(out) = crate::setup::piped(cmd) => out,
+        _ if let Some(out) = setup_move(cmd, settings::get().offline.value) => out,
         _ if cmd.has("config") => stats::config(),
         _ if cmd.has("account") => stats::account(c, cmd.flag("fresh"), wait_of(cmd)),
-        _ if cmd.has("setup") => stats::setup(cmd.get("zone"), settings::get().offline.value, wait_of(cmd)),
         // gone with the learned start: a `?`, never a paid web search
         _ if cmd.has("routes") => {
-            Out::ask(format!("? routes: gone (no learned starts) · a page's route: {b} <url> dry:true · {b} config"))
+            Out::ask(&format!("? routes: gone (no learned starts) · a page's route: {b} <url> dry:true · {b} config"))
         }
         _ if cmd.has("help") => Out::new(CARD.lines().map(String::from).chain([to_guide()]).collect()),
         _ if cmd.has("guide") => Out::new(GUIDE.lines().map(String::from).collect()),
@@ -1009,7 +1025,7 @@ fn fetch_again(cmd: &Cmd, c: &mut Cache, id: &Id) -> Out {
     match l.meta.url.strip_prefix("file://") {
         Some(f) => merged(local(c, f, cmd)),
         None if l.meta.url == "stdin:" => {
-            Out::ask(format!("? {} came from stdin · pipe it again: … | {} -", l.pid, bin()))
+            Out::ask(&format!("? {} came from stdin · pipe it again: … | {} -", l.pid, bin()))
         }
         None if l.meta.url.is_empty() => no_doc(&l.pid, &l.eq, &l.meta, &[], &NoDoc::Missing, None), // forgotten
         None => refetch(c, cmd, &l.meta.url, &format!("{} fresh", l.pid)),
@@ -1029,7 +1045,7 @@ fn open_link(cmd: &Cmd, c: &mut Cache, id: &Id, li: usize) -> Out {
         None => {
             let n = doc.links.len();
             let have = if n == 0 { "no links".into() } else { format!("have l1-l{n}") };
-            Out::ask(format!("? l{li} unknown on {} · {have} · {} {} links", l.pid, bin(), l.pid))
+            Out::ask(&format!("? l{li} unknown on {} · {have} · {} {} links", l.pid, bin(), l.pid))
         }
     }
 }
@@ -1083,12 +1099,12 @@ fn merged(r: Result<Out, Out>) -> Out {
 
 /// A URL whose own host is loopback, private or link-local: refused before any tier sees it.
 fn private(url: &str) -> Out {
-    let what = format!("{} · loopback, private and link-local hosts are not fetched · 0ms spent $0", short(url, 60));
+    let what = format!("{} · loopback, private and link-local hosts are not fetched · 0ms", short(url, 60));
     refused("private_address", &short(url, 60), &what, &At { url, ..At::default() })
 }
 
 fn offline(what: &str) -> Out {
-    let detail = format!("{what} · not cached · FATS_OFFLINE is on: cache and local files only · 0ms spent $0");
+    let detail = format!("{what} · not cached · FATS_OFFLINE is on: cache and local files only · 0ms");
     refused("offline", what, &detail, &At::default())
 }
 
@@ -1122,10 +1138,10 @@ fn unknown(c: &Cache, id: &Id) -> Out {
     let last = Some(c.job_count()).filter(|&n| n > 0).map(|n| format!("last job j{n}"));
     let Some((st, _)) = ids_of(c, id.job) else {
         let last = last.unwrap_or("no jobs yet".into());
-        return Out::ask(format!("? j{} unknown · {last} · {b} <url>", id.job.unwrap_or_default()));
+        return Out::ask(&format!("? j{} unknown · {last} · {b} <url>", id.job.unwrap_or_default()));
     };
     let have = if st.u.is_empty() { "none".into() } else { format!("u1-u{}", st.u.len()) };
-    Out::ask(format!("? {} unknown · have {have} · {}", id.page(), last.unwrap_or(format!("{b} <url>"))))
+    Out::ask(&format!("? {} unknown · have {have} · {}", id.page(), last.unwrap_or(format!("{b} <url>"))))
 }
 
 struct Loaded {
@@ -1223,7 +1239,7 @@ fn page_cmd(c: &mut Cache, id: &Id, new: bool, f: impl FnOnce(&Page) -> Result<S
     let p = Page { id: pid, eq, doc: &doc, meta: &meta, age, at: (read, render, again, fixed, others) };
     let (mut lines, cursor) = match f(&p) {
         Ok(s) => s,
-        Err(q) => return Some(Out::ask(q)),
+        Err(q) => return Some(Out::ask(&q)),
     };
     // every read's `=` line: a stored page's age, then the page's flags as the last group (`outline::flags`)
     if let Some(l) = lines.first_mut().filter(|l| l.starts_with("= ")) {
@@ -1283,6 +1299,7 @@ fn record(o: &mut Out, p: &Page, path: &str, new: bool) {
         .set("url", p.doc.final_url.clone())
         .set("provider", m.provider.clone())
         .set("cost", if new { m.cost } else { 0.0 })
+        .set("upto", if new { m.upto() } else { 0.0 })
         .set("bytes_in", if new { m.bytes } else { 0 })
         .set("cache", !new)
         .set("age", (now() - m.t).max(0.0) as u64)
@@ -1316,7 +1333,8 @@ pub(crate) fn no_doc(id: &str, eq: &str, m: &Meta, others: &[Meta], why: &NoDoc,
         NoDoc::Parse(e) => ("parse_failed", format!("· {url} · {e}"), url.clone()),
         NoDoc::Missing if !m.ok => {
             let code = if m.code.is_empty() || m.code == "ok" { "fetch_failed" } else { &m.code };
-            let what = format!("· {} · tried {} · {}ms spent ${:.4}", host_of(&m.url), m.tried(), m.ms, m.cost);
+            let spent = provider::spent(" ", m.cost, m.upto());
+            let what = format!("· {} · tried {} · {}ms{spent}", host_of(&m.url), m.tried(), m.ms);
             // A newer copy that served is the move (`copies`), no count beside it
             let (detail, again, fix, named) = fetch::fail_row(m, others, &url, id, served.is_some());
             (owners, next) = (named, Some(served.map(|s| format!("{} {s}", bin())).or(fix).unwrap_or_default()));
@@ -1355,11 +1373,11 @@ fn fetch_all(cmd: &Cmd, c: &mut Cache) -> Out {
             continue;
         }
         let now = at_once(c, want(u), cmd).map(Err);
-        let id = now.unwrap_or_else(|| reserve(c, Entry::default(), want(u), cmd).map(Ok).map_err(cache_write));
-        if let Ok(Ok(n)) = id {
+        let id = now.unwrap_or_else(|| id_of(c, want(u), cmd).map(Ok));
+        if let Ok(Ok((n, true))) = id {
             queued.push((n, want(u)));
         }
-        started.push(Some(id));
+        started.push(Some(id.map(|r| r.map(|(n, _)| n))));
     }
     // a cache that takes no run file fails every input alike
     if let Err(e) = launch(c, &queued, cmd) {
@@ -1383,16 +1401,18 @@ fn fetch_all(cmd: &Cmd, c: &mut Cache) -> Out {
     }
     // the counts are the rows below: a `pending` row is no page in context yet (not `3 ok` over 2 pending)
     let pending = parts.iter().filter(|p| p.rec.contains_key("pending")).count();
-    let ok = parts.iter().filter(|p| p.rc == 0).count() - pending;
+    // a page is ok without an `error`: a capped one exits 0 and still counts as `! budget_hit`
+    let failed = |p: &&Out| p.rc != 0 || p.rec.contains_key("error");
+    let ok = parts.iter().filter(|p| !failed(p)).count() - pending;
     let mut fails = indexmap::IndexMap::<&str, usize>::new(); // first-seen order
-    let errs =
-        parts.iter().filter(|p| p.rc != 0).map(|p| p.rec.get("error").and_then(|v| v.as_str()).unwrap_or("failed"));
+    let errs = parts.iter().filter(failed).map(|p| p.rec.get("error").and_then(|v| v.as_str()).unwrap_or("failed"));
     errs.for_each(|e| *fails.entry(e).or_default() += 1);
     let pend = if pending > 0 { format!(" · {pending} pending") } else { String::new() };
     let fails: String = pend + &fails.iter().map(|(e, n)| format!(" · {n} ! {e}")).collect::<String>();
-    let cost = parts.iter().filter_map(|p| p.rec.get("cost").and_then(|v| v.as_f64())).fold(0.0, |a, b| a + b);
+    let sum = |k: &str| parts.iter().filter_map(|p| p.rec.get(k).and_then(|v| v.as_f64())).fold(0.0, |a, b| a + b);
     let (job, ms) = (c.job.map(|j| format!("j{j} ")).unwrap_or_default(), t0.elapsed().as_millis());
-    let mut all = Out::new(vec![format!("= {job}{} inputs · {ok} ok{fails} · {ms}ms spent ${cost:.4}", parts.len())]);
+    let spent = provider::spent(" ", sum("cost"), sum("upto"));
+    let mut all = Out::new(vec![format!("= {job}{} inputs · {ok} ok{fails} · {ms}ms{spent}", parts.len())]);
     all.rc = if ok + pending > 0 { 0 } else { parts.iter().map(|p| p.rc).max().unwrap_or(1) };
     all.lines.extend(parts.iter().flat_map(|p| p.lines.iter().cloned()));
     all.set("id", c.job.map(|j| format!("j{j}")));
@@ -1422,10 +1442,24 @@ struct Want<'a> {
 /// explains what was tried.
 fn fetch(c: &mut Cache, want: Want, cmd: &Cmd) -> Result<Out, Out> {
     let new = |c: &mut Cache| {
-        let n = reserve(c, Entry::default(), want, cmd).map_err(cache_write)?;
-        launch(c, &[(n, want)], cmd).map_err(cache_write).and_then(|()| finish(c, n, want, cmd))
+        let (n, start) = id_of(c, want, cmd)?;
+        if start {
+            launch(c, &[(n, want)], cmd).map_err(cache_write)?;
+        }
+        finish(c, n, want, cmd)
     };
     at_once(c, want, cmd).map_or_else(|| new(c), Ok)
+}
+
+/// The id a URL's fetch waits for (`finish`): the live run already fetching it in this session, else a new one
+/// reserved (`true`: to launch). One fetch per URL in flight, and the same ask again = `fats uN` on that run: its
+/// page the moment it lands within `wait:` (a re-ask that answered `pending` at once cost a weak model 6.3 calls
+/// where the id form cost 2.0).
+fn id_of(c: &mut Cache, want: Want, cmd: &Cmd) -> Result<(usize, bool), Out> {
+    if let Some(n) = running(c, want.url) {
+        return Ok((n, false));
+    }
+    reserve(c, Entry::default(), want, cmd).map(|n| (n, true)).map_err(cache_write)
 }
 
 /// Reserve `want`'s id now (a search result's own `slot`) as `entry` (its url and job set here), so it prints
@@ -1435,10 +1469,10 @@ fn reserve(c: &mut Cache, entry: Entry, want: Want, cmd: &Cmd) -> Result<usize, 
     c.alloc(vec![Entry { url: want.url.into(), job: Some(job), ..entry }], want.slot)
 }
 
-/// A URL's answer that needs no network: the cache, its run already going, a private host, offline.
+/// A URL's answer that needs no network and no wait: the cache, a private host, offline.
 fn at_once(c: &mut Cache, want: Want, cmd: &Cmd) -> Option<Out> {
     let url = want.url;
-    let out = cached(c, url, want, cmd).or_else(|| running(c, url, &cmd.words));
+    let out = cached(c, url, want, cmd);
     let out = out.or_else(|| provider::private_host(url).then(|| private(url)));
     out.or_else(|| settings::get().offline.value.then(|| offline(&short(url, 60))))
 }
@@ -1455,8 +1489,9 @@ fn finish(c: &mut Cache, n: usize, want: Want, cmd: &Cmd) -> Result<Out, Out> {
     let mut out = outlined(c, n, true, want.prov);
     out.warn(done.warn);
     if !done.ok && out.rc == 0 {
-        // the best copy is shown, but the fetch failed: scripts and agents see it in rc and `error`
-        out.rc = 1;
+        // the best copy is shown, but the fetch failed: scripts and agents see it in `error`, and in rc unless the
+        // command's own cap stopped it (`budget_hit`: it ran as asked, its row carries the paid move)
+        out.rc = i32::from(done.code != "budget_hit");
         out.set("error", done.code);
     }
     Ok(out)
@@ -1547,13 +1582,38 @@ fn hold_lane(c: &Cache, n: usize) {
 /// until `wait` after the COMMAND started (`Cache::born`), never `wait` per input: three walled URLs waited
 /// 3 × 30 s, past an MCP host's 60 s call limit. None = no such run, still running, or abandoned.
 fn wait_for(c: &Cache, n: usize, wait: Duration) -> Option<Done> {
-    poll_until(c.born, wait, || c.run(n).is_none_or(|(r, alive)| r.done.is_some() || !alive));
+    let doing = || c.run(n).map(|r| on_now(&r.0.status)).unwrap_or_default();
+    poll_until(c.born, wait, || c.run(n).is_none_or(|(r, alive)| r.done.is_some() || !alive), doing);
     c.run(n)?.0.done
 }
 
+/// The tiers a run's status says are running, `bd, oxyjs running` (`plain:blocked_403✗ · bd running · oxyjs
+/// running`); `starting` before its first call (an empty status), `next tier` between two tiers (a tier ended,
+/// the next not yet called: `plain:blocked_403✗ · oxy:thin✗`).
+fn on_now(status: &str) -> String {
+    let on: Vec<&str> = status.split(" · ").filter_map(|t| t.strip_suffix(" running")).collect();
+    if status.is_empty() {
+        return "starting".into();
+    }
+    if on.is_empty() { "next tier".into() } else { format!("{} running", on.join(", ")) }
+}
+
+/// How often a wait says it still works: the still-working line (`poll_until`), the MCP progress (`mcp::ticking`).
+pub const TICK: Duration = Duration::from_secs(5);
+
 /// Sleep until `done` says so or `wait` after the command started (`born`): every wait of a command is one deadline.
-fn poll_until(born: Instant, wait: Duration, done: impl Fn() -> bool) {
+/// A human at a terminal sees it work: at 5 s and every 5 s, `~ still working · bd, oxyjs running · 10 s` (`doing`)
+/// on stderr, and only when stderr is a terminal and not `fats mcp`: a pipe (an agent's shell) gets no byte, as the
+/// agent reads stderr only after the call, merged with its answer.
+fn poll_until(born: Instant, wait: Duration, done: impl Fn() -> bool, doing: impl Fn() -> String) {
+    let human = std::io::IsTerminal::is_terminal(&std::io::stderr()) && FENCE.get().is_none();
+    let mut said = 0;
     while !done() && born.elapsed() < wait {
+        let s = born.elapsed().as_secs() / TICK.as_secs() * TICK.as_secs();
+        if human && s > said {
+            said = s;
+            eprintln!("~ still working · {} · {s} s", doing());
+        }
         std::thread::sleep(POLL);
     }
 }
@@ -1602,9 +1662,11 @@ fn waiting(row: String, id: String) -> Out {
     Out::new(vec![row]).with("id", id).with("pending", true)
 }
 
-/// The live run already fetching `url` in this session, as its `pending` answer: one fetch per URL in flight.
-fn running(c: &Cache, url: &str, words: &[String]) -> Option<Out> {
-    c.runs().into_iter().filter(|r| r.1.url == url).find_map(|r| pending(c, r.0, words).filter(|o| o.rc == 0))
+/// The live run already fetching `url` in this session (not ended, its lock held): its id. A search's prefetch is
+/// none: plain only, its failure would answer an ask that walks the whole ladder (`fats uN` walks it after one).
+fn running(c: &Cache, url: &str) -> Option<usize> {
+    let live = |r: &(usize, Detached, bool)| r.1.url == url && r.1.done.is_none() && r.2 && !is_prefetch(&r.1);
+    c.runs().into_iter().find(live).map(|r| r.0)
 }
 
 /// `fats --continue j5.u3`: the detached half of a fetch. Runs the router for the run `fetch` reserved and stores
@@ -1803,6 +1865,15 @@ mod tests {
         parse(&s.split(' ').map(String::from).collect::<Vec<_>>())
     }
 
+    /// The still-working line names the tiers a run's status has running, an `oxy running` never inside `oxyjs`;
+    /// `starting` only before the first call, never between tiers.
+    #[test]
+    fn the_still_working_line_names_the_running_tiers() {
+        assert_eq!(on_now("plain:blocked_403✗ · bd running · oxyjs running"), "bd, oxyjs running");
+        assert_eq!(on_now("plain:blocked_403✗ · oxy:thin✗"), "next tier");
+        assert_eq!(on_now(""), "starting");
+    }
+
     /// A local page's URL holds the path a user types: no Windows verbatim prefix; other paths as they are.
     #[test]
     fn a_path_is_shown_as_typed() {
@@ -1973,9 +2044,8 @@ mod tests {
     fn search_results_become_ids() {
         let (cache, _root, _, _, out) = listed_session("ids");
         let b = bin();
-        // the list cap is 300 real tokens (`clean::tok`): four of the five snippet rows, then `more`
-        let first =
-            "= j1 search \"heidelberg university\" · 5 results · 4 shown u2-u5 · oxylabs · 1.6s · spent $0.0010";
+        // every row within the read cap, 1000 real tokens (`clean::tok`): all five, no `more`
+        let first = "= j1 search \"heidelberg university\" · 5 results · oxylabs · 1.6s · spent $0.0010";
         assert_eq!(out.lines[0], first);
         assert_eq!(
             out.lines[1],
@@ -1984,9 +2054,9 @@ mod tests {
         );
         let wiki = "u4  en.wikipedia.org/wiki/Heidelberg_Univer…  Heidelberg University - Wikipedia";
         assert!(out.lines[3].starts_with(wiki));
-        let last = format!("open one: {b} u2 · filter: {b} u2 <words> · more: {b} more");
+        let last = format!("open one: {b} u2 · filter: {b} u2 <words>");
         assert_eq!(out.lines.last().map(String::as_str), Some(&*last));
-        assert_eq!((out.lines.len(), out.parts.len(), out.rc), (6, 5, 0));
+        assert_eq!((out.lines.len(), out.parts.len(), out.rc), (7, 5, 0));
         assert_eq!(out.parts[0].rec["url"], "https://www.uni-heidelberg.de/en");
         assert_eq!((out.parts[0].rec["cost"].as_f64(), out.parts[1].rec["cost"].as_f64()), (Some(0.001), Some(0.0)));
         let unfetched = |n| cache.st.result(n).filter(|e| e.dir.is_empty()).cloned();

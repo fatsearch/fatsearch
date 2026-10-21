@@ -113,7 +113,7 @@ with more than one, it routes between them. Each key goes only to its own provid
 to fatsearch.com, never a URL, search, key or id: `fats telemetry show` prints them, `fats setup → Settings → Telemetry` or
 `fats setup telemetry off` stops them ([docs/telemetry.md](telemetry.md)).
 
-| Provider | Sign up | Key | Variables |
+| Provider | Sign up | Key | Variable `import-env` reads |
 |---|---|---|---|
 | Oxylabs | https://dashboard.oxylabs.io/en/registration | a Web API instance's key in the dashboard | `OXYLABS_WEB_API_KEY` |
 | Bright Data | https://brightdata.com/cp/start | https://brightdata.com/cp/setting/users | `BRIGHTDATA_API_KEY` + `BRIGHTDATA_UNLOCKER_ZONE` (a Web Unlocker zone) |
@@ -122,28 +122,33 @@ to fatsearch.com, never a URL, search, key or id: `fats telemetry show` prints t
 Three ways to give `fats` a key:
 
 - **At a terminal:** `fats setup` opens a menu (↑↓ Enter): the providers, then Settings (agent connection, cache,
-  stats, telemetry). Pick a provider, paste its key (hidden); it is
+  stats, telemetry). Pick a provider, paste its key (shown as `•` and a count); it is
   checked live and saved.
 - **Through an agent, or with no terminal:** `fats setup oxy` (or `bd`, `decodo`, `gh`) prints the dashboard
   link and a one-time form on `127.0.0.1`, open for 10 minutes. Open it in a browser on the same machine, paste
   the key, press Save. The key never goes through the chat.
-- **Environment:** set the variables above. They win over a saved key; nothing else is read (no `./.env`, no
-  other tool's files).
+- **No browser (CI, SSH):** pipe the key in: `printf %s "$KEY" | fats setup oxy` (or `bd`, `decodo`, `gh`) reads
+  one line, checks it ($0) and saves it. Never type it as an argument: `fats setup oxy <key>` is refused (shell
+  history, `ps`). Keys already exported: run `fats setup import-env` once: each key is
+  checked ($0) and copied into `auth.json` where none is saved; a different saved key stays (replace it with
+  `fats setup oxy`). `fats` never sends a key from the environment, and reads nothing else (no `./.env`, no other
+  tool's files): the key you saved is the key every call uses.
 
-Saved keys go to `auth.json` in the key dir (mode 600, dir 700); `fats setup` alone checks every key live
-(Oxylabs lists its scrapers and Bright Data its zones, both $0; Decodo gets a test call to a host that does not
-exist) and never prints one. The Bright
+Saved keys go to `auth.json` in the key dir (mode 600, dir 700); a replaced key leaves the old file as
+`auth.json.bak` (mode 600). `fats setup` alone checks every saved key live (Oxylabs lists its scrapers and Bright
+Data its zones, both $0; Decodo gets a test call to a host that does not exist), writes nothing, and never prints
+a key: `fats` shows its last 4 characters (`keys oxy …6XBR · … · auth.json`). The Bright
 Data form saves the account's only Web Unlocker zone with the key; with several it says `key saved · ✗ no zone
 yet` and names them, and the zone is picked with `fats setup bd zone:<name>`. Keys saved by 0.1 (`oxylabs.key`, `brightdata.key`,
 `brightdata.zone`) move into `auth.json` and `settings.json` by themselves. `fats setup oxy off` turns a
-provider off and keeps its key. Saved keys are the simplest way to give keys to every MCP host: hosts differ in
-which environment variables they pass to a server.
+provider off and keeps its key. Saved keys reach every MCP host the same way: no host needs to pass a variable to
+the server.
 
 ## 5. Verify
 
 ```console
 $ fats https://example.com
-= j1.u1 Example Domain · example.com · 1 sections · 0 photos · 142tok · plain 53ms spent $0.0000
+= j1.u1 Example Domain · example.com · 1 sections · 0 photos · 133tok · plain 56ms
 [u1#1] # part 1
 This domain is for use in documentation examples without needing permission. …
 (whole page shown) · filter: fats u1 <words> · links: fats u1 links
@@ -151,8 +156,8 @@ This domain is for use in documentation examples without needing permission. …
 
 The first line starts with `=`; ids, timing and token counts vary. `fats` alone prints the status:
 session, cache path, keys, provider health, and `mcp: ready · fats mcp = stdio server, one tool fats(cmd)`.
-Its keys row reads `keys none → fats setup · network on` before setup and like
-`keys oxy:auth.json bd:auth.json decodo:none · bd zone <zone> · network on` after (`env`, `auth.json`, `none`).
+Its keys row reads `keys none → fats setup` before setup and like
+`keys oxy …6XBR · bd …k2Qf zone <zone> · decodo none · gh none · auth.json` after (each key's last 4 characters).
 
 Check the MCP server without any host (prints two JSON lines: `initialize` and `tools/list`):
 
@@ -189,14 +194,12 @@ claude mcp add --scope project fats -- fats mcp   # writes .mcp.json in the proj
 ```
 
 Scopes: `local` and `user` live in `~/.claude.json`; `project` lives in `.mcp.json`. Everything after `--`
-is the server command. To pass a key, put `--env` before the name with another option between them:
-`claude mcp add --transport stdio --env OXYLABS_WEB_API_KEY="$OXYLABS_WEB_API_KEY" fats -- fats mcp`.
+is the server command. Keys need no `--env`: the server reads them from `auth.json` (`fats setup`).
 
-`.mcp.json` (an entry without `type` is stdio; `${VAR}` expands from the environment):
+`.mcp.json` (an entry without `type` is stdio):
 
 ```json
-{ "mcpServers": { "fats": { "command": "fats", "args": ["mcp"],
-  "env": { "OXYLABS_WEB_API_KEY": "${OXYLABS_WEB_API_KEY}" } } } }
+{ "mcpServers": { "fats": { "command": "fats", "args": ["mcp"] } } }
 ```
 
 Check: `claude mcp get fats` or `claude mcp list` (`✔ Connected`); inside a session, `/mcp`.
@@ -229,8 +232,6 @@ One-click `.mcpb` bundles exist as a format; `fats` does not ship one yet.
 [mcp_servers.fats]
 command = "fats"
 args = ["mcp"]
-# optional: forward keys from Codex's environment
-env_vars = ["OXYLABS_WEB_API_KEY", "BRIGHTDATA_API_KEY", "BRIGHTDATA_UNLOCKER_ZONE", "DECODO_AUTH_TOKEN"]
 ```
 
 Check: `codex mcp list`, or `/mcp` in the `codex` TUI. Default `tool_timeout_sec` is 60, above `fats`' default 30 s `wait:`.
@@ -241,11 +242,10 @@ Check: `codex mcp list`, or `/mcp` in the `codex` TUI. Default `tool_timeout_sec
 `~/.cursor/mcp.json` (every project) or `.cursor/mcp.json` (this project):
 
 ```json
-{ "mcpServers": { "fats": { "command": "fats", "args": ["mcp"],
-  "env": { "OXYLABS_WEB_API_KEY": "${env:OXYLABS_WEB_API_KEY}" } } } }
+{ "mcpServers": { "fats": { "command": "fats", "args": ["mcp"] } } }
 ```
 
-Stdio servers also take `"envFile": "<path>"`. Check the server in Cursor's MCP settings list.
+Check the server in Cursor's MCP settings list.
 <!-- source: https://cursor.com/docs/context/mcp (2026-10-16) -->
 
 ### VS Code (Copilot)
@@ -283,9 +283,8 @@ Settings → AI → MCP Servers → Add Server → Add Local Server, or edit the
 
 `gemini mcp add --scope user fats fats mcp` writes `~/.gemini/settings.json` (default scope `project`:
 `.gemini/settings.json`) with `{ "mcpServers": { "fats": { "command": "fats", "args": ["mcp"] } } }`.
-Gemini CLI strips inherited variables whose names contain `KEY`, `TOKEN` and similar, so
-`OXYLABS_WEB_API_KEY` does not reach the server unless set in `env` (`"OXYLABS_WEB_API_KEY": "$OXYLABS_WEB_API_KEY"`).
-Saved keys (`fats setup`) avoid this. Check: `/mcp`.
+Gemini CLI strips inherited variables whose names contain `KEY`, `TOKEN` and similar; `fats` reads its keys from
+`auth.json` (`fats setup`), so none needs to reach the server. Check: `/mcp`.
 <!-- source: https://geminicli.com/docs/tools/mcp-server/ (2026-10-16) -->
 
 ### ChatGPT and other OpenAI apps: not supported yet
@@ -335,8 +334,10 @@ Remove the host entry too: `claude mcp remove fats` (add `--scope user|project` 
 | a CMake error about `ASM_NASM` (Windows) ❓ | NASM missing | install NASM, put it on `PATH` |
 | `fats: command not found` | `~/.cargo/bin` not on `PATH` | `. "$HOME/.cargo/env"`, or use the absolute path |
 | host: server failed to start / `ENOENT` | GUI app without your shell `PATH` | absolute path from `command -v fats` |
-| `keys none → fats setup` (status), or `! no_key oxy · would try … · set OXYLABS_WEB_API_KEY → fats setup oxy` | no key; the page needs a provider | any provider's key (section 4); plain pages still work |
-| `! bad_key replace OXYLABS_WEB_API_KEY → fats setup` | key rejected | new key from the dashboard, `fats setup` again |
+| `keys none → fats setup` (status), or `! no_key oxy · would try … → fats setup oxy` | no key saved; the page needs a provider | any provider's key (section 4); plain pages still work |
+| `! no_key oxy · env OXYLABS_WEB_API_KEY …SEDm not imported → fats setup import-env` | a key exported, never sent, none saved | `fats setup import-env` (copies it in) |
+| `env OXYLABS_WEB_API_KEY …SEDm ≠ saved …6XBR · not used · replace: fats setup oxy` | the exported key is not the saved one | nothing, or `fats setup oxy` to replace the saved one |
+| `! bad_key replace the saved key → fats setup` | key rejected | new key from the dashboard (`fats setup oxy`), `fats setup` again |
 | `! no_zone … unblocker zones: a, b → fats setup bd zone:a` or `! bad_zone bd <zone> → fats setup` | no zone picked, or an unknown one | `fats setup bd zone:<name>`; no zone yet: create a Web Unlocker zone in the Bright Data panel |
 | `! key_mode auth.json is 644, readable by others → chmod 600 <path>` | key file too open | run the printed `chmod` |
 | `! offline` | `FATS_OFFLINE` is set | unset it |
@@ -360,9 +361,10 @@ starts with `= fats `, continue at step 5.
    Check: `command -v fats` prints a path; `fats --version` starts with `= fats `.
 5. Plain fetch: `fats https://example.com`
    Check: the first line starts with `= ` and contains `Example Domain`.
-6. Keys, only if a key is already in the environment: `fats setup`
-   Check: `fats | grep '^keys'` shows `oxy:env`, `bd:env` or `decodo:env`. No key: skip; report that plain
-   pages work, and that `fats setup oxy` (or `bd`, `decodo`) gives the user a local form for one.
+6. Keys: `fats setup` checks the saved ones ($0, writes nothing). A key only in the environment is not used: ask
+   the user to run `fats setup import-env` themselves (it copies them in, never over a saved key).
+   Check: `fats | grep '^keys'` shows `oxy …XXXX auth.json` (its last 4 chars), `bd …` or `decodo …`. No key:
+   skip; report that plain pages work, and that `fats setup oxy` (or `bd`, `decodo`) gives the user a local form.
 7. MCP server: run the `printf … | fats mcp` block from section 5.
    Check: the output contains `"name":"fats"` in the `tools/list` reply.
 8. Register with the host in use (section 6), using the absolute path.

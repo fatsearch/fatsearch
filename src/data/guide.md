@@ -14,7 +14,7 @@ Reference: github.com/fatsearch/fatsearch docs/reference.md.
    Bad title = bad URL, not a fats failure.
 5. ! row = next move + worst price. Paste whole, exactly: `! js_shell → fats u1 js:true · bd, then oxyjs ≤$0.0030 ≈25s`
    (card only) / og = preview card only.
-6. pending ≠ failed: `fats u3 wait:30`, free. Never fresh:true (new paid fetch).
+6. pending ≠ failed: `fats u3 wait:30`, free.
 7. Don't dump. full = last resort: to a file, then grep. Never into chat.
 8. Comparing readers? Drill first (cards, full), same char cap both sides. Never outline vs whole page.
 
@@ -42,9 +42,9 @@ fats telemetry show # anonymous usage stats (no URL, search, key), as sent
 fats setup telemetry off  # stop them
 ```
 
-Mods: dry:true plan + worst price, $0 · js:true force render · fresh:true refetch, paid, new id · wait:90 longer
-before pending · timeout:150 · max:1k cap output · cost:0 free plain only · country:de ·
-provider:plain|bd|oxy|decodo · json:true.
+Mods: dry:true plan + worst price, $0 · js:true force render · fresh:true refetch, paid, new id · wait:30 s
+before pending · timeout:150 · max:1k cap output · country:de · provider:plain|bd|oxy|decodo ·
+json:true.
 
 ## The = line
 
@@ -64,13 +64,14 @@ provider:plain|bd|oxy|decodo · json:true.
 
 ## Keys
 
-Plain pages: none. JS, captchas, walls: user's own key, any one: OXYLABS_WEB_API_KEY · BRIGHTDATA_API_KEY +
-BRIGHTDATA_UNLOCKER_ZONE · DECODO_AUTH_TOKEN (pages only, no web search). Never ask for a key fats sees
-(`fats | grep '^keys'`). **Never ask for a key in the chat.**
+Plain pages: none. JS, captchas, walls: user's own key, any one: Oxylabs · Bright Data · Decodo (pages only,
+no web search). Keys live in auth.json only; `fats | grep '^keys'` shows each one's last 4 chars.
+**Never ask for a key in the chat.**
 
-- `fats setup` = check every key, $0.
+- `fats setup` = check every key, $0, writes nothing.
 - `fats setup oxy` (or bd, decodo, gh): dashboard link + local form URL. **Give the human that URL**, end your
-  turn, `fats setup` when they say done. No browser (SSH)? Key goes in agent's env; the line names the variable.
+  turn, `fats setup` when they say done. No browser (SSH)? They pipe it there: `printf %s "$KEY" | fats setup
+  oxy`, never as an argument.
 - `fats setup oxy off` / on: provider off / on; key kept.
 - `fats setup free off` = no free plain fetch (user's IP, paced 1 start/site/s). Say the cost first: every page
   paid, $0.0010–0.0015 a call (dry:true = page's worst).

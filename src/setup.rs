@@ -1,11 +1,13 @@
 //! `fats setup` past the piped check rows (`stats::setup`): way 1, a person at a terminal, walks the provider list,
 //! a key page per provider and the agent connection (a menu that exits); way 2, an agent, starts a one-shot local
-//! key form for its user (`fats setup oxy`). Screen words are data (`src/data/screens/`, `lang::screen`), the form
-//! is `src/data/setup-form.html`.
+//! key form for its user (`fats setup oxy`); way 3, a pipe (`printf %s "$KEY" | fats setup oxy`). Also every rule
+//! about a key on its way in or out: its shape on a command line (refused there, masked in `?` rows), the status
+//! line's tails and the environment's rows, the Bright Data zone pick. Screen words are data (`src/data/screens/`,
+//! `lang::screen`), the form is `src/data/setup-form.html`.
 
 use crate::cache::{Cache, jload, jsave, now};
 use crate::clean::esc;
-use crate::lang::{Out, bin, draw};
+use crate::lang::{Cmd, NO_HOLES, Out, bin, draw, paint};
 use crate::provider::{KEYS, Links, PROVIDERS, links};
 use crate::settings::{self, SWITCHES};
 use crate::telemetry::Level;
@@ -48,6 +50,9 @@ pub fn step(at: usize, n: usize, k: &[u8]) -> (usize, Option<char>) {
 /// restored on drop; no `stty` (Windows) = no menu, the key form instead (way 2). `.1` = scripted keys (tests).
 struct Term(Option<String>, std::collections::VecDeque<&'static [u8]>);
 
+/// A menu's screen lines for its marked row.
+type Text<'a> = &'a dyn Fn(usize) -> Vec<String>;
+
 fn stty(args: &[&str]) -> Option<String> {
     let o = Command::new("stty").args(args).stdin(Stdio::inherit()).stderr(Stdio::null()).output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -63,30 +68,34 @@ impl Term {
     }
 
     /// Every screen whole, same frame: head, rule, the 4-row card, one message line, the screen's rows, keys; one
-    /// empty line between blocks, so an empty message or block leaves no gap of its own.
+    /// empty line between blocks, so an empty message or block leaves no gap of its own. In colour (`hue`, `paint`).
     fn draw(&self, text: &[String], msg: &str, rows: &[String], keys: &str) {
         let (rule, head) = (format!(" {}", "─".repeat(76)), page("done").lines().nth(7).unwrap_or_default());
         let (card, own) = text.split_at(7.min(text.len()));
-        let (top, msg) = (format!("\n fats setup    {}\n{rule}\n{head}\n", marks()), format!("\n   {msg}\n"));
-        let end = [String::new()].into_iter().chain(rows.iter().cloned()).chain([format!("\n{rule}\n {keys}")]);
-        let l = [&[top][..], card.get(1..).unwrap_or_default(), &[msg], own, &end.collect::<Vec<_>>()].concat();
+        let top = format!("\n {{bold}}fats setup{{/}}    {}\n{rule}\n{head}\n", marks());
+        let end = [&[String::new()][..], rows, &[format!("\n{rule}\n {{dim}}{keys}{{/}}")]].concat();
+        let l = [&[top][..], card.get(1..).unwrap_or_default(), &[format!("\n   {msg}\n")], own, &end].concat();
         let mut lines: Vec<&str> = l.iter().flat_map(|s| s.split('\n')).collect();
         lines.dedup_by(|a, b| a.trim().is_empty() && b.trim().is_empty());
-        print!("\x1b[H\x1b[2J{}", lines.join("\r\n"));
+        let frame = paint(&lines.iter().map(|l| hue(l)).collect::<Vec<_>>().join("\r\n"), &NO_HOLES);
+        #[cfg(test)]
+        tests::FRAMES.with_borrow_mut(|f| f.push(frame.clone()));
+        print!("\x1b[H\x1b[2J{frame}");
         std::io::stdout().flush().ok();
     }
 
     /// A numbered menu of `items` under the screen's own lines; `text(i)` follows the marked row; an item led by
-    /// `\n` has an empty line above it (a spacer the cursor never stops on). (row, end key).
-    fn menu(&mut self, text: &dyn Fn(usize) -> Vec<String>, msg: &str, items: &[String]) -> (usize, char) {
+    /// `\n` has an empty line above it (a spacer the cursor never stops on); `out` names what ← and q do. (row, end
+    /// key).
+    fn menu<S: AsRef<str>>(&mut self, text: Text, msg: &str, items: &[S], out: &str) -> (usize, char) {
         let mut at = 0;
         loop {
-            let row = |(j, l): (usize, &String)| {
-                let (gap, l) = l.strip_prefix('\n').map_or(("", l.as_str()), |l| ("\n", l));
+            let row = |(j, l): (usize, &S)| {
+                let (gap, l) = l.as_ref().strip_prefix('\n').map_or(("", l.as_ref()), |l| ("\n", l));
                 format!("{gap}   {} {}. {l}", [" ", "▸"][usize::from(j == at)], j + 1)
             };
             let rows: Vec<String> = items.iter().enumerate().map(row).collect();
-            self.draw(&text(at), msg, &rows, "↑↓ move · Enter choose (or its number) · ← back · q quit");
+            self.draw(&text(at), msg, &rows, &format!("↑↓ move · Enter choose (or its number) · {out}"));
             match step(at, items.len(), &self.key()) {
                 (i, Some(k)) => return (i, k),
                 (i, None) => at = i,
@@ -94,16 +103,41 @@ impl Term {
         }
     }
 
-    /// The key, pasted or typed unseen (line mode, echo stays off: as `sudo` asks); None = an empty line (back).
+    /// The key, pasted or typed in raw mode, a byte a step: each redraws a mask and the count (`••••  36 chars`, at
+    /// most 60 glyphs, never a key byte), ⌫ takes one back, Enter ends it; the rest of that read and of the terminal's
+    /// input is then dropped (reads that wait 0.1 s, until one is empty), so a pasted `\r\n` never presses the next
+    /// screen's Enter. None = back: Esc, ^C, the terminal gone, Enter alone.
     fn secret(&mut self, text: &[String], msg: &str) -> Option<String> {
-        let ask = "   Paste the key (it stays hidden), then Enter · Enter alone = back".to_string();
-        self.draw(text, msg, &[ask], "paste · Enter check it");
-        let line = self.0.is_some() && stty(&["icanon", "icrnl"]).is_some();
-        let mut s = String::new();
-        std::io::stdin().read_line(&mut s).ok();
-        line.then(|| stty(&["-icanon", "-icrnl", "min", "1", "time", "0"]));
-        Some(s.trim().to_string()).filter(|s| !s.is_empty())
+        let (mut key, mut read) = (Vec::new(), std::collections::VecDeque::new());
+        let foot = "paste the key (it stays hidden) · Enter check it · Enter alone or Esc = back";
+        let key = loop {
+            let mask = format!("   {}  {} chars", "•".repeat(key.len().min(60)), key.len());
+            self.draw(text, msg, &[mask], foot);
+            if read.is_empty() {
+                read = self.key().into();
+            }
+            match read.pop_front() {
+                Some(b'\r' | b'\n') => break key,
+                Some(0x7f | 0x08) => _ = key.pop(),
+                Some(b) if b.is_ascii_graphic() => key.push(b),
+                Some(0x1b | 0x03 | 0x04) | None => break Vec::new(),
+                Some(_) => {}
+            }
+        };
+        if self.0.is_some() && stty(&["min", "0", "time", "1"]).is_some() {
+            while !self.key().is_empty() {}
+            stty(&["min", "1", "time", "0"]);
+        }
+        Some(String::from_utf8_lossy(&key).into_owned()).filter(|k| !k.is_empty())
     }
+}
+
+/// A frame line's colours (`lang::paint` styles, none under `NO_COLOR`): the marks ✓ green, ○ and – dim, ✗ red (a
+/// mark = the glyph and a space), the marked row (▸) bold.
+fn hue(line: &str) -> String {
+    let marks = [("✓ ", "{green}✓{/} "), ("○ ", "{dim}○{/} "), ("– ", "{dim}–{/} "), ("✗ ", "{red}✗{/} ")];
+    let l = marks.iter().fold(line.to_string(), |l, (m, c)| l.replace(m, c));
+    if line.contains('▸') { format!("{{bold}}{}{{/}}", l.replace("{/}", "{/}{bold}")) } else { l }
 }
 
 impl Drop for Term {
@@ -123,6 +157,7 @@ fn page(name: &str) -> &'static str {
 fn text(p: &str) -> Vec<String> {
     let file = if page(p).is_empty() { "provider" } else { p }; // a provider has no screen of its own
     let status = if p == "cache" { cache_words(&settings::get().cache.value).1 } else { state(p).1 };
+    let status = if links(p).is_some() && settings::key(p).is_none() { "no key".into() } else { status }; // list: rank
     fill(page(file), links(p), &[("status", &status)]).lines().map(String::from).collect()
 }
 
@@ -143,7 +178,7 @@ fn marks() -> String {
 /// A row's mark (✓ used, – off, ○ not set) and its status words.
 fn state(p: &str) -> (&'static str, String) {
     let zone = settings::zone().filter(|_| p == "bd").map(|z| format!(" · zone {z}")).unwrap_or_default();
-    match (p, settings::on(p), settings::key(p).map(|k| k.1)) {
+    match (p, settings::on(p), settings::key(p)) {
         ("mcp", ..) => ("✓", "ready · built in · nothing to install".into()),
         ("done", ..) => (" ", "close setup".into()),
         ("back", ..) => (" ", String::new()),
@@ -154,17 +189,14 @@ fn state(p: &str) -> (&'static str, String) {
             (" ", format!("this session: {pages} pages · {spent} → {} stats", bin()))
         }
         ("telemetry", ..) => {
-            let t = crate::telemetry::level();
+            let (t, what) = (crate::telemetry::level(), "anonymous usage stats, to fix and improve fats");
             let word = LEVELS.iter().find(|l| l.0 == t).map_or("", |l| l.2);
-            (
-                ["–", "✓"][usize::from(t != Level::Off)],
-                format!("{word} · anonymous usage stats, to fix and improve fats"),
-            )
+            (["–", "✓"][usize::from(t != Level::Off)], format!("{word} · {what}"))
         }
         ("free", true, _) => ("✓", "ready · no account · no key · $0 · uses your home IP".into()),
         ("free", ..) => ("–", "off · every page goes through a paid provider".into()),
         (_, false, Some(_)) => ("–", "off · not used · key kept".into()),
-        (_, _, Some(at)) => ("✓", format!("ready · key {}{zone}", if at == "env" { "from env" } else { "saved" })),
+        (_, _, Some(k)) => ("✓", format!("ready · key {} saved{zone}", crate::stats::tail(&k))),
         _ => ("○", links(p).map_or("", |l| l.rank).into()),
     }
 }
@@ -192,121 +224,136 @@ fn row_path(dir: &Path, home: Option<&Path>) -> String {
 }
 
 /// THE key check: the free read `fats setup` makes for the provider (`provider::check_key`, $0; gh: none, saved
-/// unchecked). Ok = what it shows and Bright Data's zones; Err = why not.
-fn check(l: &Links, key: &str) -> Result<(String, Vec<String>), String> {
+/// unchecked), for the menu, the form and the pipe (`cli::piped`). Ok = what it shows and Bright Data's zones;
+/// Err = (code, why not).
+pub fn check(l: &Links, key: &str) -> Result<(String, Vec<String>), (&'static str, String)> {
     if key.len() < 8 {
-        return Err("too short for a key: copy the whole key".into());
+        return Err(("bad_key", "too short for a key: copy the whole key".into()));
     }
-    let Some(t) = KEYS.into_iter().find(|t| t.spec().short == l.short) else { return Ok(("saved".into(), vec![])) };
+    let Some(t) = KEYS.into_iter().find(|t| t.spec().short == l.short) else { return Ok(("unchecked".into(), vec![])) };
     let read = crate::provider::check_key(t, key.to_string());
-    let got =
-        crate::provider::all_within(vec![read], Duration::from_secs(20)).pop().flatten().ok_or("no answer in 20 s")?;
-    let (what, zones) = got.map_err(|f| format!("{} said no: {} {}", l.name, f.code, f.why).trim_end().to_string())?;
+    let got = crate::provider::all_within(vec![read], Duration::from_secs(20)).pop().flatten();
+    let got = got.ok_or(("provider_timeout", "no answer in 20 s".to_string()))?;
+    let said =
+        |f: crate::provider::Fail| (f.code, format!("{} said no: {} {}", l.name, f.code, f.why).trim_end().into());
+    let (what, zones) = got.map_err(said)?;
     if l.short == "bd" && zones.is_empty() {
-        return Err(format!("no_zone · no Web Unlocker zone yet: make one at {}", l.mint));
+        return Err(("no_zone", format!("no_zone · no Web Unlocker zone yet: make one at {}", l.mint)));
     }
     Ok((if zones.is_empty() { what } else { format!("zones {}", zones.join(", ")) }, zones))
 }
 
 /// The gh CLI's token (`gh auth token`) for `fats setup gh` while no gh key is set: copied into `auth.json` at
-/// setup, never read at fetch time.
+/// setup, never read at fetch time; never in a unit test (no developer credential, as `settings::env`).
 fn gh(l: &Links) -> Option<String> {
-    (l.short == "gh" && settings::key("gh").is_none()).then_some(())?;
+    (l.short == "gh" && settings::key("gh").is_none() && !cfg!(test)).then_some(())?;
     let o = Command::new("gh").args(["auth", "token"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     Some(String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|t| o.status.success() && !t.is_empty())
 }
 
-/// The provider list until q or Done (Settings below it, `SETTINGS`): the done line.
+/// The main list: the free fetch, the providers in rank order, Settings (`SETTINGS`), Done.
+fn rows() -> Vec<&'static str> {
+    ["free"].into_iter().chain(PROVIDERS.links.iter().map(|l| l.short)).chain(["settings", "done"]).collect()
+}
+
+/// The main list until q or Done: the done line.
 fn walk(t: &mut Term, only: Option<&'static str>) -> String {
-    let list: Vec<&str> =
-        ["free"].into_iter().chain(PROVIDERS.links.iter().map(|l| l.short)).chain(["settings", "done"]).collect();
-    let first = only.map_or(Some(String::new()), |p| open(t, p)); // None = quit
-    list_loop(t, &list, first, page("intro").trim_end());
+    // `only`'s screen first: q there (None) quits; the marks are read after the walk (what it changed)
+    let quit = only.is_some_and(|p| open(t, p).is_none());
+    if !quit {
+        list_loop(t, &rows(), page("intro").trim_end());
+    }
     format!("= setup done · {} · try: {} example.com", marks(), bin())
 }
 
-/// A list's loop, the marked row's card above it: Enter opens a row (`open`) and comes back with its note; the last
-/// row (Done, ← Back), Esc or ← leave the list (Some: back to the list above), q quits (None). `intro` = the
-/// message while no row left a note.
-fn list_loop(t: &mut Term, list: &[&'static str], first: Option<String>, intro: &str) -> Option<String> {
+/// A list's loop, the marked row's card above it, `intro` its message: Enter opens a row (`open`) and comes back;
+/// the last row (Done, ← Back), Esc or ← leave the list (Some: back to the list above), q quits (None).
+fn list_loop(t: &mut Term, list: &[&'static str], intro: &str) -> Option<()> {
     let gap = |p: &str| if matches!(p, "settings" | "done" | "back") { "\n" } else { "" };
-    let mut note = first;
     loop {
-        let n = note?;
-        let row = |p: &&str| format!("{}{} {:18} {}", gap(p), state(p).0, text(p)[0], state(p).1).trim_end().into();
-        let items: Vec<String> = list.iter().map(row).collect();
-        let msg = if n.is_empty() { intro } else { &n };
-        let card = |i: usize| text(list.get(i).copied().unwrap_or("done")).into_iter().take(7).collect();
-        note = match t.menu(&card, msg, &items) {
-            (i, '\r') if i + 1 < list.len() => open(t, list.get(i).copied().unwrap_or_default()),
-            (_, 'q') => return None,
-            _ => return Some(String::new()),
+        // one `state` a row, the title from its page or provider (`text` works the card's Status out again)
+        let row = |p: &&str| {
+            let ((mark, words), title) =
+                (state(p), links(p).map_or(page(p).lines().next().unwrap_or_default(), |l| l.name));
+            format!("{}{mark} {title:18} {words}", gap(p)).trim_end().into()
         };
+        let items: Vec<String> = list.iter().map(row).collect();
+        let card = |i: usize| text(list.get(i).copied().unwrap_or("done")).into_iter().take(7).collect();
+        // the main list has no list above it: ← quits, as q
+        let out = if list.last() == Some(&"done") { "← or q quit" } else { "← back · q quit" };
+        match t.menu(&card, intro, &items, out) {
+            (i, '\r') if i + 1 < list.len() => open(t, list.get(i).copied().unwrap_or_default())?,
+            (_, 'q') => return None,
+            _ => return Some(()),
+        }
     }
 }
 
 /// A row picked: Settings its list, Cache and Stats nothing (they only show), the others their screen.
-fn open(t: &mut Term, p: &'static str) -> Option<String> {
+fn open(t: &mut Term, p: &'static str) -> Option<()> {
     match p {
-        "settings" => list_loop(t, &SETTINGS, Some(String::new()), ""),
-        "cache" | "stats" => Some(String::new()),
+        "settings" => list_loop(t, &SETTINGS, ""),
+        "cache" | "stats" => Some(()),
         _ => screen(t, p),
     }
 }
 
-/// One row's screen; None = quit, else the note the list shows.
-fn screen(t: &mut Term, p: &'static str) -> Option<String> {
+/// A row's screen buttons that work now: a switch (Turn on/off, Remove this key = off) that THE switch rule
+/// (`settings::switched`) refuses is not shown, so no button answers "can't".
+fn buttons(p: &str) -> Vec<&'static str> {
+    let turn = ["Turn on", "Turn off"][usize::from(settings::on(p))];
+    let all: Vec<&str> = match (p, settings::key(p).is_some()) {
+        ("free", _) => vec![turn, "← Back"],
+        ("mcp", _) => vec!["← Back"],
+        ("telemetry", _) => LEVELS.iter().map(|l| l.1).chain(["← Back"]).collect(),
+        (_, true) => vec!["Paste a new key", turn, "Remove this key", "← Back"],
+        _ => vec!["Add a key", "← Back"],
+    };
+    let switch = |b: &&str| matches!(*b, "Turn on" | "Turn off" | "Remove this key");
+    all.into_iter().filter(|b| !switch(b) || settings::switched(p, *b == "Turn on").is_ok()).collect()
+}
+
+/// One row's screen until Back (Some) or q (None); every button's answer is its message.
+fn screen(t: &mut Term, p: &'static str) -> Option<()> {
     let mut msg = String::new();
     loop {
-        let (text, keyed, on) = (text(p), settings::key(p).is_some(), settings::on(p));
-        let turn = ["Turn on", "Turn off"][usize::from(on)];
-        let items: Vec<&str> = match (p, keyed) {
-            ("free", _) => vec![turn, "← Back"],
-            ("mcp", _) => vec!["← Back"],
-            ("telemetry", _) => LEVELS.iter().map(|l| l.1).chain(["← Back"]).collect(),
-            (_, true) => vec!["Paste a new key", turn, "Remove this key", "← Back"],
-            _ => vec!["Add a key", "← Back"],
-        };
-        let (at, end) = t.menu(&|_| text.clone(), &msg, &items.iter().map(|i| i.to_string()).collect::<Vec<_>>());
-        msg = match (end, items.get(at).copied().unwrap_or_default(), links(p)) {
+        let (text, on, items) = (text(p), settings::on(p), buttons(p));
+        let (at, end) = t.menu(&|_| text.clone(), &msg, &items, "← back · q quit");
+        let done = match (end, items.get(at).copied().unwrap_or_default(), links(p)) {
             ('q', ..) => return None,
-            ('\r', "Add a key" | "Paste a new key", Some(l)) => match paste(t, l) {
-                Ok(note) => return Some(note),
-                Err(m) => m,
-            },
-            // removed = off, so `set_on`'s rule refuses removing the last key that fetches
+            // saved or not, the screen stays: its rows and Status show the key at once
+            ('\r', "Add a key" | "Paste a new key", Some(l)) => Ok(paste(t, l).unwrap_or_else(|m| m)),
+            // removed = off, so THE switch rule refuses removing the last key that fetches
             ('\r', "Remove this key", _) => (settings::set_on(p, false).and_then(|()| settings::remove_key(p)))
                 .and_then(|()| settings::set_on(p, true))
-                .map_or_else(|e| format!("✗ Can't: {e}"), |()| "○ key removed".into()),
-            ('\r', l, _) if let Some((level, _, word)) = LEVELS.iter().find(|o| o.1 == l) => settings::set(
-                "telemetry",
-                level.name(),
-            )
-            .map_or_else(|e| format!("✗ Can't: {e}"), |()| format!("✓ telemetry {word} · from the next command")),
-            ('\r', "Turn on" | "Turn off", _) => {
-                settings::set_on(p, !on).map_or_else(|e| format!("✗ Can't: {e}"), |()| format!("✓ {}", state(p).1))
+                .map(|()| bak_row().map_or("○ key removed".into(), |b| format!("○ key removed · {b}"))),
+            ('\r', l, _) if let Some((level, _, word)) = LEVELS.iter().find(|o| o.1 == l) => {
+                settings::set("telemetry", level.name()).map(|()| format!("✓ telemetry {word} · from the next command"))
             }
-            _ => return Some(String::new()),
+            ('\r', "Turn on" | "Turn off", _) => settings::set_on(p, !on).map(|()| format!("✓ {}", state(p).1)),
+            _ => return Some(()),
         };
+        msg = done.unwrap_or_else(|e| format!("✗ Can't: {e}"));
     }
 }
 
 /// Paste the key (gh: the gh CLI's first, `gh`), check it ($0), pick Bright Data's zone when it has more than one
-/// (saved: fats never switches it), save. Ok = the list's note; Err = the provider screen's message.
+/// (saved: fats never switches it), save. Ok = the screen's message for the saved key; Err = why none was saved.
 fn paste(t: &mut Term, l: &'static Links) -> Result<String, String> {
     let open = format!("Open {} (no account yet: {})", l.mint, l.signup);
     let key = gh(l).map_or_else(|| t.secret(&text(l.short), &open).ok_or_else(String::new), Ok)?;
     t.draw(&text(l.short), &format!("… checking the key with {} ($0)", l.name), &[], "checking…");
-    let (what, zones) = check(l, &key).map_err(|why| format!("✗ {why} · not saved"))?;
+    let (what, zones) = check(l, &key).map_err(|(_, why)| format!("✗ {why} · not saved"))?;
     let pick = "✓ The key works. Pick the Web Unlocker zone fats should use:";
-    let zone = match (zones.len() > 1).then(|| t.menu(&|_| text(l.short), pick, &zones)) {
+    let zone = match (zones.len() > 1).then(|| t.menu(&|_| text(l.short), pick, &zones, "← back · q quit")) {
         Some((i, '\r')) => zones.get(i),
         Some(_) => return Err(String::new()),
         None => zones.first(),
     };
     let what = zone.map_or(what, |z| format!("zone {z}"));
     let saved = settings::save_key(l.short, &key, zone.map(String::as_str));
-    saved.map(|()| format!("✓ {} works · {what}", l.name)).map_err(|e| format!("✗ not saved: {e}"))
+    let tail = crate::stats::tail(&key);
+    saved.map(|()| format!("✓ {} works · {what} · key saved {tail}", l.name)).map_err(|e| format!("✗ not saved: {e}"))
 }
 
 /// Way 1 (`main`): `fats setup [provider]` with a terminal on both ends and `stty`, `provider`'s screen first; None
@@ -331,7 +378,10 @@ pub fn agent(p: &str, dry: bool) -> Out {
     let said = match links(p) {
         None if !settings::on("free") => format!("= setup free · {}", free_off().1),
         None => format!("= setup free · built in, no key to set · $0 · off: {} setup free off", bin()),
-        Some(_) if dry => format!("= dry setup {p} · would start a one-shot key form on 127.0.0.1 · $0"),
+        // offline: the form's check could not run, so none starts (as a plain `fats setup` is dry)
+        Some(_) if dry || settings::get().offline.value => {
+            format!("= dry setup {p} · would start a one-shot key form on 127.0.0.1 · $0")
+        }
         Some(l) if gh(l).is_some_and(|k| settings::save_key(p, &k, None).is_ok()) => {
             "= setup gh · copied the token of gh auth token into auth.json · $0".into()
         }
@@ -345,6 +395,160 @@ pub fn agent(p: &str, dry: bool) -> Out {
 pub fn free_off() -> (&'static str, String) {
     let state = "free off (turned off)";
     (state, format!("{state} → {} setup free on", bin()))
+}
+
+/// THE key shape on a command line: `line` with each key-shaped run of a word (`provider:<key>`, `"<key>"`) as its
+/// tail, `…6XBR`. A run is key-shaped at `key_chars` (limits.json) chars or more of `[A-Za-z0-9_+/=-]` (Decodo's
+/// token is base64) holding a letter and a digit; a word with `://` or a dot, or led by a `words.json`
+/// `path_lead` (`/`, `./`, `~`): a URL, a host, a path, a file, is left whole, and so is the binary's name (a test
+/// build's is long). A line holds a key when its masked copy differs (`key_in_argv`).
+pub fn masked(line: &str) -> String {
+    let key_char = |c: char| c.is_ascii_alphanumeric() || "_+/=-".contains(c);
+    let shaped = |r: &&str| {
+        let mixed = r.bytes().any(|c| c.is_ascii_digit()) && r.bytes().any(|c| c.is_ascii_alphabetic());
+        mixed && r.len() >= settings::limit::<usize>("key_chars") && *r != bin()
+    };
+    let word = |w: &str| {
+        let lead = crate::lang::WORDS.path_lead.iter().any(|l| w.starts_with(l));
+        if lead || w.contains("://") || w.contains('.') {
+            return w.to_string();
+        }
+        w.split(|c: char| !key_char(c)).filter(shaped).fold(w.to_string(), |w, r| w.replace(r, &crate::stats::tail(r)))
+    };
+    line.split(' ').map(word).collect::<Vec<_>>().join(" ")
+}
+
+/// The status line's keys, each by its tail, Bright Data's zone and the one file (≤ 100 cols): `keys oxy …6XBR · bd
+/// …k2Qf zone fatsrc · decodo none · gh none · auth.json`, then ` · network off` under `FATS_OFFLINE`; no key at all
+/// = the setup move; ` · bak` last while `auth.json.bak` holds an old key (`bak_row`).
+pub fn keys_line() -> String {
+    let names = || settings::SWITCHES.into_iter().filter(|p| *p != "free");
+    let off = if settings::get().offline.value { " · network off" } else { "" };
+    let net = format!("{off}{}", if bak().is_some() { " · bak" } else { "" });
+    if names().all(|p| settings::key(p).is_none()) {
+        return format!("keys none → {} setup{net}", bin());
+    }
+    let named = |p: &str| match (p, crate::stats::key(p)) {
+        ("bd", k) if k.starts_with('…') => format!("bd {k} zone {}", settings::zone().unwrap_or("none")),
+        (p, k) => format!("{p} {k}"),
+    };
+    let keys = names().map(named).collect::<Vec<_>>().join(" · ");
+    format!("keys {keys} · {}{net}", settings::AUTH)
+}
+
+/// The old `auth.json` a replaced or removed key leaves (`settings::save_to`), while it is there.
+pub fn bak() -> Option<PathBuf> {
+    let f = settings::key_file(&format!("{}.bak", settings::AUTH));
+    f.is_file().then_some(f)
+}
+
+/// Where a removed or switched-off key's old copy still is, and the move that deletes it (`rm`, the path quoted for
+/// a shell): `old key kept in auth.json.bak (0600) · delete it: rm '<path>'`. None = no backup.
+pub fn bak_row() -> Option<String> {
+    let path = bak()?.display().to_string().replace('\'', r"'\''");
+    Some(format!("old key kept in {}.bak (0600) · delete it: rm '{path}'", settings::AUTH))
+}
+
+/// The key the environment holds for `p` that fats does not use (`settings::env_key`, never sent), by tail (`fats`,
+/// `fats setup`): beside a different saved key, replaced only by a person; where none is saved it IS that
+/// provider's `no_key` row (`fats setup` drops its plain one), what `import-env` copies in.
+pub fn env_row(p: &str) -> Option<String> {
+    let ((var, env), b) = (settings::env_key(p)?, bin());
+    let env = crate::stats::tail(&env);
+    Some(match settings::key(p) {
+        Some(k) => format!("env {var} {env} ≠ saved {} · not used · replace: {b} setup {p}", crate::stats::tail(&k)),
+        None => format!("! no_key {p} · env {var} {env} not imported → {b} setup import-env"),
+    })
+}
+
+/// `env_row` for every provider: the status rows.
+pub fn env_rows() -> Vec<String> {
+    SWITCHES.into_iter().filter_map(env_row).collect()
+}
+
+/// THE argv key rule: a key-shaped word on a command line led by `setup` or a word people type for it (`login`,
+/// `keys`, `auth`: `words.json` `aliases`) is refused, never read, saved, echoed or searched (argv lands in shell
+/// history and `ps`; `fats login <key>` would be a search sending it to a provider); the key's ways in are the
+/// paste and the pipe. On any other command such a word is a word as typed (a sha, a part number).
+pub fn key_in_argv(cmd: &Cmd, argv: &[String]) -> Option<Out> {
+    // the first word, mods aside: read off `raw`, since a `?` for a later word, or a key making `login <key>` a
+    // search, leaves `reserved` empty
+    let lead = cmd.raw.split(' ').find(|t| !t.contains(':')).unwrap_or_default();
+    let alias = crate::lang::WORDS.aliases.iter().any(|a| a.1 == "setup" && a.0.eq_ignore_ascii_case(lead));
+    if !(alias || lead.eq_ignore_ascii_case("setup")) || argv.iter().all(|a| masked(a) == *a) {
+        return None;
+    }
+    let (b, p) = (bin(), cmd.raw.split(' ').find_map(links).map_or("oxy", |l| l.short));
+    let ways = format!("paste: {b} setup {p} · pipe: printf %s \"$KEY\" | {b} setup {p}");
+    let row = format!("! key_in_argv · never on the command line (shell history, ps) · {ways}");
+    Some(Out::fail("key_in_argv", "= ! key_in_argv setup · nothing read, nothing saved · $0".into(), row))
+}
+
+/// `fats setup <p>` fed a key on stdin (`printf %s "$KEY" | fats setup oxy`: SSH, CI, no browser): ONE line, its
+/// trailing CR/LF stripped, the menu's check ($0, `setup::check`), saved when it passes (a replaced key →
+/// `auth.json.bak`; the same key again replaces none); one line, rc 1 when nothing was saved (`FATS_OFFLINE`: no
+/// check). None = no provider named, stdin a terminal or `fats mcp`'s protocol, or no byte within 2 s (an agent's
+/// shell: `/dev/null`, a pipe never written): the key form.
+pub fn piped(cmd: &Cmd) -> Option<Out> {
+    let l = cmd.sub.first().and_then(|p| links(p)).filter(|_| cmd.has("setup") && cmd.sub.len() == 1)?;
+    if cmd.flag("dry") || std::io::IsTerminal::is_terminal(&std::io::stdin()) || crate::cli::FENCE.get().is_some() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = Vec::new();
+        std::io::BufRead::read_until(&mut std::io::stdin().lock().take(16 << 10), b'\n', &mut line).ok();
+        tx.send(line).ok();
+    });
+    let line = rx.recv_timeout(Duration::from_secs(2)).ok().filter(|l| !l.is_empty())?;
+    let key = String::from_utf8_lossy(&line).trim_end_matches(['\r', '\n']).to_string();
+    let (p, b) = (l.short, bin());
+    let not_saved = |code: &'static str, why: &str| {
+        let row = format!("= ! {code} setup {p} · {why} · not saved → printf %s \"$KEY\" | {b} setup {p}");
+        Some(Out { rc: 1, ..Out::new(vec![row]).with("error", code) })
+    };
+    if settings::get().offline.value {
+        return not_saved("offline", "FATS_OFFLINE is on: no check (unset FATS_OFFLINE)");
+    }
+    // the old key goes to `auth.json.bak` only when the new one differs (`settings::save_to`)
+    let replaced = settings::key(p).is_some_and(|k| k != key.trim());
+    let kept = if replaced { " · the old key in auth.json.bak" } else { "" };
+    let (what, zones) = match check(l, &key) {
+        Ok(got) => got,
+        Err((code, why)) => return not_saved(code, &why),
+    };
+    let zone = if p == "bd" { pick_zone(&zones, None).ok() } else { None };
+    if let Err(e) = settings::save_key(p, &key, zone.as_deref()) {
+        return not_saved("cache_write", &e);
+    }
+    let pick = if p == "bd" && zone.is_none() {
+        format!(" · no zone yet → {b} setup bd zone:<name>")
+    } else {
+        String::new()
+    };
+    let what = match zone {
+        Some(z) => format!("zone {z}"),
+        None => what,
+    };
+    let tail = crate::stats::tail(&key);
+    Some(Out::new(vec![format!("= setup {p} ok {what} · key {tail} saved auth.json (600){kept} · $0{pick}")]))
+}
+
+/// Bright Data's Web Unlocker zone from its zone names: `zone:`, else the configured one, else the only one.
+/// Err = the `! no_zone` row naming the account's unblocker zones.
+pub fn pick_zone(names: &[String], arg: Option<&str>) -> Result<String, String> {
+    let want = arg.or(settings::zone()).map(String::from);
+    match (want, names) {
+        (Some(w), _) if names.contains(&w) => Ok(w),
+        (None, [one]) => Ok(one.clone()),
+        (want, _) => {
+            let what = want.map_or("pick one".into(), |w| format!("{w} is not a Web Unlocker zone here"));
+            let list = if names.is_empty() { "none (add one in the control panel)".into() } else { names.join(", ") };
+            let arg = names.first().map_or("<name>", String::as_str);
+            let at = crate::lang::At { id: "setup", arg, ..Default::default() };
+            Err(crate::lang::bang("bd", "no_zone", &format!("{what} · unblocker zones: {list}"), &at))
+        }
+    }
 }
 
 /// A key form's run file `<session>/run/setup-<p>.<ext>`: `json` = token, port, deadline (the cache root is its
@@ -373,7 +577,7 @@ fn waiting_at(c: &Cache, p: &str) -> Option<String> {
 fn form(l: &'static Links) -> Out {
     let (c, p) = (Cache::open(), l.short);
     let fill = |url: &str| {
-        let page = fill(page("agent"), Some(l), &[("url", url), ("env", settings::env_of(p))]);
+        let page = fill(page("agent"), Some(l), &[("url", url)]);
         Out::new(page.lines().map(String::from).collect()).with("cost", 0.0)
     };
     if let Some(url) = waiting_at(&c, p) {
@@ -444,30 +648,13 @@ fn answer(mut s: &TcpStream, f: &Form, l: &'static Links) -> bool {
 fn post(l: &'static Links, body: &[u8], save: &str) -> (&'static str, String, bool) {
     let key =
         url::form_urlencoded::parse(body).find(|(n, _)| n == "key").map_or(String::new(), |(_, v)| v.trim().into());
-    let saved = check(l, &key).and_then(|(what, zones)| {
+    let saved = check(l, &key).map_err(|e| e.1).and_then(|(what, zones)| {
         let (page, zone) = landed(l, &what, &zones);
         settings::save_key(l.short, &key, zone.as_deref()).map(|()| page)
     });
     match saved.map_err(|e| format!("<p class=bad>! {} · try again</p>", esc(&e))) {
         Ok(what) => ("200 OK", html(l, 3, &[("what", &what)]), true),
         Err(bad) => ("200 OK", html(l, 2, &[("save", save), ("err", &bad)]), false),
-    }
-}
-
-/// Bright Data's Web Unlocker zone from its zone names: `zone:`, else the configured one, else the only one.
-/// Err = the `! no_zone` row naming the account's unblocker zones.
-pub fn pick_zone(names: &[String], arg: Option<&str>) -> Result<String, String> {
-    let want = arg.or(settings::zone()).map(String::from);
-    match (want, names) {
-        (Some(w), _) if names.contains(&w) => Ok(w),
-        (None, [one]) => Ok(one.clone()),
-        (want, _) => {
-            let what = want.map_or("pick one".into(), |w| format!("{w} is not a Web Unlocker zone here"));
-            let list = if names.is_empty() { "none (add one in the control panel)".into() } else { names.join(", ") };
-            let arg = names.first().map_or("<name>", String::as_str);
-            let at = crate::lang::At { id: "setup", arg, ..Default::default() };
-            Err(crate::lang::bang("bd", "no_zone", &format!("{what} · unblocker zones: {list}"), &at))
-        }
     }
 }
 
@@ -499,6 +686,179 @@ fn part(n: usize) -> &'static str {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Every frame `Term::draw` painted on this thread, in order.
+        pub(super) static FRAMES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Key `i` of a number row (`1` … `9`): it picks row or button `i`.
+    fn digit(i: usize) -> &'static [u8] {
+        &b"123456789"[i..=i]
+    }
+    /// Esc as the terminal sends it: back one list.
+    const ESC: &[u8] = b"\x1b";
+
+    /// One scripted walk from the main list: every key read, the done line, no frame's message a refusal and
+    /// every menu row within 100 columns. The frames drawn, without colour.
+    fn walked(script: Vec<&'static [u8]>, what: &str) -> Vec<String> {
+        FRAMES.with_borrow_mut(Vec::clear);
+        let mut t = Term(None, script.into());
+        let done = walk(&mut t, None);
+        assert!(t.1.is_empty() && done.starts_with("= setup done · "), "{what}: keys left {:?} · {done}", t.1);
+        let frames = FRAMES.take();
+        let lines = || frames.iter().flat_map(|f| f.lines()).map(str::trim_end);
+        let refused = lines().find(|l| l.trim_start().starts_with("✗ Can't"));
+        assert!(refused.is_none(), "{what}: a shown button answered {refused:?}");
+        let row =
+            |l: &&str| l.trim_start_matches([' ', '▸']).split_once(". ").is_some_and(|(n, _)| n.parse::<u8>().is_ok());
+        let wide: Vec<&str> = lines().filter(row).filter(|l| l.chars().count() > 100).collect();
+        assert!(wide.is_empty(), "{what}: rows over 100 columns {wide:?}");
+        frames
+    }
+
+    /// Every button on every screen works, in a keyless install, with Oxylabs and Bright Data keys, and with only
+    /// an Oxylabs key and the free fetch off: from the main list (`rows`) and Settings (`SETTINGS`), every row by
+    /// its number, then every button its screen shows (`buttons`), each from the state's files in this thread's own
+    /// key dir (fake keys, no network: a key that needs a provider's check is pasted as an empty line = back), then
+    /// q to the done line (`walked`; ← Back is a button, Esc leaves Settings). A switch pressed twice shows its new
+    /// state at once and ends as it began; a key saved keeps its screen.
+    #[test]
+    fn every_button_on_every_screen_works() {
+        let keys = crate::scratch::Scratch::new("setup-buttons");
+        settings::tests::KEY_DIR.set(Some(keys.to_path_buf()));
+        crate::lang::tests::NO_COLOR.set(Some(true));
+        let states: [(&[&str], bool); 3] = [(&[], true), (&["oxy", "bd"], true), (&["oxy"], false)];
+        for (keyed, free) in states {
+            // the state's two files, written as they are read (`settings::Saved`)
+            let reset = || {
+                let keys_of = keyed.iter().map(|k| (k.to_string(), "fake-key-0123456789".to_string())).collect();
+                let off = if free { vec![] } else { vec!["free".to_string()] };
+                let files = [(settings::AUTH, keys_of, vec![]), (settings::PREFS, Default::default(), off)];
+                for (f, keys_of, off) in files {
+                    let saved = settings::Saved { version: 1, keys: keys_of, off, ..Default::default() };
+                    std::fs::write(keys.join(f), serde_json::to_vec(&saved).expect("json")).expect("write");
+                }
+            };
+            let mut at: Vec<(Vec<&'static [u8]>, &str)> = Vec::new();
+            for (i, p) in rows().into_iter().enumerate() {
+                at.push((vec![digit(i)], p));
+                let inner = SETTINGS.into_iter().enumerate().map(|(j, s)| (vec![digit(i), digit(j)], s));
+                at.extend(inner.filter(|_| p == "settings"));
+            }
+            for (to, p) in at {
+                reset();
+                let what = format!("{keyed:?} free {free} · {p}");
+                // a row with a screen: each of its buttons; else the row alone (Settings left by Esc, a row that only
+                // shows stays, Done and Back leave the list)
+                let out: &[&[u8]] = match p {
+                    "done" => &[],
+                    "settings" => &[ESC, b"q"],
+                    "back" | "cache" | "stats" => &[b"q"],
+                    _ => {
+                        buttons(p).into_iter().enumerate().for_each(|(k, b)| press(&reset, &to, p, k, b, &what));
+                        continue;
+                    }
+                };
+                walked([&to[..], out].concat(), &what);
+            }
+        }
+        settings::tests::KEY_DIR.set(None);
+        crate::lang::tests::NO_COLOR.set(None);
+    }
+
+    /// Button `b`, the `k`-th on screen `p` reached by `to`, pressed from the state `reset` makes, and what it did
+    /// checked.
+    fn press(reset: &dyn Fn(), to: &[&'static [u8]], p: &str, k: usize, b: &str, what: &str) {
+        reset();
+        let what = &format!("{what} · {b}");
+        let (on, no_check) = (settings::on(p), !crate::provider::KEYS.into_iter().any(|t| t.spec().short == p));
+        // a paste arrives as one read, its line end too (`\r\n`): the `\n` must not press the next screen's Enter
+        let pasted: &[u8] = if no_check { b"fake-gh-token-0123\r\n" } else { b"\r\n" };
+        let then: &[&[u8]] = match b {
+            "Add a key" | "Paste a new key" => &[pasted, b"q"],
+            "Turn on" | "Turn off" => &[digit(k), b"q"], // pressed again
+            _ => &[b"q"],
+        };
+        let frames = walked([to, &[digit(k)], then].concat(), what);
+        let keyless = links(p).is_some() && settings::key(p).is_none() && b == "Add a key";
+        assert!(!keyless || frames.iter().any(|f| f.contains("│ Status  no key")), "{what}: Status no key");
+        let level = LEVELS.iter().find(|l| l.1 == b).map(|l| serde_json::Value::from(l.0.name()));
+        match b {
+            "Turn on" | "Turn off" => {
+                let flip = format!("{}. {}", k + 1, ["Turn off", "Turn on"][usize::from(b == "Turn off")]);
+                let shown = frames.iter().find(|f| f.contains(&flip));
+                assert!(shown.is_some_and(|f| f.contains("│ Status  off") == on), "{what}: {flip} at once");
+                assert_eq!(settings::on(p), on, "{what}: pressed twice, as it began");
+            }
+            "Remove this key" => {
+                assert!(settings::key(p).is_none(), "{what}: the key is gone");
+                // the removed key's old copy and the move that deletes it, said on the screen it was removed from
+                let bak = "○ key removed · old key kept in auth.json.bak (0600) · delete it: rm '";
+                assert!(frames.iter().any(|f| f.contains(bak)), "{what}: the backup named");
+            }
+            "Add a key" | "Paste a new key" if no_check => pasted_frames(&frames, 18, what),
+            _ if level.is_some() => assert_eq!(settings::saved(settings::PREFS).set.get("telemetry"), level.as_ref()),
+            _ => {}
+        }
+    }
+
+    /// The frames of an `n`-byte key pasted with `\r\n` (`Term::secret`): one prompt (0 chars), then one frame a
+    /// byte with that many mask glyphs and the count, no key byte in any frame; then the check, then the provider's
+    /// screen with the key's tail saved (the `\n` pressed nothing: one prompt only).
+    fn pasted_frames(frames: &[String], n: usize, what: &str) {
+        let at = frames.iter().position(|f| f.contains("   0 chars")).unwrap_or(frames.len());
+        for (i, f) in frames.iter().skip(at).take(n + 1).enumerate() {
+            let mask = format!("\n   {}  {i} chars\r", "•".repeat(i));
+            assert!(f.contains(&mask), "{what}: byte {i} draws its mask: {f}");
+        }
+        assert!(!frames.iter().any(|f| f.contains("fake-gh") || f.contains("token-0")), "{what}: a key byte shown");
+        assert_eq!(frames.iter().filter(|f| f.contains("   0 chars")).count(), 1, "{what}: the \\n pressed Enter");
+        let (check, screen) = (frames.get(at + n + 1), frames.get(at + n + 2));
+        assert!(check.is_some_and(|f| f.contains("… checking the key with ")), "{what}: {check:?}");
+        let saved =
+            screen.is_some_and(|f| f.contains(" works · unchecked · key saved …0123") && f.contains(". Paste a"));
+        assert!(saved && settings::key("gh").as_deref() == Some("fake-gh-token-0123"), "{what}: {screen:?}");
+    }
+
+    /// A frame is in colour (`lang::paint` styles): the marks (✓ green), the marked row bold around them, the
+    /// headings bold; under `NO_COLOR` not one escape.
+    #[test]
+    fn a_frame_is_in_colour_unless_no_color() {
+        let t = Term(None, Default::default());
+        let frame = |plain| {
+            crate::lang::tests::NO_COLOR.set(Some(plain));
+            t.draw(&text("oxy"), "✓ Oxylabs Web API works", &["   ▸ 1. ✓ Free fetch".into()], "q quit");
+            FRAMES.with_borrow_mut(Vec::pop).unwrap_or_default()
+        };
+        let (colour, plain) = (frame(false), frame(true));
+        crate::lang::tests::NO_COLOR.set(None);
+        assert!(colour.contains("\x1b[32m✓\x1b[0m Oxylabs Web API works"), "{colour:?}");
+        assert!(colour.contains("\x1b[1m   ▸ 1. \x1b[32m✓\x1b[0m\x1b[1m Free fetch\x1b[0m"), "{colour:?}");
+        assert!(colour.contains("\x1b[1mHow it works\x1b[0m") && colour.contains("\x1b[2mq quit\x1b[0m"));
+        assert!(!plain.contains('\x1b') && plain.contains("   ▸ 1. ✓ Free fetch") && plain.contains("How it works"));
+    }
+
+    /// The key prompt on raw reads: ⌫ takes a byte back, a space or a control byte is no key byte, Enter ends it
+    /// (the rest of that read dropped), Esc, ^C, no bytes or Enter alone = back; a frame shows the count only.
+    #[test]
+    fn the_key_prompt_masks_and_edits() {
+        let key = |script: Vec<&'static [u8]>| {
+            FRAMES.with_borrow_mut(Vec::clear);
+            let mut t = Term(None, script.into());
+            (t.secret(&text("oxy"), ""), t.1.len(), FRAMES.take())
+        };
+        let (got, left, frames) = key(vec![b"ab\x7fc d\t", b"e\r\nq", b"z"]);
+        assert_eq!((got.as_deref(), left), (Some("acde"), 1), "the next read is the menu's");
+        assert_eq!(frames.len(), 9, "the prompt, then a frame a byte before Enter");
+        let shown: Vec<usize> = [0, 1, 2, 1, 2, 2, 3, 3, 4].into();
+        for (f, n) in frames.iter().zip(shown) {
+            assert!(f.contains(&format!("\n   {}  {n} chars\r", "•".repeat(n))) && !f.contains("acde"), "{f}");
+        }
+        for script in [vec![&b"abc\x1b"[..]], vec![b"abc\x03"], vec![b"abc"], vec![b"\r"]] {
+            assert_eq!(key(script).0, None, "back");
+        }
+    }
+
     /// The menu state machine on raw reads: moves wrap (both arrow encodings), a number jumps and picks, Enter or
     /// → picks, Esc/←/⌫ back, q, ^C or no bytes quit.
     #[test]
@@ -522,10 +882,15 @@ mod tests {
     fn a_scripted_walk_ends_with_the_done_line() {
         let script: [&[u8]; 10] =
             [b"\x1b[B", b"\r", b"\x1b", b"6", b"\r", b"\x1b", b"\x1b[D", b"\x1bOA", b"\x1bOA", b"q"];
+        FRAMES.with_borrow_mut(Vec::clear);
         let mut t = Term(None, script.into());
         let done = walk(&mut t, None);
         assert!(t.1.is_empty(), "every key read: {:?}", t.1);
         assert!(done.starts_with("= setup done · ✓ free ") && done.ends_with(" example.com"), "{done}");
+        // ← on the main list quits (no list above it), its footer says so; Settings' ← goes back
+        let frames = FRAMES.take();
+        assert!(frames.first().is_some_and(|f| f.contains("· ← or q quit")), "{:?}", frames.first());
+        assert!(frames.iter().any(|f| f.contains("Agent connection (MCP)") && f.contains("· ← back · q quit")));
         let mut t = Term(None, [&b"\x1b"[..], b"q"].into());
         assert!(walk(&mut t, Some("bd")).starts_with("= setup done") && t.1.is_empty(), "bd's screen, back, q");
     }
