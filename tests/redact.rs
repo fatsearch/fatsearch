@@ -2089,8 +2089,29 @@ fn no_address_verdict_no_paid_call() {
     assert!(!out.contains("dns_timeout"), "answered at 2 s, inside the 5 s wait: {out}");
 }
 
+/// A page's mod after its URL reads that page (`fats <url> links` = `fats u3 links`), with how it came on the
+/// `=` line; the same URL again is a read of the same id from the cache.
+#[test]
+fn a_mod_after_a_url_reads_that_page() {
+    let _l = lock();
+    let w = walled();
+    let url = format!("{w}/long-mod");
+    let out = run(&format!("{url} links fresh:true"));
+    let head = out.lines().next().unwrap_or_default();
+    let u = head.split(['.', ' ']).nth(2).unwrap_or_default().to_string();
+    assert!(head.contains(&format!(".{u} links 0")) && head.contains(" · plain "), "{out}");
+    let all = run(&format!("{url} all"));
+    assert!(all.lines().next().is_some_and(|l| l.contains(&format!(".{u} all ")) && l.contains(" · cache ")), "{all}");
+    let full = run(&format!("{url} full"));
+    assert!(full.contains("A free copy fetched before anyone asked.") && !full.contains(" · new u"), "{full}");
+    for m in ["comments", "media", "cards"] {
+        let out = run(&format!("{url} {m}"));
+        assert!(out.lines().next().is_some_and(|l| l.contains(&format!(".{u} ")) && !l.contains("search")), "{out}");
+    }
+}
+
 /// A batch's ids are the input order's, so `dry:true` names the ids the run fills: new URLs and a cache hit
-/// between them, two hosts, one URL twice.
+/// between them (the id the session holds: a hit is a read), two hosts, one URL twice.
 #[test]
 fn a_batch_dry_names_the_run_ids() {
     let _l = lock();
@@ -2098,12 +2119,16 @@ fn a_batch_dry_names_the_run_ids() {
     let cmd = "https://hx.ex.com/slowq/i1 https://hx.ex.com/slowq/cached https://hy.ex.com/slowq/i2 \
                https://hx.ex.com/slowq/i1 https://hx.ex.com/slowq/i3 provider:oxy wait:5";
     let dry = run(&format!("{cmd} dry:true"));
-    let named: Vec<&str> = dry.split(" → new ").skip(1).filter_map(|r| r.split(' ').next()).collect();
+    // each row's last arrow: `new u2` for a fetch, the held `u1` for a hit (`(same as above)` has none)
+    let last = |l: &str| Some(l.rsplit_once(" → ")?.1.trim_start_matches("new ").split(' ').next()?.to_string());
+    let named: Vec<String> = dry.lines().skip(1).filter_map(last).filter(|r| r.starts_with('u')).collect();
     let out = run(cmd);
     let rows = out.lines().skip(1).filter(|l| l.starts_with("= j"));
     let ids: Vec<&str> = rows.filter_map(|l| l.split(['.', ' ']).nth(2)).collect();
-    assert_eq!(named.len(), 4, "{dry}");
-    assert_eq!([named[0], named[1], named[2], named[0], named[3]].to_vec(), ids, "{dry}\n{out}");
+    let hit = format!("cached cache hit, cache 0s → {} · $0", named.get(1).map_or("-", String::as_str));
+    assert!(named.len() == 4 && dry.contains(&hit) && dry.matches(" → new u").count() == 3, "{dry}");
+    let want = [0, 1, 2, 0, 3].map(|i| named.get(i).map_or("-", String::as_str));
+    assert_eq!(want.to_vec(), ids, "{dry}\n{out}");
     assert!(!out.contains("\n~ "), "every run is named on its own `=` row, never again in the footer: {out}");
 }
 
@@ -2600,10 +2625,10 @@ fn a_sign_in_is_named_by_the_landing() {
     }
 }
 
-/// Plain, Bright Data and the Oxylabs render all bring the app's JS shell (no card): shells
-/// from two providers are an app page, `! no_copy`; with every keyed render tried the move is the key whose
-/// render is untried (`! no_key decodo`), never "nothing left".
-/// One provider's shell is that provider's failure: the other provider still renders (airbnb).
+/// Plain, Bright Data and the Oxylabs render all bring the app's JS shell (no card): shells from two providers are
+/// an app page, `! no_copy`; two paid providers lost it, so a third key is no move: no `! no_key decodo` row and no
+/// `→ fats setup` (a key the site refuses anyway is no answer). One provider's shell is that provider's failure: the
+/// other provider still renders.
 #[test]
 fn two_providers_shells_are_an_app_page() {
     let _t = lock();
@@ -2618,8 +2643,8 @@ fn two_providers_shells_are_an_app_page() {
         "{out}"
     );
     let row = out.lines().find(|l| l.contains("! no_copy ")).unwrap_or_default();
-    assert!(row.ends_with(" setup") && !out.contains("nothing left"), "every keyed render was tried: {out}");
-    assert!(out.contains("\nu1 ! no_key decodo · would try JS render ≤$0.0015"), "{out}");
+    assert!(row.contains("→ nothing left to try · open http") && !row.contains(" setup"), "{out}");
+    assert!(!out.contains("no_key"), "two paid providers lost it: no third key offered: {out}");
     let id = head.split(['.', ' ']).nth(2).unwrap_or_default();
     // `dry:true` on that id with `js:true` quotes the refetch, never `local read · $0`
     let dry = run(&format!("{id} js:true dry:true"));
@@ -2666,6 +2691,9 @@ fn any_one_key_gets_the_page() {
             let again = run(out.split(['.', ' ']).nth(2).unwrap_or_default());
             let once = |o: &str| o.matches("! no_key oxy · would try").count() == 1;
             assert!(once(&out) && once(&again), "{out}\n{again}");
+            // the stored row read again keeps its provider's move as the reader words it
+            let arrow = format!("{oxy} → run {} setup oxy, give the user its 3 lines", fats::lang::bin());
+            assert!(out.contains(&arrow) && again.contains(&arrow), "{out}\n{again}");
         }
         let search = run("kq fetch:0 provider:auto wait:5");
         let (from, spent) = if *keys == "bd" { ("From BD", "$0.0015") } else { ("From Oxy", "$0.0010") };
@@ -2696,9 +2724,8 @@ fn a_settled_render_is_never_asked_again() {
         let out = run(&format!("{w}/{page} provider:auto fresh:true wait:30"));
         clean(&out);
         let row = out.lines().find(|l| l.starts_with("u") && l.contains(" ! provider_error ")).unwrap_or_default();
-        // no provider move left; decodo's missing key could serve: `→ fats setup`
-        let setup = format!(" · failed 1/1 here → {} setup", fats::lang::bin());
-        assert!(row.contains(why) && row.ends_with(&setup), "{page}: {out}");
+        // no provider move left, and two paid providers lost it: no third key offered, the count ends the row
+        assert!(row.contains(why) && row.ends_with(" · failed 1/1 here") && !out.contains("no_key"), "{page}: {out}");
         assert!(!out.contains("provider:oxy"), "{page}: no arrow names oxy, oxyjs and bd spent: {out}");
         let stats = run("stats full");
         assert!(stats.contains(&format!("(not charged, {}", &why[6..])), "{page}: {stats}");
@@ -2871,7 +2898,7 @@ fn setup_form_takes_one_key() {
     let (out, rc) = run_rc("setup oxy");
     let url = out.split_whitespace().find(|w| w.starts_with("http://127.0.0.1:")).unwrap_or_default().to_string();
     assert!(
-        rc == 0 && out.starts_with(&format!("= setup oxy · waiting for the key at {url} · 10 min · $0\n")),
+        rc == 0 && out.starts_with(&format!("= setup oxy · waiting for the key at {url} · 30 min · $0\n")),
         "{out}"
     );
     let (host, path) = url.trim_start_matches("http://").split_once('/').unwrap_or_default();

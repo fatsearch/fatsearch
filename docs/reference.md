@@ -15,9 +15,9 @@ cost nothing and take a few milliseconds. A page stays cached for 30 to 60 minut
 One static binary (17 MB on macOS arm64 to 21 MB on Linux x86_64), `fats guide` starts in about 4.1 ms (p50 of 100
 runs, the native binary; the npm shim adds Node's ~40 ms). No daemon,
 no browser; anonymous usage counts and a daily update check, on by default, one command off
-([Telemetry](#telemetry)). Provider keys are optional: without one, `fats` reads what a plain request gets; with
-**any one** key (an Oxylabs Web API key, a Bright Data key **or** a Decodo token) it renders and unblocks pages through that
-provider.
+([Telemetry](#telemetry)). Pages need no key: without one, `fats` reads what a plain request gets. Web search needs
+**one** key (an Oxylabs Web API key by default, or a Bright Data key); with any one key (Decodo's token too, pages
+only) it renders and unblocks pages through that provider.
 
 ## Numbers
 
@@ -73,7 +73,7 @@ fats setup oxy off          turn a provider off, key kept (on = back; free = the
 fats config set NAME VALUE  save a setting to settings.json (unset NAME = back to the built-in)
 fats account                provider balance, spend this month, usage, zones (free reads, cached 15 min)
 fats help                   the one-screen cheat sheet
-fats guide                  how to use it well: the rules, the loop, the `=` line (~2.0k tokens)
+fats guide                  how to use it well: the rules, the loop, the `=` line (~2.1k tokens)
 fats telemetry show         what the update check and the weekly counts send next, and what was sent
 fats setup telemetry off    turn them off (minimal = the update check only; full = both, the default)
 fats mcp                    the same commands as a local MCP server (stdio)
@@ -328,7 +328,7 @@ u3#3 pstadler 24 days ago | parent | next [–] "The (169) | | | | pstadler 24 d
 $ fats
 = s:demo 3 ids · last u3 file:///…/hn-thread.html
 cache … (mode 700) · 229.8kB (0B pictures) · 3 pages · 0 searches · 3 jobs
-keys none → fats setup
+keys none · search needs oxy or bd (one is enough; oxy = cheapest search) → fats setup oxy
 health (last 10 calls, whole cache): provider ok/n p50ms outcomes (– cancelled)
 plain 1/1 Nms ✓
 bd no key

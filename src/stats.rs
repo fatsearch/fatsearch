@@ -55,6 +55,10 @@ pub fn status(c: &Cache) -> Out {
     let searches = metas.iter().filter(|m| is_serp(m)).count();
     let pages = metas.len() - searches;
     let mut lines = vec![match c.st.u.last() {
+        None if crate::setup::no_keys() && settings::on("free") => {
+            let off = format!("pages free, no key · web search off: needs one key → {}", fetch::search_key());
+            format!("= s:{} no pages · {off}", c.session)
+        }
         None => format!("= s:{} no pages · {b} <url> · {b} ./page.html", c.session),
         Some(e) => {
             let open = c.st.u.iter().filter(|e| e.serp && e.dir.is_empty() && c.lookup(&e.url).is_none()).count();
@@ -65,8 +69,8 @@ pub fn status(c: &Cache) -> Out {
     }];
     let m = mode(&c.root).map_or(String::new(), |m| format!(" (mode {m:o})"));
     let (root, size, jobs, pics) = (c.root.display(), ksize(bytes as usize), c.job_count(), ksize(pics as usize));
-    let sizes = format!("{size}B ({pics}B pictures) · {pages} pages · {searches} searches");
-    let sizes = if c.root.join(MINE).is_file() { sizes } else { "not swept (dir not created by fats)".into() };
+    let swept = if c.root.join(MINE).is_file() { "" } else { " · not swept (dir not created by fats)" };
+    let sizes = format!("{size}B ({pics}B pictures) · {pages} pages · {searches} searches{swept}");
     lines.push(format!("cache {root}{m} · {sizes} · {jobs} jobs"));
     lines.push(crate::setup::keys_line());
     lines.extend(crate::setup::env_rows());
@@ -84,7 +88,7 @@ pub fn status(c: &Cache) -> Out {
     lines.push(crate::telemetry::status());
     lines.push(match FENCE.get() {
         Some(_) => "mcp: serving (this process) · local files from the working directory + the cache".into(),
-        None => format!("mcp: ready · {b} mcp = stdio server, one tool fats(cmd)"),
+        None => crate::mcp::hosts_row(b),
     });
     let at = c.st.cursor.as_ref().filter(|k| k.u > 0);
     let at = at.map(|k| format!("at u{}{} · ", k.u, k.k.map(|s| format!("#{s}")).unwrap_or_default()));
@@ -753,12 +757,19 @@ pub fn setup(zone: Option<&str>, import: bool, dry: bool, wait: Duration) -> Out
             }
             rows.push(env);
         }
+        // a key form still waiting or dead: its row, so the agent knows which link the user holds
+        rows.extend(crate::setup::form_row(s.short).filter(|_| !keyed));
         ok &= !head.starts_with('!');
         heads.push(format!("{} {head}", s.short));
         lines.extend(rows);
     }
-    let dir = settings::get().key_dir.value.display().to_string();
-    let end = if dry { " · spends nothing now".to_string() } else { format!(" · key dir {dir}") };
+    let dir = settings::get().key_dir.value.display();
+    let mut end = if dry { " · spends nothing now".to_string() } else { format!(" · key dir {dir}") };
+    // no key and the free fetch on: what works now and the one key search needs, not a list of `none`
+    if heads.iter().all(|h| h.ends_with(" none")) {
+        heads = vec![format!("no key · pages free · web search off until one key is saved → {}", fetch::search_key())];
+        end = String::new();
+    }
     lines.insert(0, format!("={} setup {}{end} · $0", if dry { " dry" } else { "" }, heads.join(" · ")));
     lines.extend(crate::telemetry::row());
     lines.push(format!("status: {b} · balance: {b} account · {}", crate::lang::to_guide()));
@@ -1178,11 +1189,20 @@ mod tests {
         let row = |p: &str, code: &str| Account { provider: p.into(), code: code.into(), ..Account::default() };
         // The fetch row's text (buys, price, every variable) and its key form; `setup` never pointing at itself
         let oxy = "! no_key oxy · would try no-JS fetch + JS render ≤$0.0025";
-        assert_eq!(account_rows(&row("oxy", "no_key"), None), [format!("{oxy} → {b} setup oxy")]);
+        assert_eq!(
+            account_rows(&row("oxy", "no_key"), None),
+            [format!("{oxy} → run {b} setup oxy, give the user its 3 lines")]
+        );
         let bd = "! no_key bd · would try unblock+JS ≤$0.0015";
-        let page = " · bd https://brightdata.com/cp/start";
-        assert_eq!(account_rows(&row("bd", "no_key"), None), [format!("{bd} → {b} setup bd")]);
-        assert_eq!(no_key_rows("bd", true), [format!("{bd}{page}")]);
+        assert_eq!(
+            account_rows(&row("bd", "no_key"), None),
+            [format!("{bd} → run {b} setup bd, give the user its 3 lines")]
+        );
+        // inside `fats setup`: what the key adds, no price, and its form; Decodo cannot search
+        let bd_adds = "! no_key bd · search + JS pages · fats setup bd, 3 steps for the user";
+        assert_eq!(no_key_rows("bd", true), [bd_adds.replace("fats", b)]);
+        let decodo = "! no_key decodo · JS pages, no web search · fats setup decodo";
+        assert_eq!(no_key_rows("decodo", true), [decodo.replace("fats", b)]);
         assert_eq!(
             account_rows(&row("oxy", "bad_key"), None),
             [format!(

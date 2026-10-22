@@ -84,6 +84,14 @@ pub fn grep(
     Ok((lines, cursor))
 }
 
+/// Grep alternation typed as filter words (`price\|cost`, `price|cost`): no regex here, so its words, split at
+/// each `|` (a `\` beside one dropped); None when no word holds a `|`.
+pub fn unpiped(words: &[String]) -> Option<Vec<String>> {
+    let split = words.iter().flat_map(|w| w.split('|')).map(|w| w.trim_matches('\\')).filter(|w| !w.is_empty());
+    let split: Vec<String> = split.map(String::from).collect();
+    (words.iter().any(|w| w.contains('|')) && !split.is_empty()).then_some(split)
+}
+
 /// THE list filter (`links`, `cards`, `stats`): every word is in the text, case and accents folded (`fold`).
 pub fn holds(text: &str, words: &[String]) -> bool {
     words.iter().all(|w| fold(text).contains(&fold(w)))

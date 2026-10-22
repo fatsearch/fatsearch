@@ -413,6 +413,14 @@ pub fn size(p: &Page, lines: &[String]) -> usize {
 /// differ per read of one page, so it counts a plain fetch's width and a fetch and its cache read print one size.
 const HOW_WIDTH: &str = "plain 400ms";
 
+/// How a page this command fetched came: `plain 301ms`, `bd 4321ms spent $0.0015`; the path when it was more than
+/// one plain call (a second ask says why: `md:thin`).
+pub fn fetched(meta: &Meta) -> String {
+    let more = meta.hops.len() > 1 || meta.hops.iter().any(|h| h.why.starts_with("md:"));
+    let by = if more { meta.tried() } else { meta.provider.clone() + &meta.geo() };
+    format!("{by} {}ms{}{}", meta.ms, crate::provider::spent(" ", meta.cost, meta.upto()), meta.how())
+}
+
 /// The `=` line: id, a failed fetch's code, title, shape (sections, PDF pages, text lines), `size` tok, and how it
 /// came (a cache read too: a paid run is read from the cache); `how` = a HOW in place of this read's (`HOW_WIDTH`).
 fn head_line(p: &Page, prov: Option<&str>, size: usize, how: Option<&str>) -> String {
@@ -420,12 +428,7 @@ fn head_line(p: &Page, prov: Option<&str>, size: usize, how: Option<&str>) -> St
     let tail = match (how, p.age) {
         (Some(how), _) => how.to_string(),
         (None, Some(age)) => format!("cache {}{}", fmt_age(age), meta.how()),
-        (None, None) => {
-            // the path when it was more than one plain call (a second ask says why: `md:thin`)
-            let more = meta.hops.len() > 1 || meta.hops.iter().any(|h| h.why.starts_with("md:"));
-            let by = if more { meta.tried() } else { meta.provider.clone() + &meta.geo() };
-            format!("{by} {}ms{}{}", meta.ms, crate::provider::spent(" ", meta.cost, meta.upto()), meta.how())
-        }
+        (None, None) => fetched(meta),
     };
     let n = doc.served();
     let shape = match doc.mode.as_str() {
@@ -514,14 +517,30 @@ pub fn is_thin(doc: &Doc) -> bool {
 
 /// `! thin 290 of ~2.3k visible → fats u24#5ae`: the loss guard counts numbers, this counts text; cleaning served a
 /// small part of what the bytes hold, so every read says so. The way out (`next`) is ANCHORED, never sized: the
-/// island part holding the page's own words (`anchor`), else `way_out`. The biggest island of a social page is
-/// its app state; the one with the most prose, an i18n string table; its longest prose
-/// string, a moderation policy or a legal notice (TikTok and Instagram).
+/// part holding the page's own words (`anchor`), else a served `feed`, else `way_out`. On a social app's page the
+/// biggest island is its app state; the one with the most prose, an i18n string table; its longest prose string, a
+/// moderation policy or a legal notice.
 fn thin(doc: &Doc, next: Option<String>) -> Option<Flag> {
     let doc = Some(doc).filter(|d| is_thin(d))?;
     // the visible text is a char count: ~2 chars a token (printed reads, median 1.97)
     let what = format!("{} of ~{} visible", ksize(doc.tokens.clean), ksize(doc.loss.visible_chars / 2));
     Some(Flag { code: "thin".into(), what, next: next.unwrap_or_default(), row: false })
+}
+
+/// A thin page's feed, when no part holds its own words (`held`) and no island holds a thread (`threads`: the
+/// posts' own text wins over their titles): the served section holding the most link rows titled in ≥ 2 words (a
+/// profile's videos by their captions), at ≥ `feed_links` of them and most of the served text (never a related list
+/// beside the page), as its section. `thin` weighs the served text against the islands' strings too (an app's
+/// state), so a feed of captions stays under its bar; the thin arrow points at the posts, the rule stays.
+fn feed(p: &Page) -> Option<usize> {
+    let doc = Some(p.doc).filter(|d| is_thin(d) && held(p).1.is_none() && threads(d).is_empty())?;
+    let words =
+        |l: &str| LREF.replace_all(l, "").split_whitespace().filter(|w| w.contains(char::is_alphabetic)).count();
+    let titled = |l: &&String| LREF.is_match(l) && words(l) >= 2;
+    let rows = |k: usize| doc.sections[k - 1].lines.iter().filter(titled).count();
+    let most = |k: usize| 2 * tok(&doc.sections[k - 1].lines.join("\n")) >= doc.tokens.clean;
+    let (n, k) = (1..=doc.served()).map(|k| (rows(k), k)).max()?;
+    (n >= limit("feed_links") && most(k)).then_some(k)
 }
 
 /// The way to the page from a copy without it, free first: a render of it already stored (`→ fats u2
@@ -530,18 +549,20 @@ fn thin(doc: &Doc, next: Option<String>) -> Option<Flag> {
 /// this session (`#5` read → `#5b`, never back at a read part; all read → the next island, then none),
 /// else a JS render (`js_next`). A data island is never one: its long strings are an app's i18n table.
 fn way_out(p: &Page) -> Option<String> {
-    let (doc, b) = (p.doc, bin());
-    let islands = threads(doc);
-    let unread = |k: usize| {
-        let parts = parts_of(doc, k);
-        let i = (0..parts.len()).find(|&i| !read(p, k, i, &parts[i]))?;
-        let n = if i == 0 { sec_tokens(doc, k) } else { parts[i..].iter().flatten().map(|l| tok(l)).sum() };
-        let at = Id { sec: Some(k), part: i, ..Id::default() }.sec_tail();
-        Some(format!("{b} {}{at} · {} tok · $0", p.id, ksize(n)))
-    };
-    let island = islands.iter().copied().find_map(unread);
+    let islands = threads(p.doc);
+    let island = islands.iter().find_map(|&k| unread(p, k));
     // every part of the islands read: no arrow, never a render of what was read
-    p.at.1.as_ref().map(|r| format!("{b} {r}")).or(island).or_else(|| js_next(p).filter(|_| islands.is_empty()))
+    p.at.1.as_ref().map(|r| format!("{} {r}", bin())).or(island).or_else(|| js_next(p).filter(|_| islands.is_empty()))
+}
+
+/// The arrow to section `k` at its first part not read in this session (`#5` read → `#5b · 1.2k tok · $0`, the
+/// rest's size), none when every part is read.
+fn unread(p: &Page, k: usize) -> Option<String> {
+    let parts = parts_of(p.doc, k);
+    let i = (0..parts.len()).find(|&i| !read(p, k, i, &parts[i]))?;
+    let n = if i == 0 { sec_tokens(p.doc, k) } else { parts[i..].iter().flatten().map(|l| tok(l)).sum() };
+    let at = Id { sec: Some(k), part: i, ..Id::default() }.sec_tail();
+    Some(format!("{} {}{at} · {} tok · $0", bin(), p.id, ksize(n)))
 }
 
 /// The `<template>` islands holding ≥ `island_paragraphs` paragraphs (texts of ≥ `paragraph_words` words: a
@@ -712,7 +733,9 @@ fn page_flags(p: &Page) -> Vec<Flag> {
     let card = way.clone().map(|next| Flag { code: "js_shell".into(), next, ..Flag::default() });
     let landed = lost_page(&doc.url, meta.landed.as_deref().unwrap_or(&doc.final_url));
     let moved = landed.map(|what| Flag { code: "redirected".into(), what, ..Flag::default() });
-    v.extend(if doc.mode == "og" { card } else { thin(doc, held.or(way)) }.into_iter().chain(moved));
+    // a feed's section is the way to the posts before an island guess (`feed`)
+    let feed = feed(p).and_then(|k| unread(p, k));
+    v.extend(if doc.mode == "og" { card } else { thin(doc, held.or(feed).or(way)) }.into_iter().chain(moved));
     if doc.cut > 0 && doc.mode == "pdf" {
         let (all, secs) = (n + doc.cut, limit::<u64>("pdf_budget_s"));
         let next = format!("the rest: qpdf <file>.pdf --pages . {}-z -- rest.pdf, then {b} ./rest.pdf", n + 1);
@@ -1281,6 +1304,28 @@ mod tests {
         doc.sections[1].lines.push(text);
         let rec = record_in(&doc, &Meta::default(), &[]).unwrap_or_default();
         assert!(rec.starts_with("#2 · page record · "), "{rec}");
+    }
+
+    /// A thin page whose served section is a feed (≥ `feed_links` link rows titled in ≥ 2 words, most of the served
+    /// text) points there before an island guess; a thread in a template island wins over it; bare counts, a few
+    /// rows or a list beside the page's text are no feed.
+    #[test]
+    fn a_thin_feed_points_at_its_posts() {
+        let (mut doc, b) = (thin_doc(&[], "Profile"), bin());
+        let meta = Meta { url: doc.url.clone(), ok: true, ..Meta::default() };
+        let to = |doc: &Doc, k: &str| flags(&pg(doc, &meta)).contains(&format!("→ {b} u1#{k} · "));
+        let mut rows: Vec<String> = (1..=12).map(|i| format!("1.{i}M · Crew {i} reaches the station [l{i}]")).collect();
+        rows.extend((13..=20).map(|i| format!("{i}.5K [l{i}]")));
+        (doc.sections[0].lines, doc.tokens.clean) = (rows.clone(), tok(&rows.join("\n")));
+        assert!(to(&doc, "1"), "{}", flags(&pg(&doc, &meta)));
+        doc.sections[2].title = "island template 9 KB".into(); // the comments of a thread
+        assert!(to(&doc, "3") && !to(&doc, "1"), "{}", flags(&pg(&doc, &meta)));
+        doc.sections[2].title = "island json".into();
+        doc.tokens.clean *= 3; // the rows beside a page's text twice their size: a related list
+        assert!(!to(&doc, "1"));
+        doc.tokens.clean /= 3;
+        doc.sections[0].lines.drain(..3); // 9 titled rows
+        assert!(!to(&doc, "1"));
     }
 
     /// The thin pointer is the island PART holding the description's first 25 chars, never the biggest

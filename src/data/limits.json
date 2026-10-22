@@ -7,6 +7,8 @@
   "thin_chars": 300,
   "serp_links": 5,
   "link_words": 3,
+  "name_words": 4,
+  "feed_links": 10,
   "pruned_share": 0.20,
   "pruned_min": 10,
   "prose_words": 10,

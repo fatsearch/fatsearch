@@ -6,7 +6,7 @@
 //! model, not the user, picks the path), and `-` (stdin) is refused because stdin carries the protocol.
 //! Failures are `!` rows in the text; protocol errors only for requests that are not a `fats` call.
 
-use crate::lang::CARD;
+use crate::lang::{CARD, WORDS, local_path};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult,
     PaginatedRequestParams, ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerConfig, Tool,
@@ -89,9 +89,8 @@ impl ServerHandler for Fats {
             Some((b64, mime)) => ContentBlock::image(b64, mime),
             None => ContentBlock::text(format!("! not_viewable · Claude reads png, jpeg, gif, webp → open {p}")),
         }));
-        let mut r = CallToolResult::success(blocks);
-        r.is_error = Some(rc != 0); // rc 1 = the command failed, 2 = usage: the text says why either way
-        Ok(r.into())
+        // rc 1 = the command failed, 2 = usage: the text says why either way
+        Ok(if rc == 0 { CallToolResult::success(blocks) } else { CallToolResult::error(blocks) }.into())
     }
 }
 
@@ -110,9 +109,8 @@ async fn ticking<T>(
             return done;
         }
         s += crate::cli::TICK.as_secs();
-        let tick =
-            ProgressNotificationParam::new(token.clone(), s as f64).with_message(format!("still working · {s} s"));
-        peer.notify_progress(tick).await.ok();
+        let msg = format!("still working · {s} s");
+        peer.notify_progress(ProgressNotificationParam::new(token.clone(), s as f64).with_message(msg)).await.ok();
     }
 }
 
@@ -138,24 +136,46 @@ fn pixels(path: &std::path::Path) -> Option<(String, &'static str)> {
     Some((b64(out.into_inner()), "image/jpeg"))
 }
 
+/// The status row of the hosts: which of words.json `mcp_hosts` hold a server named `fats` where their own `mcp add`
+/// writes it (`read`): a TOML `[mcp_servers.fats]` table (Codex) or a JSON `mcpServers.fats` at the top level
+/// (Claude Code's user scope and project `.mcp.json`, Cursor) or under `projects.<this working dir>` (Claude Code's
+/// local scope: another project's server is not this one's; its key matched as `cli::dir_key`). Never `ready` while
+/// none does: a model relays that word as "connected".
+pub fn hosts_row(b: &str) -> String {
+    let here = crate::cli::dir_key(&std::env::current_dir().unwrap_or_default().to_string_lossy());
+    let json = |v: serde_json::Value| {
+        let local = v["projects"].as_object().into_iter().flatten().filter(|(k, _)| crate::cli::dir_key(k) == here);
+        [&v].into_iter().chain(local.map(|p| p.1)).any(|v| !v["mcpServers"]["fats"].is_null())
+    };
+    let toml = |t: &str| t.lines().any(|l| l.trim() == "[mcp_servers.fats]");
+    // a file that never names `fats` is never parsed (`~/.claude.json` keeps every project's state)
+    let on = |t: String| toml(&t) || t.contains("fats") && serde_json::from_str(&t).is_ok_and(json);
+    let added: Vec<&str> =
+        WORDS.mcp_hosts.iter().filter(|h| h.1.iter().filter_map(read).any(on)).map(|h| h.0).collect();
+    let all = WORDS.mcp_hosts.iter().map(|h| h.0).collect::<Vec<_>>().join(", ");
+    match WORDS.mcp_hosts.first().filter(|_| added.is_empty()) {
+        Some(h) => format!("mcp: not added to {all} · add: {}", h.2.replace("{b}", b)),
+        None => format!("mcp: added to {} · stdio, one tool fats(cmd)", added.join(", ")),
+    }
+}
+
+/// A host's config file as words.json `mcp_hosts` names it (`lang::local_path`: `~/` = the home dir), its text:
+/// `VAR=dir/file` = `$VAR/file` while `$VAR` is set (`settings::env`), else `dir/file` (Codex's `CODEX_HOME`).
+fn read(p: &&str) -> Option<String> {
+    let set = p.split_once('=').and_then(|(v, p)| Some(crate::settings::env(v)? + &p[p.rfind('/')?..]));
+    std::fs::read_to_string(local_path(set.as_deref().unwrap_or(p.rsplit('=').next().unwrap_or(p)))).ok()
+}
+
 /// Serve on stdin/stdout until the client closes stdin (the parent exited). Exit code for `main`.
 pub fn serve() -> i32 {
     let mut fence = vec![crate::settings::get().cache.value.clone()];
     fence.extend(std::env::current_dir());
     crate::cli::fence(fence);
-    crate::provider::block(async {
-        match Fats.serve(rmcp::transport::stdio()).await {
-            Ok(s) => s.waiting().await.map_or(1, |_| 0),
-            Err(e) => {
-                eprintln!("fats mcp: {e}");
-                1
-            }
-        }
-    })
-    .unwrap_or_else(|| {
-        eprintln!("fats mcp: no async runtime");
-        1
-    })
+    let served = crate::provider::block(async {
+        let running = Fats.serve(rmcp::transport::stdio()).await.map_err(|e| e.to_string())?;
+        running.waiting().await.map(|_| 0).map_err(|e| e.to_string())
+    });
+    served.unwrap_or_else(|| Err("no async runtime".into())).inspect_err(|e| eprintln!("fats mcp: {e}")).unwrap_or(1)
 }
 
 #[cfg(test)]
@@ -202,6 +222,17 @@ mod tests {
         let mut wide = std::io::Cursor::new(Vec::new());
         image::GrayImage::new(12_001, 1).write_to(&mut wide, image::ImageFormat::Png).expect("png");
         assert!(pixels(&saved("wide.png", wide.get_ref()).1).is_none());
+    }
+
+    /// One directory under every spelling a Windows host or `canonicalize` writes is one key; elsewhere a key is
+    /// the path as written, case and separators kept.
+    #[test]
+    fn a_dir_key_is_one_spelling() {
+        let key = crate::cli::dir_key;
+        let keys = [r"\\?\C:\Work\fats", r"C:\Work\fats", "C:/Work/fats", "c:/work/fats"].map(key);
+        assert_eq!(keys.iter().all(|k| *k == keys[0]), cfg!(windows), "{keys:?}");
+        assert_eq!(key(r"\\?\UNC\srv\share"), key(r"\\srv\share"), "the verbatim prefix is no part of a key");
+        assert_eq!(key("/home/me/Work"), if cfg!(windows) { r"\home\me\work" } else { "/home/me/Work" });
     }
 
     /// PNG chunk CRC (ISO 3309, as the PNG spec gives it).

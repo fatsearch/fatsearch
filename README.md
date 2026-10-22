@@ -49,20 +49,24 @@ Prices, dates, numbers: kept <sub>(loss guard counts every one)</sub>.
 
 ## Your key never touches the chat
 
-`fats setup <provider>` opens a one-time key form on `127.0.0.1`, behind a random token, for 10 minutes.<br>
+`fats setup <provider>` opens a one-time key form on `127.0.0.1`, behind a random token, for 30 minutes.<br>
 You paste the key there in your browser, so it stays out of the chat, the model's context and the agent's logs.<br>
 The form refuses a POST from another origin; the key is checked live, saved with mode 0600, sent only to its provider.
 
 ```console
 $ fats setup decodo
-= setup decodo · waiting for the key at http://127.0.0.1:59802/k/e0c8baba7a5b058947f4fdab97dabb05/decodo · 10 min · $0
+= setup decodo · waiting for the key at http://127.0.0.1:59802/k/e0c8baba7a5b058947f4fdab97dabb05/decodo · 30 min · $0
 tell the user (never ask for the key in chat):
 1. open https://dashboard.decodo.com/web-data/playground  (no account yet: https://dashboard.decodo.com/register)
 2. Copy the API key shown on the Web Data playground. Do NOT paste it in this chat.
 3. open http://127.0.0.1:59802/k/e0c8baba7a5b058947f4fdab97dabb05/decodo , paste the key, press Save
 then: fats setup   (when the user says done; end your turn, do not poll · checks it, $0)
-browser not on this machine (SSH)? the user runs fats setup decodo in a terminal there and pastes the key
+link dead (30 min passed)? run fats setup decodo again and give the user the new line 3
 ```
+
+`fats setup` shows a form still waiting (`! form_waiting decodo · 23 min left · <its URL>`) or one whose time ran
+out (`! form_expired decodo · the link the user got is dead → fats setup decodo · new link, same 3 steps`).
+Over SSH (`SSH_CONNECTION` or `SSH_TTY` set) one more line says how to paste the key in a terminal there.
 
 <br>
 
@@ -129,7 +133,7 @@ state, then Settings (agent connection, cache, stats, telemetry). Pick a provide
 straight to one (also `bd`, `decodo`, `gh`).
 
 **Your agent, or no terminal:** the agent runs `fats setup oxy` (or `bd`, `decodo`, `gh`). It prints the
-provider's dashboard link and a one-time form on `127.0.0.1`, open for 10 minutes. The agent gives you the URL;
+provider's dashboard link and a one-time form on `127.0.0.1`, open for 30 minutes. The agent gives you the URL;
 you paste the key into the form in your browser, never into the chat ([what it prints](#your-key-never-touches-the-chat)).
 Then the agent runs `fats setup` to check it ($0).
 
@@ -203,7 +207,7 @@ gh skill install fatsearch/fatsearch      # the same through GitHub CLI ≥ 2.90
 ```
 
 An agent without either CLI reads it pinned to a release:
-`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.3/skills/fatsearch/SKILL.md`.
+`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.4/skills/fatsearch/SKILL.md`.
 That way the agent sees versioned text it can review, and nothing it runs comes from a website.
 
 Docs as plain Markdown for agents: [fatsearch.com/llms.txt](https://fatsearch.com/llms.txt).

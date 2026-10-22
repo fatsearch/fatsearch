@@ -46,12 +46,14 @@ Done
 § intro
 FATSEARCH is ready: free fetch works already. Want more? Oxylabs (#1) or Decodo, both $5 free.
 § agent
-= setup {short} · waiting for the key at {url} · 10 min · $0
+= setup {short} · waiting for the key at {url} · {life} min · $0
 tell the user (never ask for the key in chat):
 1. open {mint}  (no account yet: {signup})
 2. {step}. Do NOT paste it in this chat.
 3. open {url} , paste the key, press Save
 then: {b} setup   (when the user says done; end your turn, do not poll · checks it, $0)
+link dead ({life} min passed)? run {b} setup {short} again and give the user the new line 3
+§ ssh
 browser not on this machine (SSH)? the user runs {b} setup {short} in a terminal there and pastes the key
 § telemetry
 Telemetry

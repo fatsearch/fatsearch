@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const LIFE: f64 = 600.0; // a key form's life, s
+/// A key form's life, s: Oxylabs' key in hand is a signup and four screens, 4–8 min and a verification mail; 10 min
+/// ran out first.
+const LIFE: f64 = 1800.0;
 const FORM: &str = include_str!("data/setup-form.html");
 
 /// The telemetry levels as the screens name them: (the stored level, its option, its word on a row). The stored
@@ -209,7 +211,7 @@ fn cache_words(root: &Path) -> (String, String) {
     let (bytes, _, metas) = crate::cache::usage(root);
     let pages = metas.iter().filter(|m| !crate::stats::is_serp(m)).count();
     let size = crate::lang::ksize(usize::try_from(bytes).unwrap_or(usize::MAX));
-    let row = format!("{} · {pages} pages, {size}B · live ≤ {ttl}", row_path(root, dirs::home_dir().as_deref()));
+    let row = format!("{} · {pages} pages, {size}B · live ≤ {ttl}", row_path(root, std::env::home_dir().as_deref()));
     (row, format!("{} · pages live ≤ {ttl} ({idle} unread) · {pages} pages, {size}B", root.display()))
 }
 
@@ -420,13 +422,17 @@ pub fn masked(line: &str) -> String {
 
 /// The status line's keys, each by its tail, Bright Data's zone and the one file (≤ 100 cols): `keys oxy …6XBR · bd
 /// …k2Qf zone fatsrc · decodo none · gh none · auth.json`, then ` · network off` under `FATS_OFFLINE`; no key at all
-/// = the setup move; ` · bak` last while `auth.json.bak` holds an old key (`bak_row`).
+/// = what search needs and the key to add first (`keys none · search needs oxy or bd (…) → fats setup oxy`); ` · bak`
+/// last while `auth.json.bak` holds an old key (`bak_row`).
 pub fn keys_line() -> String {
     let names = || settings::SWITCHES.into_iter().filter(|p| *p != "free");
     let off = if settings::get().offline.value { " · network off" } else { "" };
     let net = format!("{off}{}", if bak().is_some() { " · bak" } else { "" });
-    if names().all(|p| settings::key(p).is_none()) {
-        return format!("keys none → {} setup{net}", bin());
+    if no_keys() {
+        let all = crate::fetch::searchers();
+        let one = all.first().copied().unwrap_or_default();
+        let why = format!("search needs {} (one is enough; {one} costs least per search)", all.join(" or "));
+        return format!("keys none · {why} → {}{net}", crate::fetch::search_key());
     }
     let named = |p: &str| match (p, crate::stats::key(p)) {
         ("bd", k) if k.starts_with('…') => format!("bd {k} zone {}", settings::zone().unwrap_or("none")),
@@ -434,6 +440,11 @@ pub fn keys_line() -> String {
     };
     let keys = names().map(named).collect::<Vec<_>>().join(" · ");
     format!("keys {keys} · {}{net}", settings::AUTH)
+}
+
+/// No provider key saved, any switch (`gh` too).
+pub fn no_keys() -> bool {
+    settings::SWITCHES.into_iter().filter(|p| *p != "free").all(|p| settings::key(p).is_none())
 }
 
 /// The old `auth.json` a replaced or removed key leaves (`settings::save_to`), while it is there.
@@ -552,8 +563,8 @@ pub fn pick_zone(names: &[String], arg: Option<&str>) -> Result<String, String> 
 }
 
 /// A key form's run file `<session>/run/setup-<p>.<ext>`: `json` = token, port, deadline (the cache root is its
-/// owner's only, `cache::private_root`), there while the run serves (its port written once it listens; a run
-/// killed leaves it until the deadline); `log` = the run's output.
+/// owner's only, `cache::private_root`), there while the run serves (its port written once it listens) and after its
+/// deadline (`form_row`: dead), gone once a key is saved or a new form starts; `log` = the run's output.
 fn run_file(c: &Cache, p: &str, ext: &str) -> PathBuf {
     c.root.join(&c.session).join("run").join(format!("setup-{p}.{ext}"))
 }
@@ -565,21 +576,31 @@ struct Form {
     port: u16,
 }
 
-/// Provider `p`'s key form that still waits: its URL.
+/// Provider `p`'s key form that still waits: its URL. Its run must still answer on its port (within 200 ms): one
+/// killed before its deadline (a reboot, a killed process group) left a dead link behind.
 fn waiting_at(c: &Cache, p: &str) -> Option<String> {
     let f: Form = jload(&run_file(c, p, "json")).filter(|f: &Form| f.port > 0 && f.until > now())?;
+    TcpStream::connect_timeout(&([127, 0, 0, 1], f.port).into(), Duration::from_millis(200)).ok()?;
     Some(format!("http://127.0.0.1:{}/k/{}/{p}", f.port, f.token))
 }
 
+/// Provider `p`'s key form as `fats setup` reports it: one still waiting (its time left, its URL), or one whose time
+/// ran out with no key saved: the link the user got is dead.
+pub fn form_row(p: &str) -> Option<String> {
+    let c = Cache::open();
+    let f: Form = jload(&run_file(&c, p, "json")).filter(|f: &Form| f.port > 0)?;
+    let left = ((f.until - now()) / 60.0).ceil();
+    let dead =
+        || format!("! form_expired {p} · the link the user got is dead → {} setup {p} · new link, same 3 steps", bin());
+    Some(waiting_at(&c, p).map_or_else(dead, |url| format!("{p} form waiting · {left} min left · {url}")))
+}
+
 /// Way 2: the key form for `l`, served by a detached run (`--continue setup-<p>`, `serve`) on 127.0.0.1: the block
-/// the agent shows its user (its last line: the env row, for a user whose browser is not on this machine). One
-/// still waiting is shown again.
+/// the agent shows its user (`told`). One still waiting is shown again; a dead one is replaced.
 fn form(l: &'static Links) -> Out {
     let (c, p) = (Cache::open(), l.short);
-    let fill = |url: &str| {
-        let page = fill(page("agent"), Some(l), &[("url", url)]);
-        Out::new(page.lines().map(String::from).collect()).with("cost", 0.0)
-    };
+    let ssh = crate::lang::WORDS.ssh.iter().any(|v| std::env::var_os(v).is_some());
+    let fill = |url: &str| told(l, url, ssh);
     if let Some(url) = waiting_at(&c, p) {
         return fill(&url);
     }
@@ -597,6 +618,14 @@ fn form(l: &'static Links) -> Out {
     waiting_at(&c, p).map_or_else(failed, |url| fill(&url))
 }
 
+/// The block the agent shows its user: three numbered steps; the SSH way only over SSH (`ssh`), else an agent
+/// relays it as a fourth step.
+fn told(l: &'static Links, url: &str, ssh: bool) -> Out {
+    let block = format!("{}{}", page("agent"), if ssh { page("ssh") } else { "" });
+    let page = fill(&block, Some(l), &[("url", url), ("life", &format!("{}", LIFE / 60.0))]);
+    Out::new(page.lines().map(String::from).collect()).with("cost", 0.0)
+}
+
 /// The detached run of `fats setup <p>`: serves its form until one good key or `LIFE`, then exits. Exit code.
 pub fn serve(p: &str) -> i32 {
     let c = Cache::open();
@@ -608,12 +637,15 @@ pub fn serve(p: &str) -> i32 {
     }
     while now() < f.until {
         match lis.accept() {
-            Ok((stream, _)) if answer(&stream, &f, l) => break,
+            // a key saved: no file = no form waits (one past its deadline stays: `form_row` says it is dead)
+            Ok((stream, _)) if answer(&stream, &f, l) => {
+                std::fs::remove_file(run_file(&c, p, "json")).ok();
+                break;
+            }
             Ok(_) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
     }
-    std::fs::remove_file(run_file(&c, p, "json")).ok(); // no file = no form waits
     0
 }
 
@@ -961,6 +993,23 @@ mod tests {
     #[test]
     fn screens_and_form_parts() {
         let l = links("oxy").expect("oxy");
+        // the user's part of `fats setup oxy`: three numbered steps, the SSH way only over SSH
+        let steps =
+            |o: &Out| o.lines.iter().filter(|r| r.starts_with(['1', '2', '3']) && r[1..].starts_with(". ")).count();
+        let (here, ssh) = (told(l, "http://127.0.0.1:1/k/t/oxy", false), told(l, "http://127.0.0.1:1/k/t/oxy", true));
+        assert!(steps(&here) == 3 && !here.lines.iter().any(|r| r.contains("SSH")), "{:?}", here.lines);
+        assert!(
+            steps(&ssh) == 3 && ssh.lines.last().is_some_and(|r| r.contains("(SSH)? the user runs")),
+            "{:?}",
+            ssh.lines
+        );
+        // the agent's last line: what to do when the 30 min passed (the SSH way after it, only over SSH)
+        let dead = "link dead (30 min passed)? run fats setup oxy again and give the user the new line 3";
+        assert!(here.lines.last().is_some_and(|r| r.replace(bin(), "fats") == dead), "{:?}", here.lines);
+        assert!(
+            here.lines[0].ends_with(" · 30 min · $0")
+                && ssh.lines.iter().rev().nth(1).is_some_and(|r| r.starts_with("link dead"))
+        );
         let page = html(l, 2, &[("save", "/k/t/oxy/save"), ("err", "")]);
         assert!(page.contains("action=\"/k/t/oxy/save\"") && page.contains(l.mint) && !page.contains("<script"));
         let done = html(l, 3, &[("what", &landed(l, "351 scrapers", &[]).0)]);

@@ -255,10 +255,10 @@ fn via() -> &'static str {
     let exe = std::env::current_exe().and_then(std::fs::canonicalize).unwrap_or_default();
     let has = |part: &str| exe.components().any(|c| c.as_os_str() == part);
     let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let cargo = var("CARGO_HOME").or_else(|| dirs::home_dir().map(|h| h.join(".cargo"))).unwrap_or_default();
+    let cargo = var("CARGO_HOME").or_else(|| std::env::home_dir().map(|h| h.join(".cargo"))).unwrap_or_default();
     let in_cargo = std::fs::canonicalize(cargo.join("bin")).is_ok_and(|b| exe.parent() == Some(b.as_path()));
     // where the shell installer writes it: `$XDG_CONFIG_HOME`, else `~/.config`
-    let conf = var("XDG_CONFIG_HOME").or_else(|| dirs::home_dir().map(|h| h.join(".config"))).unwrap_or_default();
+    let conf = var("XDG_CONFIG_HOME").or_else(|| std::env::home_dir().map(|h| h.join(".config"))).unwrap_or_default();
     let receipt = conf.join("fatsearch").join("fatsearch-receipt.json").is_file();
     match () {
         _ if has("node_modules") => "npm",

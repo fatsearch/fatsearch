@@ -122,9 +122,16 @@ pub struct Entry {
     /// The parts of it read in this session (`#5`, `#5b`) and their text's keys (`=1f…`, read under any copy of the
     /// URL): a next move never points back at one.
     pub read: Vec<String>,
+    /// The later jobs that read it from the cache (`fats <url>` again: a hit is a read under the same id).
+    pub hits: Vec<usize>,
 }
 
 impl Entry {
+    /// Job `j` fetched it or read it from the cache: `fats j<j>` lists it.
+    pub fn in_job(&self, j: usize) -> bool {
+        self.job == Some(j) || self.hits.contains(&j)
+    }
+
     /// Page `u`'s `=` line id read in its own session: `j3.u2` (the job that fetched it), else `u2`.
     pub fn eq(&self, u: usize) -> String {
         self.job.map_or_else(|| format!("u{u}"), |j| format!("j{j}.u{u}"))
@@ -614,6 +621,12 @@ impl Cache {
         self.with_state(|st| st.u.get_mut(n - 1).map(|e| e.read.extend(new(e)))).map(|_| ())
     }
 
+    /// Job `j` read page `n` from the cache (`cli::cached`), logged once: a job naming the URL twice, or the job
+    /// that fetched it, adds nothing.
+    pub fn hit_mark(&mut self, n: usize, j: usize) -> Result<(), String> {
+        self.with_state(|st| st.u.get_mut(n - 1).filter(|e| !e.in_job(j)).map(|e| e.hits.push(j))).map(|_| ())
+    }
+
     /// Append entries (or fill `slot`, see `place`): the first one's 1-based u number, unique even with parallel
     /// writers.
     pub fn alloc(&mut self, es: Vec<Entry>, slot: Option<usize>) -> Result<usize, String> {
@@ -799,7 +812,8 @@ pub fn guarded(run: impl FnOnce() -> Result<Doc, String>) -> Result<Doc, String>
 /// Bytes under the root, the pictures among them (`assets/`), every live snapshot's meta.json path (`expired`:
 /// the sweep's rule, so a dead copy counts in no health row), all sessions (status: size, pages, provider health).
 /// Telemetry's `telemetry/` (its stamps, day marks and the weekly tally `Week`) is no cached page: a command's own
-/// count never changes the next's status.
+/// count never changes the next's status. Under a root fats did not make (`MINE`: `/`, a home) only what fats wrote
+/// there is walked: the `ours` dirs of each session dir (one holding a state.json), as the sweep finds them.
 pub fn usage(root: &Path) -> (u64, u64, Vec<PathBuf>) {
     fn walk(p: &Path, acc: &mut (u64, u64, Vec<PathBuf>), top: bool) {
         let Ok(rd) = fs::read_dir(p) else { return };
@@ -817,7 +831,10 @@ pub fn usage(root: &Path) -> (u64, u64, Vec<PathBuf>) {
         }
     }
     let mut acc = (0, 0, Vec::new());
-    root.join(MINE).is_file().then(|| walk(root, &mut acc, true)); // never a dir fats did not make (`/`, a home)
+    let mine = root.join(MINE).is_file();
+    mine.then(|| walk(root, &mut acc, true));
+    let sessions = dirs_in(root).into_iter().filter(|d| !mine && d.join("state.json").is_file());
+    sessions.flat_map(|s| dirs_in(&s)).filter(|d| ours(d)).for_each(|d| walk(&d, &mut acc, false));
     acc
 }
 
@@ -933,6 +950,18 @@ mod tests {
         drop(lock);
         c.run_tell(1);
         assert!(c.run(1).is_some_and(|r| r.0.told && r.0.done.is_some() && !r.1), "free: told, its done kept");
+    }
+
+    /// A cache hit logs its job on the page once, never for the job that fetched it.
+    #[test]
+    fn a_hit_logs_its_job_once() {
+        let root = crate::scratch::Scratch::new("hits");
+        let mut c = Cache::at(root.to_path_buf(), "t".into());
+        let n = c.alloc(vec![Entry { job: Some(1), ..Entry::default() }], None).expect("alloc");
+        for j in [1, 2, 2, 3] {
+            c.hit_mark(n, j).expect("mark");
+        }
+        assert_eq!(c.st.u[n - 1].hits, [2, 3]);
     }
 
     /// A run queued behind another (`by`) lives while that one's process holds its lock, and ends with it.

@@ -1,8 +1,8 @@
-//! FETCH: the router. `auto` = the ladder (`Plan::ladder`): plain first, then the keyed tiers cheapest first,
-//! Oxylabs and Decodo without JavaScript, then the renders (Bright Data, Oxylabs, Decodo) racing one hedge apart
-//! (`hedge:`, 5 s) while the content check fails. Oxylabs without JS is a page rung: after plain's captcha with both
-//! keys, first with the free fetch off, on every page with its key alone, never after a shell (`Plan::ladder`; Decodo's the same); it also serves a
-//! search, a PDF's bytes and `provider:oxy`.
+//! FETCH: the router. `auto` = the ladder (`Plan::ladder`): plain first, then the keyed tiers cheapest first, Oxylabs
+//! and Decodo without JavaScript, then the renders (Bright Data, Oxylabs, Decodo) racing one hedge apart (`hedge:`,
+//! 5 s) while the content check fails. Oxylabs without JS is a page rung: after plain's captcha with both keys, first
+//! with the free fetch off, on every page with its key alone, never after a shell (`Plan::ladder`; Decodo's the same);
+//! it also serves a search, a PDF's bytes and `provider:oxy`.
 //! The first good body wins and the other call is cancelled, its bill unverified (`billed`). Government hosts skip
 //! Bright Data (it refuses them). A PDF (`pdf_run`) goes plain → Oxylabs without JS → Bright Data for its bytes, never
 //! JavaScript; a `/pdf/` path (`Plan::hint`) only gets the file timeout and raw bytes, page rules otherwise; a zip
@@ -16,7 +16,7 @@ use crate::html::{Node, Tree, py_space};
 use crate::lang::{At, Cmd, Flag, bang, bin, fix, priced, uniq};
 use crate::outline::{fmt_age, is_thin, lost_page};
 use crate::provider::{
-    Ask, Fail, Hit, Limit, PROVIDERS, REFUSED, Raw, SEARCH_TIMEOUT, Tier, pages, search_country, sent, spend,
+    Ask, Fail, Hit, Limit, PROVIDERS, REFUSED, Raw, SEARCH_TIMEOUT, Tier, search_country, sent, spend,
 };
 use crate::settings::limit;
 use std::collections::BTreeMap;
@@ -159,9 +159,9 @@ impl Plan {
     /// plain's wall needs a render (`Check::render_first`: after a JS challenge or shell oxy no-JS served 0/33, after a
     /// 403 or captcha 11/26). With both keys it stays, before the renders, after plain's captcha only
     /// (`Check::no_js_first`: Reddit 25/34 in ~4.4 s for $0.0010, a render $0.0015), or first when plain is off (no
-    /// free verdict to wait for: a page both renders cut at 60 s served without JS in 6.4 s); one try, no site log. Never after
-    /// a shell, the page needs JS (0/3 served, each +$0.0010, +4–10 s), nor after a paid no-JS tier OUR cut stopped:
-    /// the next is the same slow page without JS (oxy 10 s, then decodo 15 s).
+    /// free verdict to wait for: a page both renders cut at 60 s served without JS in 6.4 s); one try, no site log.
+    /// Never after a shell, the page needs JS (0/3 served, each +$0.0010, +4–10 s), nor after a paid no-JS tier OUR cut
+    /// stopped: the next is the same slow page without JS (oxy 10 s, then decodo 15 s).
     /// `provider:oxy` = every tier of that key, without JS first (oxy, oxyjs).
     pub fn ladder(&self, done: &[Hop]) -> Vec<Tier> {
         let pdf = self.pdf_run(done);
@@ -438,10 +438,10 @@ pub fn next(p: &Plan, done: &[Hop], running: &[(Tier, Duration)]) -> Step {
 /// 0/7 vs 3/9 after our cut), never on the site's own status (`Hop::status`: a 5xx page, a wall served as
 /// 503), a wall or a shell (the same answer again), nor in a prefetch (its page fetch covers it), nor a detached
 /// search (`one_call`: it got the retry's time at once, `timeout_of`), nor under the agent's `timeout:` (a hard budget;
-/// a search cut there is not asked again either); inside `cost:` (`next`'s `can`); never with less
-/// time than the call it repeats had (bd-only retries after a 60 s cut got 23.9-30 s under the wall, served 0/5):
-/// the run ends at the first timeout, its row buys more time (`fix_arg`). Never after a page render's own cut (a
-/// `js` row at its 40 s; a search is no render): of 131 served renders 8 took 40-60 s (1 of them read later), 0 longer, so a second render at
+/// a search cut there is not asked again either); inside `cost:` (`next`'s `can`); never with less time than the call
+/// it repeats had (bd-only retries after a 60 s cut got 23.9-30 s under the wall, served 0/5): the run ends at the
+/// first timeout, its row buys more time (`fix_arg`). Never after a page render's own cut (a `js` row at its 40 s; a
+/// search is no render): of 131 served renders 8 took 40-60 s (1 of them read later), 0 longer, so a second render at
 /// twice the time and price buys almost nothing and blocks the run 40-80 s more; that cut ends the run.
 fn retries(p: &Plan, done: &[Hop], h: &Hop) -> bool {
     let keyed = p.ladder(&[]).into_iter().filter(|t| p.keys.contains(t) && t.spec().price > 0.0 && !refused(done, *t));
@@ -854,7 +854,9 @@ pub fn skipped(p: &Plan, hops: &[Hop], subject: &str, id: &str, url: &str) -> Ve
         return Vec::new();
     }
     let left: Vec<Tier> = p.ladder(hops).into_iter().filter(|t| !hops.iter().any(|h| h.tier == *t)).collect();
-    let mut rows = no_key(p, &left, subject, false);
+    // two paid providers lost the page: the site refuses it, a third key is no move (so no `→ fats setup` either)
+    let lost = uniq(hops.iter().filter(|h| !h.ok && h.tier.spec().price > 0.0), |h| h.tier.owner()).len();
+    let mut rows = if lost >= 2 { Vec::new() } else { no_key(p, &left, subject, false) };
     let over: Vec<Tier> = left.into_iter().filter(|t| p.keys.contains(t) && !refused(hops, *t)).collect();
     // the same rule as `next`/`pooled`: a tier the cap stopped (one cut at a search's `wait:` was not); in a batch
     // the cap the agent typed, the other runs' claims read under the pool's lock (who spent it: `budget_row`)
@@ -892,7 +894,7 @@ pub fn keyed() -> Vec<Tier> {
 /// THE `no_key` row (fetch, search, dry, setup, account), one per provider of `left` without a key: what its key
 /// would add to this run and the price, `! no_key bd · would try unblock+JS ≤$0.0015 → fats setup bd` (the key's
 /// one way in: its form, which names the sign-up page; a key in the environment is never sent); `setup` = said
-/// inside `fats setup`: no arrow, `· bd <sign-up>` instead.
+/// inside `fats setup`: what the key adds and its form, no arrow (`offer`).
 pub fn no_key(p: &Plan, left: &[Tier], subject: &str, setup: bool) -> Vec<String> {
     let row = |o: &Tier| {
         let (s, mine) = (o.owner().spec(), left.iter().filter(|t| t.owner() == o.owner()));
@@ -909,16 +911,43 @@ pub fn no_key(p: &Plan, left: &[Tier], subject: &str, setup: bool) -> Vec<String
         if code != "no_key" {
             return bang(subject, code, &format!("{sw} · {what}"), &At { arg, ..At::default() });
         }
+        if setup {
+            return format!("! no_key {}", offer(o.owner()));
+        }
         let what = format!("{} · would try {} ≤${cost:.4}", s.short, buys.join(" + "));
-        let next = if setup { String::new() } else { format!("{} setup {}", bin(), s.short) };
-        let row = Flag { code: "no_key".into(), what, next, row: true }.bang(subject);
-        if setup { row + &pages("no_key", [s.short]) } else { row }
+        let next = fix("no_key", &At { arg: s.short, ..At::default() });
+        Flag { code: "no_key".into(), what, next, row: true }.bang(subject)
     };
     // the tiers without a key, one row a provider (both Oxylabs tiers share one), the cheapest first
     let mut owners = uniq(left.iter().filter(|t| !p.keys.contains(t)), |t| t.owner());
     let cost = |o: &&Tier| spend(left.iter().filter(|t| t.owner() == o.owner()).map(|t| t.spec().price));
     owners.sort_by(|a, b| cost(a).total_cmp(&cost(b)));
     owners.into_iter().map(row).collect()
+}
+
+/// What provider `o`'s key adds, said inside `fats setup` (and `keys`) with no price: an agent relays a bare `≤$X` on
+/// a status row as the price of an answer. Then its form, for the user (`oxy · search + JS pages · fats setup oxy,
+/// 3 steps for the user`); a provider that cannot search says so (`decodo · JS pages, no web search · …`).
+fn offer(o: Tier) -> String {
+    let (b, s) = (bin(), o.spec().short);
+    if Tier::ALL.into_iter().any(|t| t.owner() == o && t.can("search")) {
+        format!("{s} · search + JS pages · {b} setup {s}, 3 steps for the user")
+    } else {
+        format!("{s} · JS pages, no web search · {b} setup {s}")
+    }
+}
+
+/// The move to the key a web search needs first, the cheapest searcher's (`→ fats setup oxy`, `lang::fix`).
+pub fn search_key() -> String {
+    fix("no_key", &At { arg: searchers().first().copied().unwrap_or_default(), ..At::default() })
+}
+
+/// The providers a web search runs on, cheapest first by the price a search there is billed at (a tier's one price
+/// a request, page or search: `billed`): the first is the key to add (`oxy`).
+pub fn searchers() -> Vec<&'static str> {
+    let mut all: Vec<Tier> = Tier::ALL.into_iter().filter(|t| t.can("search")).collect();
+    all.sort_by(|a, b| a.spec().price.total_cmp(&b.spec().price));
+    all.into_iter().map(|t| t.spec().short).collect()
 }
 
 /// The heads of `no_key`'s rows: a provider's key missing, its switch off (`! off oxy · …`), bd's zone missing.
@@ -1638,7 +1667,10 @@ mod tests {
             rows.len() == 1 && rows[0].starts_with(bd),
             "a failed search names the key that could serve it: {rows:?}"
         );
-        assert!(rows[0].ends_with(&format!(" → {} setup bd", bin())), "its key form: {rows:?}");
+        assert!(
+            rows[0].ends_with(&format!(" → run {} setup bd, give the user its 3 lines", bin())),
+            "its key form: {rows:?}"
+        );
     }
 
     fn hop(t: Tier, code: &str) -> Hop {

@@ -88,7 +88,7 @@ Other ways, same release archives:
   `gh attestation verify fatsearch-<target>.tar.xz --repo fatsearch/fatsearch`.
   The archive holds `fats` (`fats.exe`) in a `fatsearch-<target>/` folder; put it anywhere on `PATH`.
 
-Check: `fats --version` prints `= fats <version> · status: fats · agents: fats guide = the manual (~2.0k tok)`.
+Check: `fats --version` prints `= fats <version> · status: fats · agents: fats guide = the manual (~2.1k tok)`.
 
 ## 3. Build from source
 
@@ -102,7 +102,7 @@ cargo install --locked --path .
 Or straight from crates.io, no clone: `cargo install --locked fatsearch`.
 Either compiles BoringSSL once (a few minutes) and installs `fats` (the package is named `fatsearch`).
 If `fats` is not found afterwards, add `~/.cargo/bin` to `PATH` (`. "$HOME/.cargo/env"`).
-Check: `fats --version` prints `= fats <version> · status: fats · agents: fats guide = the manual (~2.0k tok)`;
+Check: `fats --version` prints `= fats <version> · status: fats · agents: fats guide = the manual (~2.1k tok)`;
 `fats help` = the one-screen cheat sheet, `fats guide` = how to use it well.
 
 ## 4. Keys (optional)
@@ -125,7 +125,7 @@ Three ways to give `fats` a key:
   stats, telemetry). Pick a provider, paste its key (shown as `•` and a count); it is
   checked live and saved.
 - **Through an agent, or with no terminal:** `fats setup oxy` (or `bd`, `decodo`, `gh`) prints the dashboard
-  link and a one-time form on `127.0.0.1`, open for 10 minutes. Open it in a browser on the same machine, paste
+  link and a one-time form on `127.0.0.1`, open for 30 minutes. Open it in a browser on the same machine, paste
   the key, press Save. The key never goes through the chat.
 - **No browser (CI, SSH):** pipe the key in: `printf %s "$KEY" | fats setup oxy` (or `bd`, `decodo`, `gh`) reads
   one line, checks it ($0) and saves it. Never type it as an argument: `fats setup oxy <key>` is refused (shell
@@ -156,7 +156,8 @@ This domain is for use in documentation examples without needing permission. …
 
 The first line starts with `=`; ids, timing and token counts vary. `fats` alone prints the status:
 session, cache path, keys, provider health, and `mcp: ready · fats mcp = stdio server, one tool fats(cmd)`.
-Its keys row reads `keys none → fats setup` before setup and like
+Its keys row reads `keys none · search needs oxy or bd (one is enough; oxy = cheapest search) → fats setup oxy`
+before setup (pages need no key; web search needs one) and like
 `keys oxy …6XBR · bd …k2Qf zone <zone> · decodo none · gh none · auth.json` after (each key's last 4 characters).
 
 Check the MCP server without any host (prints two JSON lines: `initialize` and `tools/list`):
@@ -334,7 +335,7 @@ Remove the host entry too: `claude mcp remove fats` (add `--scope user|project` 
 | a CMake error about `ASM_NASM` (Windows) ❓ | NASM missing | install NASM, put it on `PATH` |
 | `fats: command not found` | `~/.cargo/bin` not on `PATH` | `. "$HOME/.cargo/env"`, or use the absolute path |
 | host: server failed to start / `ENOENT` | GUI app without your shell `PATH` | absolute path from `command -v fats` |
-| `keys none → fats setup` (status), or `! no_key oxy · would try … → fats setup oxy` | no key saved; the page needs a provider | any provider's key (section 4); plain pages still work |
+| `keys none · search needs oxy or bd … → fats setup oxy` (status), or `! no_key oxy · would try … → fats setup oxy` | no key saved; the page needs a provider | any provider's key (section 4); plain pages still work |
 | `! no_key oxy · env OXYLABS_WEB_API_KEY …SEDm not imported → fats setup import-env` | a key exported, never sent, none saved | `fats setup import-env` (copies it in) |
 | `env OXYLABS_WEB_API_KEY …SEDm ≠ saved …6XBR · not used · replace: fats setup oxy` | the exported key is not the saved one | nothing, or `fats setup oxy` to replace the saved one |
 | `! bad_key replace the saved key → fats setup` | key rejected | new key from the dashboard (`fats setup oxy`), `fats setup` again |

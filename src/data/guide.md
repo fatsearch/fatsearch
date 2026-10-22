@@ -17,6 +17,8 @@ Reference: github.com/fatsearch/fatsearch docs/reference.md.
 6. pending ≠ failed: `fats u3 wait:30`, free.
 7. Don't dump. full = last resort: to a file, then grep. Never into chat.
 8. Comparing readers? Drill first (cards, full), same char cap both sides. Never outline vs whole page.
+9. No URL? Still the web: a price, "X vs Y", cheapest, news, "what X said", "that page" = `fats <words>`
+   first; never from memory, never ask for a URL. A price or fact: the vendor's / source's own page, never a blog.
 
 ## Commands
 
@@ -33,8 +35,8 @@ fats u1 full        # whole cleaned page, paged
 fats rust async runtime limit:5  # web search: unfetched ids, top one prefetched free; site:docs.rs
 fats gh <words>     # GitHub repos by stars, free
 fats ./x.pdf        # section per page; fats ./page.html too
-fats a b c          # batch: 8 in parallel, one summary; same URL twice = one fetch
-fats stats          # session index, row per fetch: host title provider ms cost tok
+fats a b c          # batch: 8 in parallel, one summary
+fats stats          # session index: a row per fetch, provider ms cost tok
 fats stats full     # + bytes → tokens, numbers lost
 fats                # status: keys, cache, provider health
 fats config         # every setting + its source
@@ -64,14 +66,14 @@ json:true.
 
 ## Keys
 
-Plain pages: none. JS, captchas, walls: user's own key, any one: Oxylabs · Bright Data · Decodo (pages only,
-no web search). Keys live in auth.json only; `fats | grep '^keys'` shows each one's last 4 chars.
+Plain pages: none. Web search, JS, captchas, walls: ONE key: Oxylabs (default) · Bright Data · Decodo (pages
+only, no search). Keys live in auth.json only; `fats | grep '^keys'` shows each one's last 4 chars.
 **Never ask for a key in the chat.**
 
 - `fats setup` = check every key, $0, writes nothing.
-- `fats setup oxy` (or bd, decodo, gh): dashboard link + local form URL. **Give the human that URL**, end your
-  turn, `fats setup` when they say done. No browser (SSH)? They pipe it there: `printf %s "$KEY" | fats setup
-  oxy`, never as an argument.
+- `fats setup oxy` (or bd, decodo, gh): dashboard link + local form URL. **Give the human its 3 lines only**
+  (one provider, no MCP), end your turn, `fats setup` when they say done. SSH? They pipe:
+  `printf %s "$KEY" | fats setup oxy`, never as an argument.
 - `fats setup oxy off` / on: provider off / on; key kept.
 - `fats setup free off` = no free plain fetch (user's IP, paced 1 start/site/s). Say the cost first: every page
   paid, $0.0010–0.0015 a call (dry:true = page's worst).
@@ -80,8 +82,8 @@ no web search). Keys live in auth.json only; `fats | grep '^keys'` shows each on
 
 `fats config` rows build · limits.json = knobs. Try as mod (batch_parallel:8), then env FATS_BATCH_PARALLEL=8,
 or keep: `fats config set batch_parallel 8` (`fats config unset batch_parallel` = default); `fats config` shows
-the source. Useful: batch_parallel (8 lanes, RAM guard), cache_idle_s / cache_ttl_s, read_cap,
-plain_host_pace_ms (home-IP brake: lower only on user's say-so). Per call: hedge: wait: timeout: cost:
+the source. Useful: batch_parallel (8 lanes), cache_idle_s / cache_ttl_s, read_cap, plain_host_pace_ms
+(home-IP brake: lower only on user's say-so). Per call: hedge: wait: timeout: cost:
 
 ## Not yet
 

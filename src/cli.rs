@@ -96,7 +96,7 @@ pub fn run(argv: &[String]) -> (String, i32, Option<String>) {
     let json = json_of(&cmd);
     let mut c = Cache::open();
     // a human on a terminal: `fats` alone = the home screen, help = the help screens (the agent's: status, the card)
-    let human = crate::lang::human(json);
+    let human = *crate::lang::HUMAN.get_or_init(|| crate::lang::human(json));
     let screen = || if argv.is_empty() { Some(stats::home(&c)) } else { crate::lang::help_screen(argv) };
     if let Some(s) = human.then(screen).flatten() {
         return (s, 0, None);
@@ -172,8 +172,7 @@ fn footer(c: &Cache, lines: &[String], show: bool) -> String {
 /// `more` beside a list (the old hint `u1 links more`) is named too: lists page by `from:K`.
 fn ignored(cmd: &Cmd) -> Vec<String> {
     let search = is_search(cmd);
-    let lists = WORDS.lists.iter().copied().chain(["media", "comments"]);
-    let (list, at) = (lists.into_iter().find(|w| cmd.has(w)), cmd.ids.first().map(|i| i.page() + " "));
+    let (list, at) = (paged(cmd), cmd.ids.first().map(|i| i.page() + " "));
     let fix = |w| format!("! ignored more · lists page by from:K → {} {}{w} from:K", bin(), at.unwrap_or_default());
     let more = list.filter(|_| cmd.has("more")).map(fix);
     let row = |(k, v): &(String, String)| {
@@ -418,7 +417,9 @@ fn is_prefetch(r: &Detached) -> bool {
 /// happen today) = the code's own fix.
 fn nothing_searched(s: &Search, what: &str, mut rows: Vec<String>) -> Out {
     let code = if s.plan.keys.is_empty() { "no_key" } else { "budget_hit" };
-    let eq = format!("= ! {code} {what} · no search provider can run · 0ms");
+    let why =
+        if code == "no_key" { "web search needs one key (pages work without)" } else { "no search provider can run" };
+    let eq = format!("= ! {code} {what} · {why} · 0ms");
     let first = if rows.is_empty() { bang("", code, "", &At::default()) } else { rows.remove(0) };
     let mut o = Out::fail(code, eq, first);
     o.warn(rows);
@@ -701,8 +702,9 @@ impl Dry<'_> {
         if let Some(n) = render_of(self.c, u, self.cmd) {
             return format!("{what} = u{n} (rendered, cache) · $0");
         }
-        if let Some((_, age)) = self.c.lookup(u).filter(|_| !self.cmd.fresh()) {
-            return format!("{what} cache hit, cache {} → {} · $0", outline::fmt_age(age), self.to(slot));
+        if let Some((dir, age)) = self.c.lookup(u).filter(|_| !self.cmd.fresh()) {
+            let to = held(self.c, &dir, slot).map_or_else(|| self.to(slot), |n| format!("u{n}"));
+            return format!("{what} cache hit, cache {} → {to} · $0", outline::fmt_age(age));
         }
         // the run already fetching it is waited for (`id_of`), never a second one
         if let Some(n) = running(self.c, u) {
@@ -791,9 +793,14 @@ fn job_read(cmd: &Cmd, c: &mut Cache, j: usize) -> Out {
     o
 }
 
+/// The paged list `cmd` asks for (`from:K`): words.json `lists`, `media`, `comments`.
+fn paged(cmd: &Cmd) -> Option<&'static str> {
+    WORDS.lists.iter().copied().chain(["media", "comments"]).find(|w| cmd.has(w))
+}
+
 /// No page, no URL, no words: what to type; a list word alone names the page it needs (the current one, else u1).
 fn nothing_to_do(cmd: &Cmd, u: usize) -> Out {
-    let (b, list) = (bin(), WORDS.lists.iter().chain(&["media", "comments"]).find(|w| cmd.has(w)));
+    let (b, list) = (bin(), paged(cmd));
     let page = list.map(|w| format!("? {w} needs a page: {b} u{} {w}", u.max(1)));
     Out::ask(&page.unwrap_or(format!("? nothing to do · {b} <url> · {b} u1#2 · {b} u1 <words>")))
 }
@@ -810,16 +817,20 @@ fn dispatch(cmd: &Cmd, c: &mut Cache) -> Out {
     {
         return job_read(cmd, c, j);
     }
-    let one = match (cmd.files.as_slice(), page_url(cmd), cmd.words.is_empty()) {
+    // a page's mod after one URL or file (`fats <url> links`, a bare host's too) reads that page like `fats u3 links`
+    let reads = paged(cmd).is_some() || cmd.has("all") || cmd.has("full");
+    let host = cmd.urls.first().filter(|_| reads && cmd.urls.len() == 1 && cmd.words.is_empty());
+    let one = match (cmd.files.as_slice(), page_url(cmd).or(host.map(String::as_str)), cmd.words.is_empty() && !reads) {
         ([f], None, false) if cmd.urls.is_empty() => Some(local(c, f, cmd)),
         ([], Some(u), false) => Some(fetch(c, Want { url: u, ..Want::default() }, cmd)),
         _ => None,
     };
     if let Some(o) = one {
-        // a document + words: read it, then filter it like `fats u3 <words>`; still running → its `pending`
+        // a document + words or a mod: read it, then filter or list it like `fats u3 …`; still running → `pending`
         let o = merged(o);
+        let new = o.rec.get("cache").and_then(serde_json::Value::as_bool) != Some(true);
         return match (o.rc, c.st.cursor.clone(), o.rec.contains_key("pending")) {
-            (0, Some(cur), false) => dispatch_one(cmd, c, &cur, Id { u: cur.u, ..Id::default() }, true),
+            (0, Some(cur), false) => dispatch_one(cmd, c, &cur, Id { u: cur.u, ..Id::default() }, new),
             _ => o,
         };
     }
@@ -1061,7 +1072,9 @@ fn read(cmd: &Cmd, c: &mut Cache, cur: &Cursor, id: &Id, new: bool) -> Out {
         Ok(if let Some(kind) = WORDS.lists.iter().find(|w| cmd.has(w)) {
             outline::list(p, from, limit, &cmd.words, kind)
         } else if !cmd.words.is_empty() {
-            search::grep(p, &cmd.words, (rung, pinned), id.sec, limit)?
+            // `price\|cost`: its words are filtered, the `=` line says which (`filter "price cost"`)
+            let split = search::unpiped(&cmd.words);
+            search::grep(p, split.as_deref().unwrap_or(&cmd.words), (rung, pinned), id.sec, limit)?
         } else if cmd.has("all") {
             outline::outline_all(p)
         } else if cmd.has("media") {
@@ -1118,7 +1131,7 @@ fn job_view(c: &Cache, j: usize) -> Out {
         return refused("expired", "", &format!("j{j} · its command and pages went after an hour"), &At::default());
     }
     // the page's `stats` row (`stats::page_row`: a result's cached / not fetched, THE liveness rule), in this job
-    let mine = st.u.iter().enumerate().filter(|(_, e)| e.job == Some(j));
+    let mine = st.u.iter().enumerate().filter(|(_, e)| e.in_job(j));
     let rows: Vec<_> = mine.map(|(i, e)| stats::page_row(c, i + 1, e, &format!("j{j}.")).lean).collect();
     let age = outline::fmt_age((now() - job.t).max(0.0));
     // a search's rows are results, fetched or not (`9 pages` for 9 unfetched results)
@@ -1126,7 +1139,7 @@ fn job_view(c: &Cache, j: usize) -> Out {
     let mut lines = vec![format!("= j{j} {} {what} · {age} ago · s:{} · {b} {}", rows.len(), job.session, job.cmd)];
     let next = match rows.len() {
         0 => format!("no pages stored · rerun: {b} {}", job.cmd),
-        _ => format!("open: {b} j{j}.u{}", st.u.iter().position(|e| e.job == Some(j)).map_or(1, |p| p + 1)),
+        _ => format!("open: {b} j{j}.u{}", st.u.iter().position(|e| e.in_job(j)).map_or(1, |p| p + 1)),
     };
     lines.extend(rows);
     lines.push(next);
@@ -1169,7 +1182,9 @@ fn load(c: &Cache, id: &Id) -> Option<Loaded> {
     let e = st.u.get(id.u.checked_sub(1)?)?.clone();
     let (meta, doc) = c.page(&e);
     let pid = if other { id.page() } else { format!("u{}", id.u) };
-    let eq = if other { pid.clone() } else { e.eq(id.u) };
+    // a page this command (or the job typed, `j6.u1`) read from the cache is named under that job
+    let hit = c.job.or(id.job).filter(|j| e.hits.contains(j));
+    let eq = if other { pid.clone() } else { hit.map_or_else(|| e.eq(id.u), |j| format!("j{j}.u{}", id.u)) };
     Some(Loaded { pid, eq, meta, doc, dir: c.dir(&e).unwrap_or_default(), other })
 }
 
@@ -1241,13 +1256,15 @@ fn page_cmd(c: &mut Cache, id: &Id, new: bool, f: impl FnOnce(&Page) -> Result<S
         Ok(s) => s,
         Err(q) => return Some(Out::ask(&q)),
     };
-    // every read's `=` line: a stored page's age, then the page's flags as the last group (`outline::flags`)
+    // every read's `=` line: how the page came (a stored page's age, a fetch's path), then the page's flags last
     if let Some(l) = lines.first_mut().filter(|l| l.starts_with("= ")) {
-        if let Some(a) = age {
-            // once: a head line names it already (`· cache 2m`, `· og cache 2m`)
-            let age = format!("cache {}", outline::fmt_age(a));
-            let age = if l.contains(&format!(" {age}")) { String::new() } else { format!(" · {age}") };
-            l.push_str(&(age + &stale(c, id)));
+        let how = age.map_or_else(|| outline::fetched(&meta), |a| format!("cache {}", outline::fmt_age(a)));
+        // once: a head line names it already (`· cache 2m`, `· og cache 2m`, `· plain 301ms`)
+        if !l.contains(&format!(" {how}")) {
+            l.push_str(&format!(" · {how}"));
+        }
+        if age.is_some() {
+            l.push_str(&stale(c, id));
         }
         l.push_str(&outline::flags(&p));
     }
@@ -1751,15 +1768,26 @@ fn routed(c: &mut Cache, run: &Detached, n: usize, seen: fetch::Seen) -> Done {
     }
     Done { ok, code, cost, warn: fetch::ignored(&ask, &hops, &id).into_iter().collect(), fail: None }
 }
-/// The snapshot indexed under `key` (unless `fresh:true`) as a new id of `url` that points at it: no second
-/// copy, no cost. None = not cached.
+/// The snapshot indexed under `key` (unless `fresh:true`), no second copy, no cost: a hit is a read, so the id this
+/// session already gave that snapshot under this command's job (`= j6.u1`), else a new id of `url` that points at
+/// it (a search result's `slot` is filled). None = not cached.
 fn cached(c: &mut Cache, key: &str, want: Want, cmd: &Cmd) -> Option<Out> {
     if let Some(n) = render_of(c, key, cmd) {
         return Some(outlined(c, n, false, None));
     }
     let (dir, _) = c.lookup(key).filter(|_| !cmd.fresh())?;
+    if let Some(n) = held(c, &dir, want.slot) {
+        let read = c.job_of(&cmd.raw).and_then(|j| c.hit_mark(n, j));
+        return Some(read.map_or_else(cache_write, |()| outlined(c, n, false, want.prov)));
+    }
     let n = reserve(c, Entry { dir, alias: true, ..Entry::default() }, want, cmd);
     Some(n.map_or_else(cache_write, |n| outlined(c, n, false, want.prov)))
+}
+
+/// THE hit rule: the id this session already gave snapshot `dir` (the newest), unless a search result's `slot` is
+/// to be filled. A hit reads it; only a refetch (`fresh:true`, expired) is a new id (doctrine §3).
+fn held(c: &Cache, dir: &str, slot: Option<usize>) -> Option<usize> {
+    c.st.u.iter().rposition(|e| e.dir == dir).filter(|_| slot.is_none()).map(|i| i + 1)
 }
 
 /// THE stored-render rule: `js:true` without `fresh:true` on a URL whose session holds a served render (any id,
@@ -1781,6 +1809,13 @@ fn rendered(m: &Meta) -> bool {
 fn shown(p: &Path) -> String {
     let p = p.to_string_lossy();
     p.strip_prefix(r"\\?\UNC\").map_or_else(|| p.strip_prefix(r"\\?\").unwrap_or(&p).into(), |s| format!(r"\\{s}"))
+}
+
+/// A directory as a key to compare (`mcp::hosts_row`): `shown`, on Windows with `/` as `\` and in lower case
+/// (Claude Code stores one directory as `C:\x`, `C:/x` or `c:/x`; Windows paths ignore case); elsewhere `shown`.
+pub fn dir_key(p: &str) -> String {
+    let p = shown(Path::new(p));
+    if cfg!(windows) { p.replace('/', "\\").to_lowercase() } else { p }
 }
 
 /// A local file (or stdin, `-`) → a new id: the stored snapshot when the same bytes came from the same place

@@ -159,6 +159,12 @@
     ".npmrc", ".pypirc", ".git-credentials", "credentials.json", ".htpasswd"
   ],
   "hosts": [["CLAUDECODE", "claude_code"], ["CODEX_THREAD_ID", "codex"], ["PI_CODING_AGENT", "pi"]],
+  "mcp_hosts": [
+    ["claude", ["~/.claude.json", "./.mcp.json"], "claude mcp add --scope user fats -- {b} mcp"],
+    ["codex", ["CODEX_HOME=~/.codex/config.toml"], "codex mcp add fats -- {b} mcp"],
+    ["cursor", ["~/.cursor/mcp.json", "./.cursor/mcp.json"], "~/.cursor/mcp.json mcpServers.fats"]
+  ],
+  "ssh": ["SSH_CONNECTION", "SSH_TTY"],
   "media": ["image", "images", "img", "photo", "photos", "picture", "pictures", "pic", "pics", "video", "videos"],
   "stop": [
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "was", "what", "how", "much", "does",

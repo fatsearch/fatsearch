@@ -5,6 +5,72 @@ versions: [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Numbers co
 Silicon Mac, one run each unless a range is given; provider results move run to run.
 Method: [docs/benchmarks.md](docs/benchmarks.md).
 
+## 0.2.4 - 2026-10-22
+
+### Changed
+
+- With no key, `fats`, `fats setup` and a web search now say in one line that pages are free and web search needs
+  one key, and which one to set up: `= setup no key · pages free · web search off until one key is saved → fats
+  setup oxy · $0`; the status says `keys none · search needs oxy or bd (one is enough; oxy costs least per search) →
+  fats setup oxy`. Oxylabs is named because its search costs the least. Decodo's row says it reads pages and
+  cannot search.
+- `fats setup` rows for a missing key say what the key adds, without a price: `! no_key oxy · search + JS pages ·
+  fats setup oxy, 3 steps for the user`. Fetch, search and dry rows keep their prices.
+- `fats setup oxy` (or `bd`, `decodo`) prints three numbered steps for the user. The line on pasting the key in a
+  terminal elsewhere is printed only over SSH (`SSH_CONNECTION` or `SSH_TTY` set).
+- With no key, the arrow on those rows reads as a step for the agent when an agent reads them (a pipe,
+  `json:true`, `fats mcp`): `→ run fats setup oxy, give the user its 3 lines`. At a terminal it stays `→ fats setup
+  oxy`, a command for you.
+- `fats status` names the hosts that have `fats` as an MCP server (`mcp: added to claude, cursor · stdio, one tool
+  fats(cmd)`), read from Claude Code, Codex and Cursor config files, or `mcp: not added to claude, codex, cursor ·
+  add: claude mcp add --scope user fats -- fats mcp`. It no longer says `ready` when no host has it. It reads
+  where each host's own `mcp add` writes: Claude Code's user scope, its local scope for the current directory and
+  the project's `.mcp.json`; Codex's `config.toml` under `CODEX_HOME` (default `~/.codex`); Cursor's
+  `~/.cursor/mcp.json` and the project's `.cursor/mcp.json`. A server added for another project does not count.
+- When two paid providers have already failed on a page, `fats` no longer suggests setting up a third provider
+  for it; the row ends with `nothing left to try` or its failure count.
+- The installed skill and `fats guide`: pages work with no key, web search needs one key (Oxylabs by default),
+  and the user gets only the three lines `fats setup oxy` prints. A question whose answer is on the web now (a
+  price, "X vs Y", news, a page with no URL) is searched with `fats <words>`, never answered from memory. The
+  skill opens with it, and a price or a fact comes from the vendor's or source's own page, never a blog about it.
+
+### Fixed
+
+- `fats "rust news" --cards` searched for "rust news cards". A mod typed as a flag after search words now asks
+  instead, without a search: `? --cards is a mod, not a search word · search first: fats rust news · then: fats
+  u1 cards`. The same goes for `--full` and every other mod; `fats u1 --cards` works as before. `--json` has one
+  reading, the output switch, so it becomes `json:true` wherever it stands, as `-v` becomes `verbose:true`.
+- A key form stays open 30 minutes instead of 10: signing up and making a key took longer. `fats setup` shows a
+  form still waiting (`oxy form waiting · 23 min left · <its URL>`) and one whose time ran out (`! form_expired
+  oxy · the link the user got is dead → fats setup oxy · new link, same 3 steps`); the agent's block ends with
+  what to do when the link is dead.
+- `fats <url> links` (and `cards`, `all`, `full`, `media`, `comments`) printed the page's outline and dropped
+  the mod. It now does what `fats u1 links` does on the page the URL names: `= j10.u10 links 785 · open one:
+  fats u10 l<N> · plain 301ms`. A read right after a fetch says how the page came (`plain 301ms`), as a cache
+  read says `cache 2m`.
+- Opening a page that is already in the cache no longer gives it a new id. `fats example.com` twice printed
+  `j5.u5`, then `j6.u6` for the same page; the second is now `= j6.u1 Example Domain · … · cache 15m`: a new
+  job, the same page id, and `fats j6` lists it. `fresh:true` and an expired copy still fetch again under a new
+  id; `dry:true` names the id a cache hit reads (`cache hit, cache 0s → u1 · $0`).
+- `fats u1 'price\|cost'` read the words as a missing file and dropped the page. A `\` now makes a path only at
+  its start (`C:\x`, `.\x`, `..\x`, `~\x`, `\\server\share`), so `u1 a\b` filters for `a\b`. With no page in
+  the command a word holding `\` is still a local path, never sent to a search: `fats 'Documents\pay 2026'`
+  answers `! no_file Documents\pay`. A filter word
+  with `|` or `\|` is split into words; the `=` line names them (`filter "price cost"`).
+- A link that shows only a picture or a count now reads its accessible name (the picture's `alt`, its
+  `aria-label`), so a video grid reads `1.7M · <the caption> [l40]` instead of a bare `1.7M`, and a news card's
+  overlay link puts its id on the headline it covers. Short icon labels (`Share`, `Homepage`) stay out.
+- A thin app page whose served text is a feed (a profile's videos by their captions) now points its `thin` arrow
+  at that section (`→ fats u1#5`) instead of leaving the reader to an app-state island; a thread's comments in a
+  page island still win over a feed.
+- A profile page now reads the same title on every fetch. A render caught before the page set its title printed
+  `NASA`, one caught after printed `NASA (@nasa) | TikTok`. When the title is the page's heading plus
+  one bracketed part (a handle) and the site's name, the row now prints the heading, `NASA`, either way.
+- With `FATS_CACHE` set to a folder you made yourself, `fats` printed `not swept` and `plain - no calls yet` after
+  a page was served from it. The status now counts the pages fats stored there and their calls (`21.4kB · 1
+  pages · 0 searches · not swept (dir not created by fats)`, `plain 1/1 421ms ✓`); fats still deletes nothing
+  in a folder it did not make.
+
 ## 0.2.3 - 2026-10-21
 
 ### Added

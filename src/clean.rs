@@ -365,6 +365,10 @@ struct Render<'a> {
     thread: HashMap<usize, usize>,
     /// A comment's head line while its byline runs: the line its `<time>` lands on ends it (`flush`).
     by: Option<(usize, usize)>,
+    /// The link targets some link names in words (`worded_links`).
+    worded: HashSet<String>,
+    /// Links that show nothing but name a text beside them (a card's overlay): (first line, name, id), `pay`.
+    owed: Vec<(usize, String, usize)>,
 }
 
 /// Text chars under `id` that a page shows; a `<template>` shows none, its contents (the fragment after it) are
@@ -538,7 +542,8 @@ impl Render<'_> {
         self.lines.extend((!t.is_empty() && t != "-" && t != "|" && t != "- |").then_some(Line::T(t)));
     }
 
-    fn link(&mut self, href: &str, text: &str) -> Option<usize> {
+    /// The URL a link lists under (no fragment), none for a same-page, script, mail or skipped one.
+    fn target(&self, href: &str) -> Option<String> {
         let href = py_strip(href);
         if href.is_empty() || ["#", "javascript:", "mailto:", "tel:", "data:"].iter().any(|p| href.starts_with(p)) {
             return None;
@@ -546,9 +551,19 @@ impl Render<'_> {
         let mut j = url::Url::options().base_url(self.base_url.as_ref()).parse(href).ok()?;
         j.set_fragment(None);
         let u = String::from(j);
-        if !u.starts_with("http") || self.base_url.as_ref().is_some_and(|b| b.as_str() == u) || skip_link(&u) {
-            return None;
-        }
+        let same = self.base_url.as_ref().is_some_and(|b| b.as_str() == u);
+        (u.starts_with("http") && !same && !skip_link(&u)).then_some(u)
+    }
+
+    /// The link targets some link names in words (`worded`): a picture linked beside its title is that title's.
+    fn worded_links(&self) -> HashSet<String> {
+        let t = self.tree;
+        let worded = |&a: &usize| t.nodes[a].tag == "a" && worded(&t.texts(a, &LISTS.drop_always).collect::<String>());
+        (0..t.nodes.len()).filter(worded).filter_map(|a| self.target(t.nodes[a].attr("href")?)).collect()
+    }
+
+    fn link(&mut self, href: &str, text: &str) -> Option<usize> {
+        let u = self.target(href)?;
         let (i, a) = self.links.insert_full(u, collapse(text));
         if let Some(a) = a.filter(|a| a.len() > text.len()) {
             self.links[i] = a; // keep the longest
@@ -738,31 +753,78 @@ impl Render<'_> {
 
     /// A link's text, then its `[lN]` when it has text and an href worth listing. A link around blocks (a card's
     /// heading or whole body) flushed them as lines: their text is its text, its id goes on their heading, else on
-    /// the longest that is no paragraph (a title, never a teaser or a button), else the first.
+    /// the longest that is no paragraph (a title, never a teaser or a button), else the first. Its name
+    /// (`accname`) follows its text: `1.7M · <the thumbnail's caption> [l40]`; a link showing nothing whose name
+    /// its parent shows is `owed` to that text.
     fn anchor(&mut self, id: usize, scoped: bool) {
         let blocks = self.inline == 0 && held(self.tree, id, &|n| LISTS.block.contains(&n.tag.as_str()));
         if blocks {
             self.flush();
         }
-        let (b0, l0) = (self.marks.len(), self.lines.len());
+        let (b0, l0, m0) = (self.marks.len(), self.lines.len(), self.media.len());
         self.kids(id, scoped);
         if blocks {
             self.flush();
         }
         let tail = self.marks.get(b0).map_or(String::new(), |&m| self.buf[m..].to_string());
         let text = self.lines[l0..].iter().map(Line::text).chain([tail.as_str()]).collect::<Vec<_>>().join(" ");
-        if py_strip(&text).is_empty() {
+        let name = self.accname(id, m0, &text);
+        let name = if name.is_empty() || py_strip(&text).is_empty() { name } else { format!("{PIECE}{name}") };
+        if py_strip(&text).is_empty() && name.is_empty() {
             return;
         }
-        let Some(i) = self.link(self.tree.nodes[id].attr("href").unwrap_or(""), &text) else { return };
+        let Some(i) = self.link(self.tree.nodes[id].attr("href").unwrap_or(""), &format!("{text}{name}")) else {
+            return;
+        };
+        let near = |p| collapse(&self.tree.texts(p, &LISTS.drop_always).collect::<Vec<_>>().join(" "));
+        if py_strip(&text).is_empty() && self.tree.nodes[id].parent.is_some_and(|p| near(p).contains(&name)) {
+            return self.owed.push((self.lines.len(), name, i));
+        }
         if !blocks {
-            return self.push(&format!(" [l{i}] "));
+            return self.push(&format!(" {name} [l{i}] "));
+        }
+        if self.lines.len() == l0 {
+            self.lines.push(Line::T(String::new())); // a picture alone: its name is the line
         }
         let ls = self.lines[l0..].iter().enumerate();
         let title = ls.clone().filter(|l| !paragraph(l.1.text())).max_by_key(|l| l.1.text().chars().count());
         let at = ls.clone().find(|l| matches!(l.1, Line::H(..))).or(title).map_or(0, |l| l.0);
         let (Line::T(t) | Line::H(_, t)) = &mut self.lines[l0 + at];
-        t.push_str(&format!(" [l{i}]"));
+        *t = collapse(&format!("{t}{name} [l{i}]"));
+    }
+
+    /// An `owed` link's id goes on the first line from its own that shows its name: a card's headline, never
+    /// the name twice.
+    fn pay(&mut self) {
+        for (l0, name, i) in std::mem::take(&mut self.owed) {
+            let line = self.lines.iter_mut().skip(l0).find(|l| l.text().contains(&name));
+            if let Some(Line::T(t) | Line::H(_, t)) = line {
+                t.push_str(&format!(" [l{i}]"));
+            }
+        }
+    }
+
+    /// The name of a link whose text holds no word (a count `1.7M`, an arrow, nothing), in the order of W3C
+    /// accname 1.2 §4.3.2: its `aria-label`, else the `alt` of the pictures it served (`media` from `m0`) in
+    /// page order (a `decorative` one or `alt=""` names nothing), else its
+    /// `title` when it shows nothing; shown when it holds ≥ `name_words` words (a caption: an icon's label,
+    /// `Share this page`, `Homepage`, names no content). A thumbnail grid's caption lives only in the alt.
+    /// Empty when its text names it or another link to its target does in words (an avatar beside its user's
+    /// name, a shop's photo beside the product's title link).
+    fn accname(&self, id: usize, m0: usize, text: &str) -> String {
+        let t = self.tree;
+        let href = t.nodes[id].attr("href").and_then(|h| self.target(h));
+        if worded(text) || href.is_none_or(|h| self.worded.contains(&h)) {
+            return String::new();
+        }
+        let shown = self.media[m0..].iter().map(|&i| &t.nodes[i]).filter(|n| !decorative(n));
+        let mut alts: Vec<&str> = shown.filter_map(|n| n.attr("alt")).collect();
+        alts.dedup();
+        let alt = alts.join(" ");
+        let n = &t.nodes[id];
+        let names = [n.attr("aria-label"), Some(alt.as_str()), n.attr("title").filter(|_| py_strip(text).is_empty())];
+        let name = names.into_iter().flatten().map(collapse).find(|s| !s.is_empty()).unwrap_or_default();
+        if name.split_whitespace().count() >= limit("name_words") { name } else { String::new() }
     }
 
     fn inline_or_block(&mut self, id: usize, scoped: bool, top: bool) {
@@ -803,6 +865,16 @@ impl Render<'_> {
             }
         }
     }
+}
+
+/// A picture hidden from screen readers or marked as decoration (`aria-hidden`, `role=presentation|none`).
+fn decorative(n: &Node) -> bool {
+    n.attr("aria-hidden") == Some("true") || matches!(n.attr("role"), Some("presentation" | "none"))
+}
+
+/// A text holds a word: two letters in a row (`1.7M`, `x4`, `›`, `12` hold none; `user123` does).
+fn worded(text: &str) -> bool {
+    text.chars().zip(text.chars().skip(1)).any(|(a, b)| a.is_alphabetic() && b.is_alphabetic())
 }
 
 /// The `[lN]` link ids in `lines`: (line index, N).
@@ -1053,13 +1125,13 @@ fn ld_media<'a>(obj: &'a Value, base: &str, out: &mut Vec<Media>) {
     }
 }
 
-/// A served `<img>` or a `<video>`'s poster, its alt and declared size; aria-hidden and role=presentation are
-/// decoration. The source is the tag's largest: a `srcset` candidate (its `<picture>`'s too), else a `data-*`
-/// source a script swaps in (named by a `lazy_src` word: the lazy or hi-res copy where `src` is a placeholder or a
-/// thumbnail), else `src`. Demoted: classed as a logo or an icon (`has_word`), or linked elsewhere.
+/// A served `<img>` or a `<video>`'s poster, its alt and declared size; a `decorative` one is none. The source is the
+/// tag's largest: a `srcset` candidate (its `<picture>`'s too), else a `data-*` source a script swaps in (named by a
+/// `lazy_src` word: the lazy or hi-res copy where `src` is a placeholder or a thumbnail), else `src`. Demoted: classed
+/// as a logo or an icon (`has_word`), or linked elsewhere.
 fn body_media(t: &Tree, id: usize, base: &str) -> Option<Media> {
     let (n, page) = (&t.nodes[id], url::Url::parse(base).ok()?);
-    if n.attr("aria-hidden") == Some("true") || n.attr("role") == Some("presentation") {
+    if decorative(n) {
         return None;
     }
     let attr = |k: &str| n.attr(k).unwrap_or_default();
@@ -1261,14 +1333,19 @@ fn rank(cards: (Vec<Media>, usize), t: &Tree, body: &[usize], base: &str, info: 
 /// `fetch::words_of`; `Reddit - The heart of the internet` on every thread; none = a wall's, no suffix = maybe
 /// an error's, `Site Maintenance`) and shares none of its words with the `h1` (its text outside controls:
 /// `tokio - Rust` over `<h1>Crate tokio <button>Copy item path</button></h1>` is the page's own title; `Home -
-/// Away - League` with `<h1>Home</h1>`), else `<title>`.
+/// Away - League` with `<h1>Home</h1>`), else `<title>`. Either title up to its suffix that is the `h1` and one
+/// bracketed qualifier (`NASA (@nasa) | Site` over `<h1>NASA</h1>`: a name and its handle) yields to the `h1`, so
+/// a render caught before its script set the title (the site's name, the same `h1`) reads the same title.
 fn meta_info(t: &Tree) -> Info {
     let mut info = IndexMap::new();
-    let site = matches!(title_head(&t.title), h if h.len() < t.title.len() && words_of(h).len() == 1);
+    let og = t.meta("og:title");
+    let named = og.unwrap_or(&t.title);
+    let site = og.is_none() && matches!(title_head(named), h if h.len() < named.len() && words_of(h).len() == 1);
     let text = |i| collapse(&t.texts(i, &["button", "input", "select"]).collect::<String>());
-    let mine = |h: &String| site && !h.is_empty() && words_of(&t.title).iter().all(|w| !words_of(h).contains(w));
-    let h1 = t.nodes.iter().position(|n| n.tag == "h1").map(text).filter(mine).unwrap_or_else(|| t.title.clone());
-    info.insert("title".into(), t.meta("og:title").unwrap_or(&h1).to_string());
+    let apart = |h: &str| site && words_of(named).iter().all(|w| !words_of(h).contains(w));
+    let mine = |h: &String| !h.is_empty() && (apart(h) || qualified(title_head(named), h));
+    let title = t.nodes.iter().position(|n| n.tag == "h1").map(text).filter(mine);
+    info.insert("title".into(), title.unwrap_or_else(|| named.to_string()));
     for (key, names) in &LISTS.info {
         // an author that is a URL names no one; a description is cut to 300 chars
         let named = |v: &&str| *key != "author" || !v.starts_with("http");
@@ -1281,6 +1358,12 @@ fn meta_info(t: &Tree) -> Info {
         info.insert("price".into(), format!("{price} {cur}"));
     }
     info
+}
+
+/// `head` = `name` and one bracketed qualifier after it (`NASA (@nasa)`, `vitiral (u/vitiral)`).
+fn qualified(head: &str, name: &str) -> bool {
+    let rest = head.strip_prefix(name).unwrap_or_default().trim_start();
+    rest.strip_prefix('(').and_then(|q| q.strip_suffix(')')).is_some_and(|q| !q.contains(['(', ')']))
 }
 
 /// One JSON-LD object fills the `info` keys still missing: author, dates, price, rating.
@@ -1331,10 +1414,14 @@ fn render<'a>(t: &'a Tree, tlen: &'a [usize], base: &str, mode: Mode, js: bool) 
         media: Vec::new(),
         thread: HashMap::new(),
         by: None,
+        worded: HashSet::new(),
+        owed: Vec::new(),
     };
     r.thread = r.comments();
+    r.worded = r.worded_links();
     r.kids(0, false);
     r.flush();
+    r.pay();
     r
 }
 
@@ -1368,6 +1455,7 @@ fn islands(tree: &Tree, r: &mut Render, url: &str) -> Vec<Section> {
     for f in (0..tree.nodes.len()).filter(big).map(|i| i + 1).collect::<Vec<_>>() {
         r.kids(f, false);
         r.flush();
+        r.pay();
         let lines = std::mem::take(&mut r.lines).into_iter().map(|l| match l {
             Line::H(lv, t) => format!("{} {t}", "#".repeat(lv)),
             Line::T(t) => t,
@@ -1596,6 +1684,27 @@ mod tests {
         assert_eq!(docs("Module <span>Widget</span>"), "widget - Lang");
         assert_eq!(docs("<button>Copy item path</button>"), "widget - Lang");
         assert_eq!(docs("Gadget parts for sale"), "Gadget parts for sale");
+    }
+
+    /// Two renders of one profile page: one caught before its script set the title (the site's name and tagline,
+    /// no og:title), one after (`Name (@handle) | Site`). Both read the `h1`; a title that adds words of its own
+    /// to the `h1`, or only a suffix, stays.
+    #[test]
+    fn a_page_reads_one_title_whatever_the_render_timing() {
+        let title = |head: &str, h1: &str| {
+            let h = format!("<head>{head}</head><h1>{h1}</h1><p>Posts and replies</p>");
+            page_info(&parse(&h), "https://a.example/@nasa").0.get("title").cloned().unwrap_or_default()
+        };
+        let early = "<title>Clipsite - Make Your Day</title>";
+        let late = "<title>NASA (@nasa) | Clipsite</title><meta property='og:title' content='NASA (@nasa) | Clipsite'>";
+        assert_eq!((title(early, "NASA"), title(late, "NASA")), ("NASA".into(), "NASA".into()));
+        assert_eq!(title("<title>Cleo Abram (@cleoabram) | Clipsite</title>", "Cleo Abram"), "Cleo Abram");
+        assert_eq!(title("<title>vitiral (u/vitiral) - Forum</title>", "vitiral"), "vitiral");
+        let stays = ["Rytas - Žalgiris - League", "History of Rome - Wiki", "Dune (2021) (film) - Db"];
+        for t in stays {
+            let h1 = t.split(' ').next().unwrap_or_default();
+            assert_eq!(title(&format!("<title>{t}</title>"), h1), t, "{t}");
+        }
     }
 
     /// A TikTok rehydration island as saved (20 lines): Claude 5.5 count_tokens
@@ -1865,6 +1974,33 @@ mod tests {
         assert_eq!(d.links, vec!["https://ex.com/p".to_string()]);
         assert_eq!(d.sections[0].lines, vec!["Price 12 EUR [l1]".to_string()]);
         assert_eq!((d.mode.as_str(), d.loss.vs_light_lost), ("clean", 1)); // "2026" sat in the footer: 1 of 5
+    }
+
+    /// A link whose text holds no word reads its accessible name (W3C accname): a thumbnail's caption in its alt
+    /// after the count it shows, an `aria-label`, a `title` only when it shows nothing; a card's overlay link puts
+    /// its id on the headline that shows its name. Never an icon's short label, a decorative picture, a picture
+    /// beside a text link to the same target, nor a link that names itself.
+    #[test]
+    fn a_picture_link_reads_its_accessible_name() {
+        let h = "<h1>Videos</h1><div><a href='/v/1'><div><img alt='Crew-13 reaches the ISS this week'></div>\
+             <div><strong>1.7M</strong></div></a></div>\
+             <p>See <a href='/v/2' aria-label='The full launch video in HD'><img alt=''></a></p>\
+             <div><a href='/p/3'><img alt='Red wool winter coat for women'></a><a href='/p/3'>Red coat</a></div>\
+             <div><a href='/share'><img alt='Share this page'></a><a href='/v/5'><img role=presentation alt='a b c d'></a></div>\
+             <p><a href='/docs'><img alt='a small book icon here'> Read the docs</a></p>\
+             <p><a href='/x25' title='The X.25 protocol for packet networks'>X.25</a></p>\
+             <div><a href='/n/7' aria-label='Storm closes the harbour for two days'></a><img alt='Waves'>\
+             <h3>Weather</h3><p>Storm closes the harbour for two days</p></div>";
+        let d = build_doc(&parse(h), "https://ex.com/", "https://ex.com/", false);
+        let want = [
+            "1.7M · Crew-13 reaches the ISS this week [l1]",
+            "See The full launch video in HD [l2]",
+            "Red coat [l3]",
+            "Read the docs [l4]",
+            "X.25 [l5]",
+            "Storm closes the harbour for two days [l6]",
+        ];
+        assert_eq!(d.sections.iter().flat_map(|s| &s.lines).collect::<Vec<_>>(), want);
     }
 
     /// A `<button>`'s text is on screen (trivago's hotel cards are buttons: 44 facts were dropped blind); a

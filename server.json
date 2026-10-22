@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://fatsearch.com",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "packages": [
     {
       "registryType": "cargo",
       "identifier": "fatsearch",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "transport": {
         "type": "stdio"
       },
@@ -34,7 +34,7 @@
     {
       "registryType": "npm",
       "identifier": "fatsearch",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

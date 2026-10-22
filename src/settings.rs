@@ -3,10 +3,9 @@
 //! its own way can disagree with it. A refused value is never silent: it prints a `!` row and shows in `config`.
 
 use crate::telemetry::Level;
-use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf, absolute};
 use std::sync::{LazyLock, OnceLock};
+use std::{collections::BTreeMap, env::home_dir, ops::RangeInclusive};
 
 /// A value and its source (`env FATS_X`, `default`).
 pub struct Set<T> {
@@ -61,7 +60,7 @@ pub fn get() -> &'static Settings {
 }
 
 /// Env `k` as settings read it: empty = unset; unit tests read none.
-fn env(k: &str) -> Option<String> {
+pub fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty() && !cfg!(test))
 }
 
@@ -390,7 +389,7 @@ fn load(env: &dyn Fn(&str) -> Option<String>) -> Settings {
     let cache = system_dir(env, "LOCALAPPDATA", dirs::cache_dir).unwrap_or_else(std::env::temp_dir).join("fatsearch");
     // made absolute once (a relative dir is the cwd's at start); `~/…` no shell expanded, a dir fats can't make
     // (a host started in `/`) and one holding the keys (a sweep deletes in it) are refused for the default
-    let safe = |v: &str, p: &PathBuf| !v.starts_with('~') && p.parent().is_some() && dirs::home_dir() != Some(p.into());
+    let safe = |v: &str, p: &PathBuf| !v.starts_with('~') && p.parent().is_some() && home_dir() != Some(p.into());
     let safe = |v: &str, p: &PathBuf| safe(v, p) && !key_dir.value.starts_with(p) && !p.starts_with(&key_dir.value);
     let ok = |v: &str| absolute(v).ok().filter(|p| safe(v, p) && crate::cache::private_root(p, false));
     let cache =
@@ -613,8 +612,8 @@ pub(crate) mod tests {
                 ("check", 86),
                 ("sites", 69),
                 ("clean", 186),
-                ("words", 1608),
-                ("limits", 53),
+                ("words", 1613),
+                ("limits", 55),
                 ("telemetry", 10)
             ]
         );
