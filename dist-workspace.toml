@@ -39,6 +39,11 @@ publish-jobs = ["homebrew", "npm"]
 
 # The Linux builds run on ubuntu-22.04 and link glibc 2.35 symbols (`strings fats | grep GLIBC_2.`); dist's
 # default floor is 2.31, so the npm and shell installers would install a binary that cannot start on 2.31–2.34.
+# GitHub retired the macos-14 image on 2026-11-02; dist 0.33 still names it for arm64 macOS (0.2.5's first
+# Release run: that job cancelled before a runner took it). Intel macOS already runs on macos-15-intel.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 [dist.min-glibc-version]
 "*" = "2.35"
 
