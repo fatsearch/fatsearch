@@ -364,10 +364,10 @@ fn one_key(api: Api, req: &Value, target: &str) -> Option<Reply> {
             "<html><head><title>Just a moment...</title></head><body></body></html>".into()
         }
         t if t.contains("/k-sh") && (api == Api::BdRequest || !render) => shell.into(),
-        // `/k-sh400`: the Oxylabs render refuses the target (its RFC 9457 400); `/k-shfault`: its
-        // own retries gave up (500 `faulted`)
-        t if t.contains("/k-sh400") || t.contains("/k-shfault") => {
-            let (status, body) = if t.contains("/k-sh400") {
+        // `/k-sh400`: the Oxylabs render refuses the target (its RFC 9457 400), `/k-refuse`: Oxylabs refuses it with or
+        // without JS; `/k-shfault`: its own retries gave up (500 `faulted`)
+        t if t.contains("/k-sh400") || t.contains("/k-shfault") || t.contains("/k-refuse") && api == Api::OxyScrape => {
+            let (status, body) = if !t.contains("/k-shfault") {
                 (
                     400,
                     r##"{"title":"INVALID_BODY_PROPERTY","errors":[{"detail":"Value not supported.","pointer":"#/url"}]}"##,
@@ -377,13 +377,18 @@ fn one_key(api: Api, req: &Value, target: &str) -> Option<Reply> {
             };
             return Some(Reply { status, headers: vec![], body: body.into() });
         }
-        // `/k-sherr`: Bright Data's shell, the Oxylabs render's first call a 500 (Instagram)
-        t if t.contains("/k-flaky") || t.contains("/k-sherr") => {
+        // `/k-sherr`: Bright Data's shell, the Oxylabs render's first call a 500 (Instagram); `/k-limit`: Oxylabs' rate
+        // limit with a 1 s `retry-after` and the key's cap, the next call served, every call on `/k-limit2`
+        t if t.contains("/k-flaky") || t.contains("/k-sherr") || t.contains("/k-limit") && api == Api::OxyScrape => {
             let mut seen = FLAKY.lock().unwrap_or_else(|e| e.into_inner());
             let call = format!("{api:?}{render}{t}");
-            if !seen.contains(&call) {
+            if !seen.contains(&call) || t.contains("/k-limit2") {
                 seen.push(call);
-                return Some(Reply { status: 500, headers: vec![], body: b"upstream".to_vec() });
+                let n = |end: &str| format!("x-ratelimit-internal_total_default-{ACCT}-{end}");
+                let cap = h(&[("retry-after", "1"), (&n("limit"), "10"), (&n("remaining"), "0")]);
+                let rate = br#"{"status":429,"title":"RATE_LIMIT_EXCEEDED"}"#.to_vec();
+                let r = if t.contains("/k-limit") { (429, cap, rate) } else { (500, vec![], b"upstream".to_vec()) };
+                return Some(Reply { status: r.0, headers: r.1, body: r.2 });
             }
             page
         }
@@ -1040,8 +1045,12 @@ fn oxylabs_budget_is_two_numbers() {
     let status = go("");
     assert!(status.contains("\noxy limits 250 scrape · 10 search\n"), "{status}");
     for (cmd, row) in [
-        ("burst now provider:oxy", "! rate_limited oxy retry in 7s → "),
-        ("https://ex.com/burst provider:oxy js:true", "! rate_limited oxy retry in 5s → "),
+        // a pause past `wait:` is no retry: the limit is the answer, its cap beside the wait
+        ("burst now provider:oxy wait:6", "! rate_limited oxy cap 10 on this account · retry in 7s → "),
+        (
+            "https://ex.com/burst provider:oxy js:true wait:4",
+            "! rate_limited oxy cap 250 on this account · retry in 5s → ",
+        ),
     ] {
         let out = go(cmd);
         let rows: Vec<&str> = out.lines().skip(1).filter(|l| l.contains(" ! ") || l.starts_with('!')).collect();
@@ -2245,7 +2254,7 @@ fn setup_checks_the_saved_keys_and_writes_nothing() {
 }
 
 /// An old key in the environment is never sent: with no Oxylabs key saved, a page asked of Oxylabs is `no_key`, the
-/// move `fats setup oxy`, and status says the key is none.
+/// move `fats setup import-env` (the env's row), and status says the key is none.
 #[test]
 fn an_env_key_is_never_sent() {
     let _l = lock();
@@ -2255,7 +2264,8 @@ fn an_env_key_is_never_sent() {
     let js = JS.load(Ordering::SeqCst);
     let out = run(&format!("{}/k-wall-env provider:oxy fresh:true wait:30", walled()));
     let b = fats::lang::bin();
-    assert!(out.contains(" ! no_key ") && out.contains(&format!(" → {b} setup\n")), "{out}");
+    let env = format!(" ! no_key oxy · env OXYLABS_WEB_API_KEY …Vz5J not imported → {b} setup import-env\n");
+    assert!(out.contains(&env), "the env's key is the move, never sent: {out}");
     assert!(!out.contains("oxy✓") && !out.contains("oxyjs✓") && JS.load(Ordering::SeqCst) == js, "{out}");
     let status = run("");
     assert!(status.contains("\nkeys oxy none · bd … zone "), "{status}");
@@ -2682,7 +2692,10 @@ fn any_one_key_gets_the_page() {
         assert!(*page != "k-sherr" || out.contains(" fresh:true provider:oxy js:true ≤$0.0015"), "{out}");
         let missing = [("oxy", "provider:bd"), ("bd", "provider:oxy")].iter().find(|k| k.0 == *keys);
         let missing = missing.map_or("no hint is missing", |k| k.1);
-        assert!(!out.contains(missing), "a hint names the missing key's provider: {keys} {page}: {out}");
+        // only behind its own key's move: `setup oxy, give the user its 3 lines, then … provider:oxy`
+        let lead = missing.replace("provider:", " setup ");
+        let named = out.lines().all(|l| !l.contains(missing) || l.contains(&lead));
+        assert!(named, "a hint names the missing key's provider: {keys} {page}: {out}");
         if (*keys, *page) == ("bd", "k-shell") {
             // a failed run names the key that could still render it, never "nothing left"
             let oxy = "! no_key oxy · would try JS render ≤$0.0015";
@@ -2719,13 +2732,17 @@ fn any_one_key_gets_the_page() {
 fn a_settled_render_is_never_asked_again() {
     let _t = lock();
     let w = walled();
-    for (page, why) in [("k-sh400", "oxyjs 400 url: value not supported"), ("k-shfault", "oxyjs 500 faulted: request")]
-    {
+    // a refusal of the URL (400 `#/url`) and an own retry given up (`faulted`)
+    let open = format!(" → nothing left to try · open {w}/k-sh400 in a browser");
+    for (page, code, why, end) in [
+        ("k-sh400", "provider_refused", "oxyjs 400 url: value not supported", open.as_str()),
+        ("k-shfault", "provider_error", "oxyjs 500 faulted: request", " · failed 1/1 here"),
+    ] {
         let out = run(&format!("{w}/{page} provider:auto fresh:true wait:30"));
         clean(&out);
-        let row = out.lines().find(|l| l.starts_with("u") && l.contains(" ! provider_error ")).unwrap_or_default();
-        // no provider move left, and two paid providers lost it: no third key offered, the count ends the row
-        assert!(row.contains(why) && row.ends_with(" · failed 1/1 here") && !out.contains("no_key"), "{page}: {out}");
+        let row = out.lines().find(|l| l.starts_with("u") && l.contains(&format!(" ! {code} "))).unwrap_or_default();
+        // no provider move left, and two paid providers lost it: no third key offered, the end of the row
+        assert!(row.contains(why) && row.ends_with(end) && !out.contains("no_key"), "{page}: {out}");
         assert!(!out.contains("provider:oxy"), "{page}: no arrow names oxy, oxyjs and bd spent: {out}");
         let stats = run("stats full");
         assert!(stats.contains(&format!("(not charged, {}", &why[6..])), "{page}: {stats}");
@@ -3037,7 +3054,7 @@ fn https_refused_moves_to_http_once() {
     clean(&cert);
     // http refused as well (a 403 there): the ladder on the https URL as before, no http arrow
     let both = run(&format!("{} wait:30", walled().replacen("http://", "https://", 1) + "/k-sh400"));
-    assert!(both.contains("plain:connect_failed✗") && both.contains("oxyjs:provider_error✗"), "{both}");
+    assert!(both.contains("plain:connect_failed✗") && both.contains("oxyjs:provider_refused✗"), "{both}");
     assert!(!both.contains("→ fats http:") && !both.contains(" http://127"), "the http move was tried: {both}");
     assert!(written().contains("\"why\": \"tls:wrong-version-number+http:403\""), "what http answered: {both}");
     clean(&out);
@@ -3133,4 +3150,94 @@ fn weekly_summary_holds_no_input() {
         "{text}"
     );
     assert!(w["codes"]["provider_error"].as_u64() >= Some(1) && w["tier"]["oxy"]["ok"].as_u64() >= Some(1), "{text}");
+}
+
+/// The id a fetch's `=` line names (`= j4.u4 …` → `u4`).
+fn id_of(out: &str) -> String {
+    out.split(' ').nth(1).and_then(|j| j.split('.').nth(1)).unwrap_or_default().to_string()
+}
+
+/// A provider that refuses the URL itself (Oxylabs' 400 on `#/url`) is no wall and no cost question: its other
+/// tier is never asked, a keyed provider on the ladder fetches the page in the same run; a pinned one, or one
+/// switched off or keyless, is the row's move: the arrow turns it on or adds it, then fetches again.
+#[test]
+fn a_refusal_goes_to_the_next_provider() {
+    let _l = lock();
+    keys(&[("oxy", OXY), ("bd", BD)]);
+    let (w, b) = (walled(), fats::lang::bin());
+    assert!(run("setup free off").starts_with("= setup free off"));
+    let out = run(&format!("{w}/k-refuse-on"));
+    assert!(run("setup free on").starts_with("= setup free on"));
+    assert!(out.contains(" · oxy:provider_refused✗$0 (not charged) bd✓ ") && out.contains("One Key Page"), "{out}");
+    let refused = |cmd: &str| {
+        let js = JS.load(Ordering::SeqCst);
+        let out = run(cmd);
+        let id = id_of(&out);
+        assert!(out.contains(" · tried oxy:provider_refused✗$0 (not charged) · "), "{out}");
+        assert_eq!(JS.load(Ordering::SeqCst), js, "no render asked after the refusal: {out}");
+        let row = out.lines().find(|l| l.starts_with(&format!("{id} ! "))).unwrap_or_default().to_string();
+        (row, id)
+    };
+    let (row, id) = refused(&format!("{w}/k-refuse-pin provider:oxy"));
+    let head = format!("{id} ! provider_refused oxy 400 url: value not supported → ");
+    assert_eq!(row, format!("{head}{b} {id} fresh:true provider:bd ≤$0.0015"));
+    assert!(run("setup bd off").starts_with("= setup bd off"));
+    let (row, id) = refused(&format!("{w}/k-refuse-off provider:oxy"));
+    assert!(run("setup bd on").starts_with("= setup bd on"));
+    let head = format!("{id} ! provider_refused oxy 400 url: value not supported → ");
+    assert_eq!(row, format!("{head}{b} setup bd on, then {b} {id} fresh:true provider:bd ≤$0.0015"));
+    keys(&[("oxy", OXY)]);
+    let (row, id) = refused(&format!("{w}/k-refuse-nokey provider:oxy"));
+    let head = format!("{id} ! provider_refused oxy 400 url: value not supported → ");
+    let then = format!("then {b} {id} fresh:true provider:bd ≤$0.0015");
+    assert_eq!(row, format!("{head}run {b} setup bd, give the user its 3 lines, {then}"));
+}
+
+/// A provider switched off is never `no_key`: asked for by name, its run tries nothing and says `! off` with the
+/// switch that turns it on; a missing key the environment holds names `import-env`, else the key's setup.
+#[test]
+fn off_is_never_no_key() {
+    let _l = lock();
+    keys(&[("oxy", OXY), ("bd", BD)]);
+    let (w, b) = (walled(), fats::lang::bin());
+    let row = |out: &str| out.lines().nth(1).unwrap_or_default().to_string();
+    assert!(run("setup bd off").starts_with("= setup bd off"));
+    let out = run(&format!("{w}/k-off provider:bd"));
+    assert!(run("setup bd on").starts_with("= setup bd on"));
+    let id = id_of(&out);
+    assert!(out.contains(&format!(".{id} ! off · 127.0.0.1 · tried - · ")), "{out}");
+    assert_eq!(row(&out), format!("{id} ! off bd · turned off (key kept) → {b} setup bd on"));
+    keys(&[("oxy", OXY)]);
+    let mut env = Env::default();
+    env.set("BRIGHTDATA_API_KEY", Some("bdEnvK3y-9cXbN3Lq7Vz5J"));
+    let out = run(&format!("{w}/k-env provider:bd"));
+    drop(env);
+    let id = id_of(&out);
+    assert_eq!(
+        row(&out),
+        format!("{id} ! no_key bd · env BRIGHTDATA_API_KEY …Vz5J not imported → {b} setup import-env")
+    );
+    let out = run(&format!("{w}/k-none provider:bd"));
+    let id = id_of(&out);
+    let want =
+        format!("{id} ! no_key bd · would try unblock+JS ≤$0.0015 → run {b} setup bd, give the user its 3 lines");
+    assert_eq!(row(&out), want);
+}
+
+/// A rate limit that says when (`retry-after`) is a wait, not a no: one retry of the same call after the pause when
+/// it ends inside `wait:`, the tried path shows both calls; a second limit is the row, naming the key's cap.
+#[test]
+fn a_rate_limit_is_retried_once_inside_the_wait() {
+    let _l = lock();
+    keys(&[("oxy", OXY)]);
+    let (w, b) = (walled(), fats::lang::bin());
+    let out = run(&format!("{w}/k-limit1 provider:oxy"));
+    assert!(out.contains(" · oxy:rate_limited✗$0 (not charged) oxy✓ ") && out.contains("One Key Page"), "{out}");
+    let (out, rc) = run_rc(&format!("{w}/k-limit2 provider:oxy"));
+    let id = id_of(&out);
+    assert!(out.contains(" · tried oxy:rate_limited✗$0 (not charged) oxy:rate_limited✗$0 (not charged) · "), "{out}");
+    let row = format!(
+        "{id} ! rate_limited oxy cap 10 on this account · retry in 1s → {b} {id} fresh:true ≤$0.0025 · last try not charged"
+    );
+    assert_eq!((out.lines().nth(1).unwrap_or_default(), rc), (row.as_str(), 1), "{out}");
 }

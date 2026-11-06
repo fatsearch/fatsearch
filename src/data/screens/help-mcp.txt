@@ -2,6 +2,10 @@
 
 fats mcp starts the agent connection (an MCP server with one tool, `fats`). Add it once:
 
+  fats setup mcp claude    does it for you (or codex, cursor) · fats setup mcp = where it is added
+
+or by hand:
+
   Claude Code   claude mcp add --scope user fats -- fats mcp
   Codex         codex mcp add fats -- fats mcp
   Cursor        ~/.cursor/mcp.json: { "mcpServers": { "fats": { "command": "fats", "args": ["mcp"] } } }

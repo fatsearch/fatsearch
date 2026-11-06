@@ -1,7 +1,7 @@
 {
   "reserved": [
     "more", "up", "all", "full", "json", "guide", "help", "stats", "links", "config", "account", "status", "version",
-    "routes", "setup", "media", "comments", "cards", "telemetry"
+    "routes", "setup", "media", "comments", "cards", "telemetry", "raw", "headers"
   ],
   "lists": ["links", "cards"],
   "alone": ["status", "version", "routes", "setup", "account", "guide", "help", "telemetry"],
@@ -158,11 +158,12 @@
     ".env", ".env.*", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "authorized_keys", "known_hosts", ".netrc",
     ".npmrc", ".pypirc", ".git-credentials", "credentials.json", ".htpasswd"
   ],
+  "secret_headers": ["set-cookie", "cookie", "authorization", "proxy-authorization", "www-authenticate"],
   "hosts": [["CLAUDECODE", "claude_code"], ["CODEX_THREAD_ID", "codex"], ["PI_CODING_AGENT", "pi"]],
   "mcp_hosts": [
-    ["claude", ["~/.claude.json", "./.mcp.json"], "claude mcp add --scope user fats -- {b} mcp"],
-    ["codex", ["CODEX_HOME=~/.codex/config.toml"], "codex mcp add fats -- {b} mcp"],
-    ["cursor", ["~/.cursor/mcp.json", "./.cursor/mcp.json"], "~/.cursor/mcp.json mcpServers.fats"]
+    ["claude", ["CLAUDE_CONFIG_DIR=~/.claude.json", "./.mcp.json"], "claude mcp add --scope user fats -- {b} mcp", "Claude Code"],
+    ["codex", ["CODEX_HOME=~/.codex/config.toml"], "codex mcp add fats -- {b} mcp", "Codex"],
+    ["cursor", ["~/.cursor/mcp.json", "./.cursor/mcp.json"], "", "Cursor"]
   ],
   "ssh": ["SSH_CONNECTION", "SSH_TTY"],
   "media": ["image", "images", "img", "photo", "photos", "picture", "pictures", "pic", "pics", "video", "videos"],

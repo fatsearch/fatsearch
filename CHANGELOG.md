@@ -5,6 +5,90 @@ versions: [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Numbers co
 Silicon Mac, one run each unless a range is given; provider results move run to run.
 Method: [docs/benchmarks.md](docs/benchmarks.md).
 
+## 0.2.5 - 2026-11-06
+
+### Fixed
+
+- On Windows, a finished run's `~ u2 failed · http_500` line shows once and is not printed again with the next
+  command, and `fats setup oxy` hands an agent's shell back at once instead of holding it while the key form waits.
+- When Oxylabs refuses a URL itself (`400 url: value not supported`), fats asks Bright Data in the same run when
+  its key is saved and on, and never asks Oxylabs' JavaScript tier for the same URL. With Bright Data turned off the
+  row says `→ fats setup bd on, then fats u4 fresh:true provider:bd ≤$0.0015`: the provider by name and the most it
+  can cost; with no Bright Data key, its setup, then the page again. Oxylabs' `400 location: …` refuses the country
+  you sent, not the URL: the same page from another country is still offered.
+- A provider you turned off is never reported as a missing key. `provider:bd` with Bright Data off says
+  `! off bd · turned off (key kept) → fats setup bd on`; a key only in your environment says `! no_key bd · env
+  BRIGHTDATA_API_KEY …Vz5J not imported → fats setup import-env`, and the status line's arrow says the same.
+- A rate limit that says when to retry (`retry-after`, or Oxylabs' 5 s) is retried once when the pause ends inside
+  `wait:` (30 s by default); the tried path shows both calls. If the retry is limited too, the row names the
+  account's cap: `! rate_limited oxy cap 10 on this account · retry in 5s → fats u8 fresh:true`.
+- The status line's `mcp:` row names the add command after `· add:`, only for the agents fats is not added to yet;
+  with no key saved the one arrow is `fats setup oxy`.
+- `fats u1 full > page.md` writes the whole cleaned page in one answer (`= j1.u1 full · 47.5ktok · up fats u1`), so
+  `rg` on the file works; before, the file got one part (`part 1/51`) and the rest took 50 `fats more` calls.
+  `json:true` gets the whole text too. A terminal, a pipe and `fats mcp` still read it a part at a time, and the `=`
+  line names the file move: `= j1.u1 full · part 1/51 · up fats u1 · whole: fats u1 full > page.md`. A `fats more`
+  after a whole `full` says `full complete`. Part 1 of a page whose text is one long line now holds the heading and
+  the first piece of that line, not the heading alone.
+- `fats setup mcp claude` says `added` only once Claude Code's own file holds fats; a `claude mcp add` that exits 0
+  and writes nothing is `! host_failed claude · … ran claude mcp add …, fats not in ~/.claude.json`, exit 1. Claude
+  Code's file is read under `CLAUDE_CONFIG_DIR` when that is set.
+- A refused `fats config` or `fats setup` change prints its `=` line first (`= ! refused config set chunk 99999 ·
+  $0`), then the row, as every failed command does.
+- `fats setup oxy stop` that cannot remove the waiting form's file says `! cache_write setup oxy · <file>: <error>`,
+  exit 1, never `form stopped` while the form still answers.
+- A `.` path with `from:` on a page that is no list says `! ignored from:K`, as a plain filter word does.
+- A JSON path with a second `[]` is refused (`? u1 .a[].b[] · one [] per path`), never read as `.`; one value is
+  one row, with no `(end of …)` row under it.
+- The setup screen after a pasted key reads `✓ Oxylabs works · … · key …0123 saved`, the same order as the pipe.
+- A search word with a colon goes to the search as typed: `fats "discord embed og:image animated gif"` searches,
+  where it printed only `? og: unknown · keys …`; so do `schema:org` and any `word:word` that names no mod. A mod
+  one letter off (`wiat:30`, `jsn:true`) still asks, and beside a page id (`fats u1 og:image`) a `key:` can only
+  be a mod, so an unknown one asks there too.
+- A table built from `div`s with ARIA roles (`role=row`, `cell`, `gridcell`, `columnheader`, `rowheader`), as
+  documentation sites render them, reads as a table, one row a line: `| Plan | Traffic, GB | Total req/s |`; before,
+  every cell was its own line and no row said which number belonged to which plan. A page cached by an earlier
+  version is rebuilt from its saved copy.
+
+### Added
+
+- `fats u1 raw` prints one `=` line with the stored body's kind and size and the line to grep it:
+  `= u1 raw · html 412kB · grep: rg <re> <cache>/u1/raw.html`. `fats u1 headers` prints the served answer's
+  status line (`HTTP 200`), then its headers as kept at fetch time, never one that carries a credential
+  (`set-cookie`, `cookie`, `authorization`, `proxy-authorization`, `www-authenticate` are not stored). Both read the cache only, $0; a failed fetch
+  that kept no body says `? u1 raw · no body kept (failed fetch)`.
+- `fats setup mcp claude` (or `codex`, `cursor`) connects fats to your agent for you: it runs `claude mcp add` /
+  `codex mcp add` with the full path of this `fats`, or writes `~/.cursor/mcp.json` keeping your other servers, and
+  says what it did: `= setup mcp claude added · claude mcp add --scope user fats -- /opt/homebrew/bin/fats mcp ·
+  $0`. Without Claude Code or Codex installed it says so and prints the line to type (`! no_host claude`), never a
+  success, nor when the host's command ran but its file holds no fats (`! host_failed`); `dry:true` changes nothing; `fats setup mcp` alone shows where fats is added. The setup menu's Agent
+  connection screen has an `Add to Claude Code` / `Codex` / `Cursor` button for each, marked `added ✓` once done.
+- `fats setup oxy stop` (or `bd`, `decodo`, `gh`) ends a key form that is still waiting, so its link stops working:
+  `= setup oxy form stopped · $0`, or `= setup oxy no form waiting · $0`. The setup menu shows a `Stop the waiting
+  form` button on that provider's screen while the form waits, and the lines `fats setup oxy` prints for an agent
+  end with this command.
+
+### Security
+
+- `allow_private` and `cache` are env-only now: set `FATS_ALLOW_PRIVATE=1` or `FATS_CACHE=<dir>` in the environment
+  of the host that runs `fats`. `fats config set` refuses both, in a terminal and under `fats mcp`: `= ! env_only
+  config set allow_private true · $0`, then `! env_only allow_private · set FATS_ALLOW_PRIVATE=1 in the host's env,
+  never from a tool call`. A value an older `fats` saved in `settings.json` is ignored, and `fats config` says so on
+  one row with the way out: `! env_only settings.json allow_private · ignored → fats config unset allow_private`
+  (`unset` is allowed: it only removes the stored value).
+- Under `fats mcp`, a tool call can no longer switch a provider on or off (`setup <name> on|off`), change telemetry
+  or lower the home-IP brake (`plain_host_pace_ms`), neither with `config set` nor with a per-call mod
+  (`fats example.org plain_host_pace_ms:0` is refused; a higher value still runs): `! not_under_mcp … · run it in a
+  terminal`. Speed settings (`wait`, `batch_parallel`, `country`, …) are still set from a tool call.
+- A redirect to a host name that resolves only to private addresses is refused at that hop (`! private_address`,
+  $0), as the first URL already was.
+- The free fetch (`plain`, your own connection) no longer goes through a proxy set in `HTTP_PROXY`, `HTTPS_PROXY`
+  or `ALL_PROXY` (any case): through one, the proxy resolved the names, so a redirect to a private host name could
+  get through. `fats` and `fats config` say so on one line when one is set: `proxy env ignored on plain (your own
+  connection); paid tiers are the proxies`. Provider calls still use the proxy.
+- `fats uN headers` never stores or prints a site's session cookie or an auth header (list above).
+- Dependency bumps for RUSTSEC-2026-0414/0433 (pulldown-cmark 0.13.6), RUSTSEC-2026-0391 (zstd 0.13.4 / 0.14.3) and
+  the tokio `AsyncFd` unsoundness note (tokio 1.53.3); none was reachable from `fats`.
 ## 0.2.4 - 2026-10-22
 
 ### Changed
@@ -36,6 +120,9 @@ Method: [docs/benchmarks.md](docs/benchmarks.md).
 
 ### Fixed
 
+- `fats setup` run by an agent with no key saved listed Oxylabs, Bright Data and Decodo as three equal
+  choices. It now prints one row, the key to add first: `! no_key oxy · search + JS pages · fats setup oxy, 3 steps
+  for the user`. Once one key is saved, each provider still missing one keeps its row.
 - `fats "rust news" --cards` searched for "rust news cards". A mod typed as a flag after search words now asks
   instead, without a search: `? --cards is a mod, not a search word · search first: fats rust news · then: fats
   u1 cards`. The same goes for `--full` and every other mod; `fats u1 --cards` works as before. `--json` has one

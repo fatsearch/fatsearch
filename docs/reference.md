@@ -27,7 +27,7 @@ symbols stripped; Linux x86_64 in CI: 20.7 MB, 20,664,112 bytes) and `fats guide
 with the Bright Data key alone over nine runs on 2026-10-15, each on the pre-release build of that moment; the same
 build moves by up to 3 pages between runs a minute apart, so read the band, not one run. The `Ntok` figure `fats`
 prints on a whole read came to 1.01 real tokens per `Ntok` (5 whole reads of 42 counted with Anthropic's token counter, pre-release build).
-Method, every run and the pages: [docs/benchmarks.md](docs/benchmarks.md). What changed in each version: [CHANGELOG.md](CHANGELOG.md).
+Method, every run and the pages: [docs/benchmarks.md](benchmarks.md). What changed in each version: [CHANGELOG.md](../CHANGELOG.md).
 
 ## Install
 
@@ -54,10 +54,17 @@ fats ./report.pdf           a PDF: one section per page (u1#4 = page 4), no netw
 fats ./report.pdf revenue   read the file, then filter it
 fats u1                     outline again        fats u1#2      read section 2 (first part)
 fats more                   next part            fats u1 all    every section, one line each
+fats u1 full > page.md      the whole cleaned page in one answer into a file (or with json:true); a terminal,
+                            a pipe and MCP read it a part at a time, fats more the next, the = line naming
+                            whole: fats u1 full > page.md · u1#2 full = section 2 whole
+fats u1 raw                 one = line: the stored body's kind and size, and the rg line on its path ($0, cache only)
+fats u1 headers             the served answer's status line, then its headers as kept (names and values lower
+                            case; none for a local file)
 fats u1 links               numbered links       fats u1 price  filter inside the page
 fats u1 links from:11       the next page of a list (links or media)
 fats u1 media               the page's pictures   fats u1 m1     save picture 1, print its view cost
 fats u1#2 vat match:exact   filter one section, exact phrase only
+fats u1 .data.chains        on a JSON page: that value, pretty ([0] an item, one [] every item, a value a row)
 fats l4                     the link a fetch would follow
 fats j8                     job 8: its command, when it ran, its pages
 fats j8.u3                  a page from another session (job 8)
@@ -70,6 +77,7 @@ fats setup import-env       copy exported keys into auth.json (CI, SSH), checked
 fats setup oxy              add one key (also bd, decodo, gh): the menu on a terminal, else a local key form
 printf %s "$KEY" | fats setup oxy   the same, no browser (SSH, CI): one piped line, checked ($0), saved
 fats setup oxy off          turn a provider off, key kept (on = back; free = the plain fetch)
+fats setup oxy stop         end the waiting key form (its link stops working), $0
 fats config set NAME VALUE  save a setting to settings.json (unset NAME = back to the built-in)
 fats account                provider balance, spend this month, usage, zones (free reads, cached 15 min)
 fats help                   the one-screen cheat sheet
@@ -430,6 +438,15 @@ client:
 {"mcpServers": {"fats": {"command": "fats", "args": ["mcp"]}}}
 ```
 
+`fats setup mcp claude` (or `codex`, `cursor`) does this for you. For Claude Code and Codex it runs the host's
+own `mcp add` with this binary's absolute path (on Windows behind `cmd /c`) and prints the command it ran; when the
+host's binary is not on `PATH` it prints `! no_host` and the command to type, and a failed `mcp add` is `!
+host_failed` with its exit code and first line of output. Cursor has no such command, so fats writes
+`mcpServers.fats` into `~/.cursor/mcp.json`, keeping every other server and key (a file that is not JSON is left
+alone). A host that already has fats says `already added`; `dry:true` names the command or file and touches
+nothing; `fats setup mcp` alone says which hosts have it. Through `fats mcp` a tool call cannot edit a host's
+config: `! not_under_mcp`.
+
 The session is `FATS_SESSION` if the client sets it, else a hash of the server's working directory.
 
 ## How a page is fetched
@@ -518,6 +535,12 @@ Every body is recognised by its first bytes (`%PDF`, the zip signature), whoever
 - **Text documents** (a `text/plain`, CSV, Markdown, JSON or XML answer, or a body that parses as JSON or opens
   like XML) are served as they are: one `lN` row per line, 300 lines per section (`u1#2` = lines 301-600), JSON
   top-level keys, XML elements or a feed's item titles as `u1#0`. They never go to a provider.
+  On a JSON page a word led by `.` is a path: `fats u1 .data.chains` prints that value pretty under
+  `= j1.u1 .data.chains · 12 items · item keys: chainName, … · 1.1ktok`, `.data.chains[0].chainName` one value
+  (as JSON), `.data.chains[].chainName` the rest of the path in every item, one value a row (one `[]`, no other
+  jq syntax; zsh globs `[`: quote it, `'.data.chains[0]'`); a long value pages with `from:`. A path that is not
+  there names where it stops, exit 2: `? u1 .data.foo · keys at .data: currency, chains[12]`. On any other page
+  the same word is a filter.
 - **Markdown from the server.** The plain request asks for `text/markdown` before HTML. A Markdown answer is
   cleaned like a page and marked `md` on the `=` line. When it is much thinner than the page or has no
   headings, `fats` asks again for HTML; if that fails, the Markdown copy is served. `FATS_ACCEPT_MD=0` turns
@@ -621,7 +644,9 @@ row is `! off oxy · turned off (key kept) → fats setup oxy on` and its status
 the free fetch off, `fats setup free` reads `= setup free · free off (turned off) → fats setup free on` and the
 `fats setup` summary starts `= setup free off (turned off) · …` with that row first. A
 Bright Data key saved without a zone reads `! no_zone bd · key saved, no Web Unlocker zone yet → fats setup bd
-zone:<name>`. `fats setup` takes only a switch name (`plain` = `free`), `on|off`, `import-env` and mods; any
+zone:<name>`. `fats setup oxy stop` ends a waiting key form: `= setup oxy form stopped · $0` (with none,
+`= setup oxy no form waiting · $0`); the setup menu shows a `Stop the waiting form` button on the provider's screen
+while one waits. `fats setup` takes only a switch name (`plain` = `free`), `on|off|stop`, `import-env` and mods; any
 other word is a repair at $0, never a search: `fats setup oxi` → `? setup oxi → fats setup oxy`.
 
 `fats setup` with no name checks every saved key (one free read each) and writes nothing: a zone it would pick
@@ -717,11 +742,9 @@ cargo build --release --locked
 ```
 
 `check.sh` needs `cargo install --locked cargo-nextest` and `python3` (the line budget); `full` also needs
-`cargo install --locked cargo-deny`. The parity test compares the output with a reference
-implementation on a set of cached pages that is not part of this repository; without `FATS_PARITY` it skips
-and says so.
+`cargo install --locked cargo-deny`.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your
-option. Security reports: [SECURITY.md](SECURITY.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
+Licensed under either of [Apache License, Version 2.0](../LICENSE-APACHE) or [MIT license](../LICENSE-MIT), at your
+option. Security reports: [SECURITY.md](../SECURITY.md). Contributing: [CONTRIBUTING.md](../CONTRIBUTING.md).

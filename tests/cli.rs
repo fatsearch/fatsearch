@@ -251,6 +251,11 @@ fn file_names_do_not_steal_words() {
     assert_eq!(rc, 0, "{out}");
     assert!(out.starts_with("= j1.u1 filter \"apple\""), "{out}");
     assert!(s.run("u1 notes.md").0.starts_with("= j1.u1 filter \"notes.md\""));
+    // a missing dotted name with a file's suffix beside an id is a filter word, dot-led or in a phrase
+    for q in ["u1 .claude.json", "u1#2 \"applies to .claude.json\"", "u1 settings.json"] {
+        let out = s.run(q).0;
+        assert!(out.starts_with("= j1.u1") && out.contains(" filter \"") && !out.contains("no_file"), "{q}: {out}");
+    }
     let dry = s.run("apple dry:true").0;
     assert!(dry.contains("\napple 10B local") && !dry.contains("search \""), "a bare name that is a file here: {dry}");
     for help in ["help", "-h", "--help"] {
@@ -402,6 +407,11 @@ fn mods_are_honoured_or_named() {
             .0
             .contains("! ignored from:5 · only a links, cards, media or comments list pages → fats u1\n")
     );
+    let (out, _) = s.run("u1 .item from:5");
+    assert!(
+        out.ends_with("\n! ignored from:5 · only a links, cards, media or comments list pages\n"),
+        "a dot word: {out}"
+    );
     let (out, _) = s.run("u1 item limit:3");
     assert_eq!(out.lines().filter(|l| l.starts_with("u1#")).count(), 3, "{out}");
     let (out, rc) = s.run("u1 links max:40");
@@ -543,16 +553,22 @@ fn weak_matches_show_the_best_rows() {
     assert!(out.contains("match:all auto · in islands"), "an island with all words beats a weak served row: {out}");
 }
 
-/// A bare `more` goes on with what the last read showed: the next part of `full`, of a section, else every
-/// section (`all`); after another page's list it is that page's.
+/// `args` as a terminal runs them (`FATS_HUMAN=1`, no colour): its stdout.
+fn on_screen(s: &Sandbox, args: &str) -> String {
+    let o = s.cmd(args).env("FATS_HUMAN", "1").env("NO_COLOR", "1").output().expect("run");
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// A bare `more` goes on with what the last read showed: the next part of `full` (on a terminal), of a section,
+/// else every section (`all`); after another page's list it is that page's.
 #[test]
 fn bare_more_goes_on() {
     let s = Sandbox::new("baremore");
     let para = "<p>".to_string() + &"a long line of words that fills the reader ".repeat(40) + "</p>";
     s.file("long.html", &page("Long", &format!("<h2>One</h2>{}<h2>Two</h2>{para}", para.repeat(6))));
     assert_eq!(s.run("./long.html").1, 0);
-    assert!(s.run("u1 full").0.starts_with("= j1.u1 full · part 1/7 "));
-    assert!(s.run("more").0.starts_with("= j1.u1 full · part 2/7 "), "full goes on");
+    assert!(on_screen(&s, "u1 full").starts_with("= j1.u1 full · part 1/7 "));
+    assert!(on_screen(&s, "more").starts_with("= j1.u1 full · part 2/7 "), "full goes on");
     let sec = s.run("u1#1").0;
     assert!(sec.starts_with("= j1.u1#1 Long · part 1/7 "), "{sec}");
     assert!(s.run("more").0.starts_with("= j1.u1#1b Long · part 2/7 "), "the section goes on");
@@ -560,6 +576,81 @@ fn bare_more_goes_on() {
     s.run("./short.html");
     let all = s.run("more").0;
     assert!(all.starts_with("= j2.u2 ") && all.contains("short"), "the current page: {all}");
+}
+
+/// `full` into a regular file (`> page.md`, or with `json:true`) is the whole text in one answer: the parts a
+/// terminal pages through with `more`, end to end, under one `=` line with its size and no `more` row; a `more`
+/// after it says `full complete`, never the text again. A pipe (a shell tool's stdout) stays paged, its `=` line
+/// naming the file move. A line longer than a part fills the part it starts in: part 1 holds its heading and the
+/// first piece, never the heading alone.
+#[test]
+fn full_into_a_file_is_the_whole_text() {
+    let s = Sandbox::new("fullpipe");
+    let para = "<p>".to_string() + &"a long line of words that fills the reader ".repeat(40) + "</p>";
+    s.file("long.html", &page("Long", &format!("<h2>One</h2>{}<h2>Two</h2>{para}", para.repeat(6))));
+    assert_eq!(s.run("./long.html").1, 0);
+    let file = s.dir.join("page.md");
+    let out = std::fs::File::create(&file).expect("page.md");
+    assert!(s.cmd("u1 full").stdout(out).status().expect("run").success());
+    let whole = std::fs::read_to_string(&file).expect("page.md");
+    let head = whole.lines().next().unwrap_or_default();
+    assert!(head.starts_with("= j1.u1 full · ") && head.contains("tok · up fats u1") && !whole.contains("more →"));
+    assert!(!head.contains("whole:"), "{head}");
+    assert!(s.run("more").0.starts_with("= j1.u1 full complete · 7 parts · up fats u1"), "never the text again");
+    let piped = s.run("u1 full").0;
+    let hint = " · up fats u1 · whole: fats u1 full > page.md";
+    assert!(piped.starts_with("= j1.u1 full · part 1/7 · ") && piped.contains(hint), "{piped}");
+    let mut parts = vec![on_screen(&s, "u1 full")];
+    while parts.len() < 7 {
+        parts.push(on_screen(&s, "more"));
+    }
+    assert!(parts[6].starts_with("= j1.u1 full · part 7/7 "), "{}", parts[6]);
+    let body =
+        |o: &str| o.lines().skip(1).filter(|l| !l.starts_with("… ")).map(|l| format!("{l}\n")).collect::<String>();
+    assert_eq!(body(&whole).len(), parts.iter().map(|p| body(p).len()).sum::<usize>(), "every part's bytes, once");
+    assert_eq!(body(&whole), parts.iter().map(|p| body(p)).collect::<String>());
+    let json = s.run("u1 full json:true").0;
+    assert!(json.contains("\"= j1.u1 full · ") && !json.contains("part 1/") && !json.contains("whole:"), "{json}");
+    // one line longer than a part (a minified paragraph, a JSON island): part 1 = its heading + its first piece
+    s.file("huge.html", &page("Huge", &format!("<h2>Big</h2><p>{}</p>", "word ".repeat(3000))));
+    assert_eq!(s.run("./huge.html").1, 0);
+    let first = on_screen(&s, "u2 full");
+    assert!(first.starts_with("= j2.u2 full · part 1/") && first.contains("Big") && body(&first).len() > 2000);
+}
+
+/// `uN raw` names the stored body in one `=` line (kind, size, the grep to run) and `uN headers` prints the served
+/// answer's status line, then its headers, both from the cache alone: a failed fetch kept no body.
+#[test]
+fn raw_and_headers_come_from_the_cache() {
+    use std::io::Write;
+    let addr = serve(|head, c| {
+        let gone = head.starts_with("GET /gone");
+        let body = if gone { String::new() } else { page("Kept page", "<p>kept words of the page here</p>") };
+        let status = if gone { "500 Internal Server Error" } else { "200 OK" };
+        let h = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: text/html\r\nx-served-by: test\r\nSet-Cookie: sid=s3cret\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        c.write_all(h.as_bytes()).and_then(|_| c.write_all(body.as_bytes()))
+    });
+    let s = Sandbox::new("rawhead");
+    let run = |args: &str| {
+        let mut c = s.cmd(args);
+        c.env_remove("FATS_OFFLINE").env("FATS_ALLOW_PRIVATE", "1");
+        String::from_utf8_lossy(&c.output().expect("run").stdout).into_owned()
+    };
+    assert!(run(&format!("{addr}/page")).starts_with("= j1.u1 "));
+    let raw = run("u1 raw");
+    let path = raw.split_once(" · grep: rg <re> ").map(|(_, p)| p.trim_end()).unwrap_or_default();
+    assert!(raw.starts_with("= u1 raw · html 1") && raw.lines().count() == 1, "one `=` line, the path once: {raw}");
+    assert!(std::fs::read_to_string(path).is_ok_and(|b| b.contains("kept words of the page")), "{raw}");
+    let headers = run("u1 headers");
+    assert!(headers.starts_with("= u1 headers\nHTTP 200\n") && headers.contains("\nx-served-by: test\n"), "{headers}");
+    assert!(!headers.contains("sid=") && !headers.contains("cookie"), "a credential is never kept: {headers}");
+    assert_eq!(on_screen(&s, "u1 raw"), raw, "a terminal gets the same row");
+    run(&format!("{addr}/gone"));
+    assert_eq!(run("u2 raw"), "? u2 raw · no body kept (failed fetch)\n");
+    assert_eq!(run("u2 headers"), "? u2 headers · no body kept (failed fetch)\n");
 }
 
 /// The agent's word for the media list: `images` that hits no text points to `media`; a word
@@ -1180,7 +1271,7 @@ fn oversized_input_is_refused() {
     // the built-in tables (src/data/*.json) are counted where every other setting is shown
     assert!(s.run("config").0.contains(
         "
-tables 8 files · 2121 rows · built-in · providers 49, errors 53, check 86, sites 69, clean 186, words 1613, limits 55, telemetry 10
+tables 8 files · 2136 rows · built-in · providers 49, errors 53, check 86, sites 69, clean 194, words 1620, limits 55, telemetry 10
 "
     ));
     // every behaviour threshold is a row of its own
@@ -1236,6 +1327,25 @@ fn loose_key_file_is_flagged() {
     assert!(!status().contains("key_mode"));
 }
 
+/// Piped `fats setup` with no key at all = one choice, the cheapest searcher's row (the `=` line's arrow); once a
+/// key is saved, each missing provider keeps its own row.
+#[cfg(unix)]
+#[test]
+fn setup_without_any_key_offers_one_provider() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Sandbox::new("setup");
+    let (out, _) = s.run("setup");
+    let rows: Vec<_> = out.lines().filter(|l| l.starts_with("! no_key ")).collect();
+    assert_eq!(rows, ["! no_key oxy · search + JS pages · fats setup oxy, 3 steps for the user"], "{out}");
+    let k = s.dir.join("keys");
+    std::fs::create_dir_all(&k).expect("key dir");
+    std::fs::write(k.join("auth.json"), r#"{"version":1,"keys":{"oxy":"oxy-saved-key-Wq41xx"}}"#).expect("key");
+    std::fs::set_permissions(k.join("auth.json"), std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let (out, _) = s.run("setup");
+    assert!(out.contains("\n! no_key bd · search + JS pages · fats setup bd, 3 steps for the user\n"), "{out}");
+    assert!(!out.contains("! no_key oxy"), "{out}");
+}
+
 /// Keys live in `auth.json` only: an exported key, `./.env` and the Bright Data CLI's credentials are never read.
 /// The 0.1 key files move into `auth.json` / `settings.json` once (0600) and are deleted; no key ever prints.
 #[test]
@@ -1251,8 +1361,9 @@ fn keys_come_from_auth_json_only() {
     std::fs::create_dir_all(&bdata).expect("bdata dir");
     std::fs::write(bdata.join("credentials.json"), r#"{"api_key": "bd-cli-Kx7"}"#).expect("bdata key");
     let (out, _) = bare("");
-    let keys = "\nkeys none · search needs oxy or bd (one is enough; oxy costs least per search) → run fats setup oxy, give the \
-                user its 3 lines · network off\n";
+    // the env holds oxy's key: its move copies it in (`import-env`), never a key typed again
+    let keys = "\nkeys none · search needs oxy or bd (one is enough; oxy costs least per search) → fats setup import-env · \
+                network off\n";
     assert!(out.contains(keys), "{out}");
     let row = "\n! no_key oxy · env OXYLABS_WEB_API_KEY …Zq82 not imported → fats setup import-env\n";
     assert!(out.contains(row) && !out.contains("oxy-exported"), "{out}");
@@ -1444,6 +1555,43 @@ fn setup_names_a_waiting_or_dead_form() {
     }
 }
 
+/// `fats setup oxy stop` ends a waiting key form: its run stops answering on its port, `fats setup` names no form, a
+/// second stop says none waits; `dry:true` stops nothing; the agent block's last line names the move.
+#[test]
+fn setup_stop_ends_a_waiting_form() {
+    let s = Sandbox::new("formstop");
+    let started = s.cmd("setup oxy").env_remove("FATS_OFFLINE").output().expect("run");
+    let out = String::from_utf8_lossy(&started.stdout).to_string();
+    let url = out.split_whitespace().find(|w| w.starts_with("http://127.0.0.1:")).unwrap_or_default();
+    let host = url.trim_start_matches("http://").split('/').next().unwrap_or_default().to_string();
+    let last = "no key coming (the user stopped)? fats setup oxy stop ends the form, $0";
+    assert!(out.starts_with("= setup oxy · waiting for the key at ") && out.lines().last() == Some(last), "{out}");
+    let answers = || std::net::TcpStream::connect(&host).is_ok();
+    assert_eq!(s.run("setup oxy stop dry:true").0, "= dry setup oxy would stop the waiting form · $0\n");
+    assert!(answers() && s.run("setup").0.contains("oxy form waiting · "), "dry stops nothing");
+    // a run file that cannot be removed is said, never `form stopped` while the form still serves
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let run = s.dir.join("cache/t/run");
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let (out, rc) = s.run("setup oxy stop");
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let file = run.join("setup-oxy.json");
+        let row = format!("= ! cache_write setup oxy stop · $0\n! cache_write setup oxy · {}: ", file.display());
+        assert!(out.starts_with(&row) && rc == 1 && answers(), "{out}");
+    }
+    assert_eq!(s.run("setup oxy stop").0, "= setup oxy form stopped · $0\n");
+    let t = std::time::Instant::now();
+    while answers() && t.elapsed().as_secs() < 3 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!answers(), "the form's run has exited");
+    assert_eq!(s.run("setup oxy stop").0, "= setup oxy no form waiting · $0\n");
+    let status = s.run("setup").0;
+    assert!(!status.contains("form waiting") && !status.contains("form_expired"), "{status}");
+}
+
 /// `setup <name> on|off` never leaves nothing that can fetch; an off tier reads like a missing key in `config`;
 /// `config set|unset` keep a threshold in `settings.json`, a mod beats it, a value of the wrong kind is refused.
 #[test]
@@ -1453,8 +1601,10 @@ fn switches_and_settings_rows() {
         let o = s.cmd(args).output().expect("run");
         (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code().unwrap_or(-1))
     };
-    let nothing = ("! refused · nothing left that can fetch: turn one on or add a key\n".into(), 1);
-    assert_eq!(run("setup free off"), nothing);
+    let nothing = "nothing left that can fetch: turn one on or add a key";
+    // a refused change: its `=` line, then the row, rc 1
+    let refused = |c: &str, why: &str| assert_eq!(run(c), (format!("= ! refused {c} · $0\n! refused · {why}\n"), 1));
+    refused("setup free off", nothing);
     let k = s.dir.join("keys");
     std::fs::create_dir_all(&k).expect("key dir");
     std::fs::write(k.join("auth.json"), r#"{"version":1,"keys":{"oxy":"k-123456789"}}"#).expect("auth");
@@ -1468,10 +1618,13 @@ fn switches_and_settings_rows() {
     assert_eq!(run("setup oxi"), ("? setup oxi → fats setup oxy\n".into(), 2));
     assert_eq!(run("setup plain on"), ("= setup free on · saved settings.json · from the next command\n".into(), 0));
     let (out, rc) = run("setup foo bar");
-    assert!(rc == 2 && out.starts_with("? setup foo bar · fats setup <free|oxy|bd|decodo|gh|plain> [on|off]"), "{out}");
+    assert!(
+        rc == 2 && out.starts_with("? setup foo bar · fats setup <free|oxy|bd|decodo|gh|plain> [on|off|stop]"),
+        "{out}"
+    );
     assert!(run("stats").0.starts_with("= stats s:t · 0 searches · "), "no search ran");
     assert_eq!(run("setup free off").1, 0);
-    assert_eq!(run("setup oxy off"), nothing);
+    refused("setup oxy off", nothing);
     assert_eq!(run("setup free on").1, 0);
     assert_eq!(run("setup oxy off").1, 0);
     assert!(run("config").0.contains("\noxy 10s $1.00/1k · build · off (settings.json)\n"));
@@ -1479,18 +1632,14 @@ fn switches_and_settings_rows() {
     assert!(health.contains("\noxy off (key kept)\n") && health.contains("\noxyjs off (key kept)\n"), "{health}");
     assert!(health.contains("\nbd no key\n") && health.contains("\nplain - no calls yet\n"), "{health}");
     assert_eq!(run("config set batch_parallel 6").1, 0);
-    assert_eq!(run("config set batch_parallel 2.5").0, "! refused · batch_parallel 2.5 · want a number ≥ 1 like 8\n");
+    refused("config set batch_parallel 2.5", "batch_parallel 2.5 · want a number ≥ 1 like 8");
     // THE reader's check (`settings::fits` and the env readers): 0 lanes, a chunk past its range, a cut value
-    assert_eq!(run("config set batch_parallel 0").0, "! refused · batch_parallel 0 · want a number ≥ 1 like 8\n");
-    assert_eq!(run("config set chunk 99999"), ("! refused · chunk 99999 · want an integer 50-10000\n".into(), 1));
-    assert_eq!(run("config set country de x").0, "! refused · country de x · want two letters: us · de\n");
-    let spaced = s.dir.join("my cache").display().to_string();
-    assert_eq!(run(&format!("config set cache {spaced}")).1, 0);
-    let cfg = s.cmd("config").env_remove("FATS_CACHE").output().expect("run").stdout;
-    assert!(String::from_utf8_lossy(&cfg).contains(&format!("\ncache {spaced} · settings.json · ")), "whole value");
-    assert_eq!(run("config unset cache").1, 0);
+    refused("config set batch_parallel 0", "batch_parallel 0 · want a number ≥ 1 like 8");
+    refused("config set chunk 99999", "chunk 99999 · want an integer 50-10000");
+    refused("config set country de x", "country de x · want two letters: us · de");
+    let prefs = s.dir.join("keys/settings.json");
     // a refused `settings.json` value is named by its file and its `config` move, never an env var nobody set
-    let (prefs, bad) = (s.dir.join("keys/settings.json"), "! bad_setting settings.json chunk=99999 · want an integer");
+    let bad = "! bad_setting settings.json chunk=99999 · want an integer";
     let kept = std::fs::read_to_string(&prefs).expect("prefs");
     let mut set: serde_json::Value = serde_json::from_str(&kept).expect("prefs json");
     set["set"]["chunk"] = "99999".into();
@@ -1505,6 +1654,42 @@ fn switches_and_settings_rows() {
     assert_eq!(run("config unset batch_parallel").1, 0);
     assert!(run("config").0.contains(&format!("\nbatch_parallel 8 · build · limits.json{lanes}")));
     assert!(run("config").0.contains("\nplain_host_pace_ms 1000 · build · limits.json · plain waits its turn a host"));
+}
+
+/// A fence is env-only: no command opens it, on the CLI either (`settings.json` keeps every byte), and a value an
+/// older fats saved there is never read: `config` names it and the env var instead.
+#[test]
+fn fences_are_env_only() {
+    let s = Sandbox::new("fences");
+    let run = |args: &str| {
+        let o = s.cmd(args).output().expect("run");
+        (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code().unwrap_or(-1))
+    };
+    assert_eq!(run("config set batch_parallel 6").1, 0);
+    let prefs = s.dir.join("keys/settings.json");
+    let before = std::fs::read(&prefs).expect("prefs");
+    let fence = "! env_only allow_private · set FATS_ALLOW_PRIVATE=1 in the host's env, never from a tool call\n";
+    let eq = "= ! env_only config set allow_private true · $0\n";
+    assert_eq!(run("config set allow_private true"), (format!("{eq}{fence}"), 1));
+    let cache = "! env_only cache · set FATS_CACHE=<dir> in the host's env, never from a tool call\n";
+    assert_eq!(run("config set cache /x"), (format!("= ! env_only config set cache /x · $0\n{cache}"), 1));
+    assert_eq!(std::fs::read(&prefs).expect("prefs"), before, "settings.json untouched");
+    let mut set: serde_json::Value = serde_json::from_slice(&before).expect("json");
+    (set["set"]["allow_private"], set["set"]["cache"]) = (true.into(), "/x".into());
+    std::fs::write(&prefs, set.to_string()).expect("prefs");
+    let cfg = s.cmd("config").env_remove("FATS_CACHE").output().expect("run").stdout;
+    let cfg = String::from_utf8_lossy(&cfg);
+    assert!(cfg.contains("\nallow_private false · default\n") && !cfg.contains("\ncache /x "), "{cfg}");
+    assert!(cfg.contains("\n! env_only settings.json allow_private · ignored → fats config unset allow_private\n"));
+    assert!(cfg.contains("\n! env_only settings.json cache · ignored → fats config unset cache\n"), "{cfg}");
+    // removing an older fats' value only closes a fence: `unset` is allowed, the row goes
+    assert_eq!(
+        run("config unset cache dry:true").0,
+        "= config unset cache · would save settings.json · from the next command\n"
+    );
+    assert_eq!(run("config unset cache").1, 0);
+    assert_eq!(run("config unset allow_private").1, 0);
+    assert!(!run("config").0.contains("! env_only"), "both values gone");
 }
 
 /// A threshold has a `config` row, never a literal; a name in the env or `settings.json` that no
@@ -1553,8 +1738,9 @@ fn free_off_and_per_call_rows() {
         sum.starts_with("= dry setup free off (turned off) · oxy ") && sum.contains(&format!("\n{off}\n")),
         "{sum}"
     );
-    assert_eq!(run("config set cost_cap -1"), ("! refused · cost_cap is per call: the cost: mod\n".into(), 1));
-    assert_eq!(run("config set wait abc").0, "! refused · wait is per call: the wait: mod\n");
+    let cap = "= ! refused config set cost_cap -1 · $0\n! refused · cost_cap is per call: the cost: mod\n";
+    assert_eq!(run("config set cost_cap -1"), (cap.into(), 1));
+    assert!(run("config set wait abc").0.ends_with("\n! refused · wait is per call: the wait: mod\n"));
 }
 
 /// The free fetch off with both keys: the page ladder starts at oxy without JS, then bd ∥ oxyjs, as `dry:true` and
@@ -1646,16 +1832,17 @@ fn mcp_session(s: &Sandbox, calls: &[serde_json::Value]) -> std::collections::Ha
 }
 
 /// The status's mcp row reads each host's config where its own `mcp add` writes it: Claude Code's user scope (top
-/// level) and local scope (`projects.<this dir>`; another project's server is not this one's), its `./.mcp.json`;
-/// Codex under `$CODEX_HOME`, else `~/.codex`; Cursor's global and project `mcp.json`.
+/// level) and local scope (`projects.<this dir>`; another project's server is not this one's) under
+/// `$CLAUDE_CONFIG_DIR`, else `~`, its `./.mcp.json`; Codex under `$CODEX_HOME`, else `~/.codex`; Cursor's global and
+/// project `mcp.json`.
 #[test]
 fn mcp_row_reads_where_each_host_writes() {
     let s = Sandbox::new("mcp-hosts");
     let (home, work) = (s.dir.join("home"), std::fs::canonicalize(s.dir.join("work")).expect("work"));
     std::fs::create_dir_all(home.join(".codex")).expect("dir");
-    let row = |codex: Option<&std::path::Path>| {
+    let row = |env: Option<(&str, &std::path::Path)>| {
         let mut c = s.cmd("");
-        c.envs(codex.map(|d| ("CODEX_HOME", d)));
+        c.envs(env);
         let out = String::from_utf8_lossy(&c.output().expect("run").stdout).into_owned();
         out.lines().find(|l| l.starts_with("mcp: ")).unwrap_or_default().to_string()
     };
@@ -1667,7 +1854,13 @@ fn mcp_row_reads_where_each_host_writes() {
     let local = serde_json::json!({"projects": {work.to_string_lossy(): serde_json::from_str::<serde_json::Value>(server).expect("json")}});
     std::fs::write(home.join(".claude.json"), local.to_string()).expect("w");
     std::fs::write(home.join(".codex/config.toml"), "[mcp_servers.fats]\ncommand = \"fats\"\n").expect("w");
-    assert_eq!(row(None), "mcp: added to claude, codex · stdio, one tool fats(cmd)");
+    assert_eq!(row(None), "mcp: added to claude, codex · stdio, one tool fats(cmd) · add: fats setup mcp cursor");
+    // `CLAUDE_CONFIG_DIR` moves Claude Code's `.claude.json` with its folder
+    let claude = s.dir.join("claude-home");
+    std::fs::create_dir_all(&claude).expect("dir");
+    std::fs::rename(home.join(".claude.json"), claude.join(".claude.json")).expect("mv");
+    assert!(row(None).starts_with("mcp: added to codex · "), "{}", row(None));
+    assert!(row(Some(("CLAUDE_CONFIG_DIR", &claude))).starts_with("mcp: added to claude, codex · "));
     // `CODEX_HOME` moves Codex's file; the project files count for Claude Code and Cursor
     let codex = s.dir.join("codex-home");
     std::fs::create_dir_all(&codex).expect("dir");
@@ -1675,7 +1868,97 @@ fn mcp_row_reads_where_each_host_writes() {
     std::fs::write(work.join(".mcp.json"), server).expect("w");
     std::fs::create_dir_all(work.join(".cursor")).expect("dir");
     std::fs::write(work.join(".cursor/mcp.json"), server).expect("w");
-    assert_eq!(row(Some(&codex)), "mcp: added to claude, cursor · stdio, one tool fats(cmd)");
+    assert_eq!(
+        row(Some(("CODEX_HOME", &codex))),
+        "mcp: added to claude, cursor · stdio, one tool fats(cmd) · add: fats setup mcp codex"
+    );
+}
+
+/// `fats setup mcp <host>` adds fats for the user: the host's own `mcp add` when its binary is on `PATH` (argv as
+/// the host gets it, this binary's absolute path), its failure with rc and first line, `no_host` with the command
+/// by hand when the binary is missing, never a success (rc 0 without fats in its file neither); `dry:true` runs
+/// nothing; a host that holds fats is said.
+#[cfg(unix)]
+#[test]
+fn setup_mcp_runs_the_hosts_own_add() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Sandbox::new("mcp-add");
+    let (bin, none, argv) = (s.dir.join("bin"), s.dir.join("empty"), s.dir.join("bin/claude.argv"));
+    for d in [&none, &s.dir.join("home")] {
+        std::fs::create_dir_all(d).expect("dir");
+    }
+    let host = |body: &str| {
+        std::fs::create_dir_all(&bin).expect("dir");
+        std::fs::write(bin.join("claude"), format!("#!/bin/sh\n{body}\n")).expect("script");
+        std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    let run = |args: &str, path: &std::path::Path| {
+        let o = s.cmd(args).env("PATH", path).output().expect("run");
+        (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code().unwrap_or(-1))
+    };
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_fats")).expect("exe");
+    let (line, rc) = run("setup mcp", &none);
+    assert_eq!(
+        (line.as_str(), rc),
+        ("= setup mcp: not added to claude, codex, cursor · add: fats setup mcp claude|codex|cursor\n", 0)
+    );
+    let (line, rc) = run("setup mcp claude", &none);
+    let by_hand =
+        "claude not on PATH · install Claude Code first, or add by hand: claude mcp add --scope user fats -- ";
+    assert!(line.contains(&format!("\n! no_host claude · {by_hand}")) && line.ends_with(" mcp\n") && rc == 1, "{line}");
+    host(r#"printf '%s\n' "$@" > "$0.argv""#);
+    let (line, rc) = run("setup mcp claude dry:true", &bin);
+    assert!(line.starts_with("= dry setup mcp claude · would run claude mcp add --scope user fats -- /") && rc == 0);
+    assert!(!argv.exists(), "dry ran nothing: {line}");
+    // rc 0 is not enough: `added` only once the host's own file holds fats (an alias can exit 0 and write nothing)
+    let (line, rc) = run("setup mcp claude", &bin);
+    let (eq, ran) = (
+        "= ! host_failed setup mcp claude · nothing added · $0\n! host_failed claude · ran claude mcp ",
+        " mcp, fats not in ~/.claude.json\n",
+    );
+    assert!(line.starts_with(eq) && line.ends_with(ran) && rc == 1, "{line}");
+    let got = std::fs::read_to_string(&argv).expect("argv");
+    let got: Vec<&str> = got.lines().collect();
+    assert_eq!(got[..6], ["mcp", "add", "--scope", "user", "fats", "--"], "{got:?}");
+    assert_eq!((std::fs::canonicalize(got[6]).expect("path"), got[7..].to_vec()), (exe, vec!["mcp"]));
+    host("echo 'MCP server fats already exists in user config' >&2\nexit 1");
+    let (line, rc) = run("setup mcp claude", &bin);
+    let failed = "\n! host_failed claude · rc 1 · MCP server fats already exists in user config\n";
+    assert!(line.starts_with("= ! host_failed setup mcp claude") && line.ends_with(failed) && rc == 1, "{line}");
+    host(r#"echo '{"mcpServers":{"fats":{"command":"fats"}}}' > "$HOME/.claude.json""#);
+    let (line, rc) = run("setup mcp claude", &bin);
+    assert!(line.starts_with("= setup mcp claude added · claude mcp add --scope user fats -- /") && rc == 0, "{line}");
+    assert_eq!(run("setup mcp claude", &bin), ("= setup mcp claude already added · ~/.claude.json · $0\n".into(), 0));
+    assert_eq!(run("setup mcp zed", &bin).1, 2, "an unknown host is a usage row");
+}
+
+/// Cursor has no `mcp add`: fats writes `mcpServers.fats` into `~/.cursor/mcp.json`, every other server and key
+/// kept; again = already added; `dry:true` writes nothing; a file that is not JSON is left as it is.
+#[test]
+fn setup_mcp_cursor_merges_its_file() {
+    let s = Sandbox::new("mcp-cursor");
+    let (dir, file) = (s.dir.join("home/.cursor"), s.dir.join("home/.cursor/mcp.json"));
+    assert!(
+        s.run("setup mcp cursor dry:true").0.starts_with("= dry setup mcp cursor · would write ~/.cursor/mcp.json")
+    );
+    assert!(!dir.exists(), "dry wrote nothing");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(&file, "{ not json").expect("w");
+    let (out, rc) = s.run("setup mcp cursor");
+    assert!(out.contains("\n! host_failed cursor · ~/.cursor/mcp.json is not JSON (") && rc == 1, "{out}");
+    assert_eq!(std::fs::read_to_string(&file).expect("r"), "{ not json", "a broken file is left as it is");
+    std::fs::write(&file, r#"{"theme":"dark","mcpServers":{"other":{"command":"x","args":[]}}}"#).expect("w");
+    assert_eq!(s.run("setup mcp cursor"), ("= setup mcp cursor added · ~/.cursor/mcp.json · $0\n".into(), 0));
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).expect("r")).expect("json");
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_fats")).expect("exe");
+    let fats = &v["mcpServers"]["fats"];
+    #[cfg(unix)]
+    assert_eq!(
+        (std::fs::canonicalize(fats["command"].as_str().unwrap_or_default()).ok(), &fats["args"]),
+        (Some(exe), &serde_json::json!(["mcp"]))
+    );
+    assert_eq!((&v["theme"], &v["mcpServers"]["other"]["command"]), (&"dark".into(), &"x".into()), "{v}");
+    assert_eq!(s.run("setup mcp cursor").0, "= setup mcp cursor already added · ~/.cursor/mcp.json · $0\n");
 }
 
 /// `fats mcp` over stdio, as a client sees it: initialize → tools/list → tools/call. The tool text is the CLI's
@@ -1690,7 +1973,7 @@ fn mcp_serves_the_cli_text() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(s.dir.join("secret.html"), s.dir.join("work/link.html")).expect("symlink");
     let (status, _) = s.run("");
-    let add = "\nmcp: not added to claude, codex, cursor · add: claude mcp add --scope user fats -- fats mcp\n";
+    let add = "\nmcp: not added to claude, codex, cursor · add: fats setup mcp claude|codex|cursor\n";
     assert!(status.contains(add), "{status}");
     assert!(s.run("config").0.contains("\nmcp fats mcp · stdio"), "config names the server");
     let config = s.run("config").0;
@@ -1769,6 +2052,56 @@ fn mcp_never_tells_whether_a_path_outside_exists() {
     assert!(text(4).starts_with("= ! not_allowed ../secret.md "), "{}", text(4));
     // an outside path of 2+ segments beside words is refused, never searched
     assert!(text(8).starts_with("= ! not_allowed /etc/hosts "), "{}", text(8));
+}
+
+/// A tool call never opens a fence nor flips what spends or brakes: under `fats mcp` the env-only settings, every
+/// `setup` switch, the telemetry level and the home-IP brake are refused and `settings.json` keeps every byte; a
+/// speed knob is still set.
+#[test]
+fn mcp_never_opens_a_fence() {
+    let s = Sandbox::new("mcp-fence");
+    assert_eq!(s.run("config set batch_parallel 6").1, 0);
+    let prefs = s.dir.join("keys/settings.json");
+    let before = std::fs::read(&prefs).expect("prefs");
+    let fats = |cmd: &str| serde_json::json!({"name": "fats", "arguments": {"cmd": cmd}});
+    let cmds = [
+        "config set allow_private true",
+        "config set cache /x",
+        "setup free off",
+        "setup telemetry off",
+        "config set plain_host_pace_ms 0",
+        "config unset telemetry",
+        "setup oxy on dry:true",
+        "setup mcp claude",
+        "setup mcp cursor dry:true",
+        "example.org plain_host_pace_ms:0 dry:true",
+        "example.org plain_host_pace_ms:60000 dry:true",
+    ];
+    let by_id = mcp_session(&s, &cmds.map(fats));
+    let text = |i: u64| by_id[&(i + 3)]["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    let way = "in the host's env, never from a tool call";
+    let env = "= ! env_only config set allow_private true · $0\n! env_only allow_private · set FATS_ALLOW_PRIVATE=1";
+    assert!(text(0).starts_with(&format!("{env} {way}")), "{}", text(0));
+    let env = "= ! env_only config set cache /x · $0\n! env_only cache · set FATS_CACHE=<dir>";
+    assert!(text(1).starts_with(&format!("{env} {way}")), "{}", text(1));
+    for (i, c) in cmds.iter().enumerate().skip(2).take(7) {
+        let c = c.trim_end_matches(" dry:true");
+        let (verb, words) = c.split_once(' ').unwrap_or_default();
+        let row = format!("= ! not_under_mcp {c} · $0\n! not_under_mcp {verb} {words} · run it in a terminal");
+        assert!(text(i as u64).starts_with(&row), "{c}: {}", text(i as u64));
+        assert_eq!(by_id[&(i as u64 + 3)]["result"]["isError"].as_bool(), Some(true), "{c}");
+    }
+    // a per-call mod never lowers the home-IP brake below its setting either: the whole call is refused
+    let pace =
+        "= ! not_under_mcp plain_host_pace_ms:0 · $0\n! not_under_mcp plain_host_pace_ms:0 · run it in a terminal\n";
+    assert_eq!((text(9).as_str(), by_id[&12]["result"]["isError"].as_bool()), (pace, Some(true)));
+    assert!(!text(10).contains("not_under_mcp"), "raising it is allowed: {}", text(10));
+    assert_eq!(std::fs::read(&prefs).expect("prefs"), before, "settings.json byte-identical");
+    assert!(!s.dir.join("home/.claude.json").exists() && !s.dir.join("home/.cursor").exists(), "no host config");
+    let knob = mcp_session(&s, &[fats("config set batch_parallel 4")]);
+    let knob = knob[&3]["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    assert!(knob.starts_with("= config set batch_parallel 4 · saved"), "{knob}");
+    assert!(s.run("config").0.contains("\nbatch_parallel 4 · settings.json"), "a speed knob is set");
 }
 
 /// A loopback HTTP server for one test (loopback is not "the network"): answers each connection with `reply`
@@ -1906,21 +2239,53 @@ fn a_repeated_page_failure_is_a_count() {
     let first = row(&online(&s, &format!("{addr}/flaky")));
     assert!(first.ends_with("→ fats u1 fresh:true") && !first.contains("failed"), "a 5xx retries once: {first}");
     let again = row(&online(&s, "u1 fresh:true"));
-    // no key here: a count, and a key could serve it, never the call that failed twice
-    let setup = " · failed 2/2 here → fats setup";
-    assert!(again.ends_with(setup), "{again}");
-    assert!(row(&s.run("u1").0).ends_with(setup), "the older copy says the count too");
+    // no key here: a count, and the cheapest key that could serve it (its row's move, then the page again), never
+    // the call that failed twice
+    let setup = |id: &str| {
+        format!("→ run fats setup bd, give the user its 3 lines, then fats {id} fresh:true provider:bd ≤$0.0015")
+    };
+    assert!(again.ends_with(&format!(" · failed 2/2 here {}", setup("u2"))), "{again}");
+    assert!(row(&s.run("u1").0).ends_with(&format!(" · failed 2/2 here {}", setup("u1"))), "the older copy too");
     let bad = row(&online(&s, &format!("{addr}/bad")));
-    assert!(bad.contains("! http_400") && bad.ends_with("→ fats setup"), "no keyed tier: no retry of a 4xx: {bad}");
+    assert!(bad.contains("! http_400") && bad.ends_with(&setup("u3")), "no keyed tier: no retry of a 4xx: {bad}");
     // Plain is no provider: its error page names none; a row with no arrow is a count from the first copy
     let page = |out: &str| out.lines().find(|l| l.contains(" ! error_page 1")).unwrap_or_default().to_string();
     let first = page(&online(&s, &format!("{addr}/akamai")));
-    assert!(
-        first.ends_with("· tried plain:error_page✗ · showing the best copy · failed 1/1 here → fats setup"),
-        "{first}"
-    );
+    let end = format!("· tried plain:error_page✗ · showing the best copy · failed 1/1 here {}", setup("u4"));
+    assert!(first.ends_with(&end), "{first}");
     let again = page(&online(&s, "u4 fresh:true"));
-    assert!(again.ends_with("showing the best copy · failed 2/2 here → fats setup"), "the error page again: {again}");
+    let end = format!("showing the best copy · failed 2/2 here {}", setup("u5"));
+    assert!(again.ends_with(&end), "the error page again: {again}");
+}
+
+/// Plain is the user's own connection: a proxy in the env is never taken (through one, the proxy resolves the
+/// name and the private-address fence never runs), and status and `config` say so once.
+#[test]
+fn plain_never_takes_the_proxy_env() {
+    use std::io::Write;
+    let addr = serve(|_, c| {
+        let body = "<html><head><title>Own line</title></head><body><p>Served without the proxy.</p></body></html>";
+        let h = format!("HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\r\n", body.len());
+        c.write_all(h.as_bytes()).and_then(|_| c.write_all(body.as_bytes()))
+    });
+    let s = Sandbox::new("noproxy");
+    // a proxy nothing listens on: a client that took it would fail the page
+    let run = |cmd: &str| {
+        let c = s
+            .cmd(cmd)
+            .env_remove("FATS_OFFLINE")
+            .env("FATS_ALLOW_PRIVATE", "1")
+            .env("http_proxy", "http://127.0.0.1:9")
+            .output();
+        String::from_utf8_lossy(&c.expect("run").stdout).into_owned()
+    };
+    let out = run(&format!("{addr}/page"));
+    assert!(out.starts_with("= j1.u1 Own line · ") && out.contains("\nServed without the proxy."), "{out}");
+    let note = "proxy env ignored on plain (your own connection); paid tiers are the proxies";
+    for cmd in ["status", "config"] {
+        assert_eq!(run(cmd).matches(note).count(), 1, "{cmd}: {}", run(cmd));
+    }
+    assert!(!s.run("config").0.contains(note), "no proxy env, no line");
 }
 
 /// The command's own cap stopping the paid try is no failed command: the best copy is shown, its `budget_hit` row
@@ -2324,8 +2689,9 @@ fn a_host_needs_a_real_tld_and_json_ends_a_search_as_a_word() {
     assert!(keyed("vite config json:true").starts_with('{'), "json:true is the output mod");
 }
 
-/// Beside search words a path must exist and `-` be the whole command; a search engine's query key is a search
-/// word as typed, while an unknown key of ours still asks.
+/// Beside search words a path must exist and `-` be the whole command; a search engine's query key, or any key that
+/// is no mod nor one edit from one, is a search word as typed, while a mistyped mod asks, and so does any unknown
+/// key beside a page id.
 #[test]
 fn search_words_that_look_like_paths_or_operators_search() {
     let s = Sandbox::new("path-words");
@@ -2343,6 +2709,8 @@ fn search_words_that_look_like_paths_or_operators_search() {
         "before:2026-01 rust",
         "intitle:fatsearch",
         "rust inurl:docs intext:spawn after:2025 allintitle:tokio allinurl:x",
+        "discord embed og:image animated gif plays link preview",
+        "schema:org foo:bar",
     ] {
         let (out, rc) = keyed(q);
         assert!(out.contains(&format!("\nsearch \"{q}\" via oxy")) && rc == Some(0), "{q}: {out}");
@@ -2353,8 +2721,10 @@ fn search_words_that_look_like_paths_or_operators_search() {
         let (out, _) = keyed(cmd);
         assert!(out.contains(row) && !out.contains("\nsearch "), "{cmd}: {out}");
     }
-    let (out, rc) = keyed("rust countr:lt");
-    assert!(out.starts_with("? countr: unknown") && rc == Some(2), "{out}");
+    for (cmd, ask) in [("rust countr:lt", "? countr: "), ("rust wiat:30", "? wiat: "), ("u1 og:image", "? og: ")] {
+        let (out, rc) = keyed(cmd);
+        assert!(out.starts_with(&format!("{ask}unknown")) && rc == Some(2), "{cmd}: {out}");
+    }
     let mut run = s.cmd("-");
     let mut child = run.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().expect("run");
     std::io::Write::write_all(&mut child.stdin.take().expect("stdin"), b"hello from a pipe\n").expect("write");
@@ -2667,6 +3037,59 @@ fn cache_root_is_private() {
     let mode = std::fs::metadata(s.dir.join("cache")).expect("cache root").permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
     assert!(s.run("status").0.contains(" (mode 700) · "), "status shows it");
+}
+
+/// On a JSON page a word led by `.` is a path (`.data.chains`, `[0]` an index): the value pretty under an `=` line
+/// with its shape and size, a scalar as JSON (one row, no end row), one `[]` = the rest of the path in every item, a
+/// value a row (a second one refused); a path
+/// that is not there names the keys where it stops, rc 2; a long value pages on with `from:`. On any other page the
+/// same word is a filter. The keys row stays the map, nested arrays with their length.
+#[test]
+fn a_dot_path_reads_into_a_json_page() {
+    let s = Sandbox::new("jsonpath");
+    let big: Vec<String> = (1..=400).map(|i| format!("{{\"n\":{i},\"note\":\"row number {i}\"}}")).collect();
+    let chains = r#"[{"chainName":"ERC20","fee":"4"},{"chainName":"TRC20","fee":"1"},{"chainName":"SOL"}]"#;
+    let body =
+        format!(r#"{{"code":"200000","data":{{"currency":"USDC","chains":{chains}}},"big":[{}]}}"#, big.join(","));
+    s.file("api.json", &body);
+    s.file("p.html", &page("Notes", "<p>read .data.chains here</p>"));
+    let (out, rc) = s.run("./api.json");
+    assert!(rc == 0 && out.contains("\nu1#0 info | keys: code, data{2}, big[400]\n"), "{out}");
+    let (out, rc) = s.run("u1 .data");
+    assert!(rc == 0 && out.starts_with("= j1.u1 .data · keys: currency, chains[3] · "), "{out}");
+    assert!(out.contains("\n{\n \"currency\": \"USDC\",\n \"chains\": [\n  {\n   \"chainName\": \"ERC20\","), "{out}");
+    let (out, rc) = s.run("u1 .data.chains");
+    assert!(rc == 0 && out.starts_with("= j1.u1 .data.chains · 3 items · item keys: chainName, fee · "), "{out}");
+    let (out, rc) = s.run("u1 .data.chains[1].chainName");
+    assert!(rc == 0 && out.starts_with("= j1.u1 .data.chains[1].chainName · \"TRC20\" · "), "{out}");
+    assert_eq!(out.lines().skip(1).collect::<Vec<_>>(), ["\"TRC20\""], "a scalar as JSON, no end row: {out}");
+    let (out, rc) = s.run("u1 .data.chains[].fee");
+    assert!(rc == 0 && out.starts_with("= j1.u1 .data.chains[].fee · 2 values · "), "{out}");
+    assert_eq!(out.lines().skip(1).take(2).collect::<Vec<_>>(), ["\"4\"", "\"1\""], "one value a row: {out}");
+    let asks = [
+        ("u1 .data.foo", "? u1 .data.foo · keys at .data: currency, chains[3]\n"),
+        ("u1 .data.chains[7]", "? u1 .data.chains[7] · .data.chains is 3 items · item keys: chainName, fee\n"),
+        ("u1 .code.x", "? u1 .code.x · .code is \"200000\"\n"),
+        ("u1 .code[]", "? u1 .code[] · .code is \"200000\"\n"),
+        ("u1 .data.chains[].nope", "? u1 .data.chains[].nope · keys at .data.chains[0]: chainName, fee\n"),
+        ("u1 .data.chains[].x[]", "? u1 .data.chains[].x[] · one [] per path\n"),
+        ("u1 .nope", "? u1 .nope · keys at .: code, data{2}, big[400]\n"),
+    ];
+    for (cmd, want) in asks {
+        assert_eq!(s.run(cmd), (want.to_string(), 2), "{cmd}");
+    }
+    // a value past the read cap pages on by the path, as lists do
+    let (out, rc) = s.run("u1 .big[]");
+    let next = out.lines().last().unwrap_or_default();
+    assert!(rc == 0 && out.starts_with("= j1.u1 .big[] · 400 values · "), "{out}");
+    let from = next.strip_prefix("+").and_then(|r| r.split_once(" from:")).expect("a next page").1;
+    assert!(next.contains(" → fats u1 .big[] from:"), "{next}");
+    let (out, _) = s.run(&format!("u1 .big[] from:{from}"));
+    assert!(out.lines().nth(1).is_some_and(|l| l.starts_with(&format!("{{\"n\":{from},"))), "{out}");
+    // on a page that is no JSON the word filters, as before
+    s.run("./p.html");
+    let (out, rc) = s.run("u2 .data.chains");
+    assert!(rc == 0 && out.starts_with("= j2.u2 filter \".data.chains\" · 1 hit"), "{out}");
 }
 
 /// A text document (plain text, CSV, Markdown, JSON, XML, RSS, a sitemap) is served as it is from plain: `lN`

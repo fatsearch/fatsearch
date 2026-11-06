@@ -30,7 +30,8 @@ Agent connection (MCP)
  │ Do      add it once (below), then ask: “read example.com”
  │         runs only while your agent runs · no server, no account
  ╰─
-   {bold}Add it to your agent once (copy the line){/}
+   {bold}Add it to your agent once{/}: a button below, or {b} setup mcp claude|codex|cursor
+   By hand (copy the line):
    Claude Code  claude mcp add --scope user fats -- fats mcp
    Codex        codex mcp add fats -- fats mcp
    Cursor       ~/.cursor/mcp.json: { "mcpServers": { "fats": { "command": "fats", "args": ["mcp"] } } }
@@ -53,6 +54,7 @@ tell the user (never ask for the key in chat):
 3. open {url} , paste the key, press Save
 then: {b} setup   (when the user says done; end your turn, do not poll · checks it, $0)
 link dead ({life} min passed)? run {b} setup {short} again and give the user the new line 3
+no key coming (the user stopped)? {b} setup {short} stop ends the form, $0
 § ssh
 browser not on this machine (SSH)? the user runs {b} setup {short} in a terminal there and pastes the key
 § telemetry

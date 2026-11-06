@@ -168,6 +168,7 @@ second; a page waits its turn rather than buying a provider call. Providers use 
 **One tool. One string. Same commands.**
 
 ```sh
+fats setup mcp claude                                             # or codex, cursor: fats adds itself
 claude mcp add --scope user fats -- fats mcp                      # Claude Code
 codex mcp add fats -- fats mcp                                    # Codex
 {"mcpServers": {"fats": {"command": "fats", "args": ["mcp"]}}}   # Cursor, Desktop, …
@@ -207,7 +208,7 @@ gh skill install fatsearch/fatsearch      # the same through GitHub CLI ≥ 2.90
 ```
 
 An agent without either CLI reads it pinned to a release:
-`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.4/skills/fatsearch/SKILL.md`.
+`https://raw.githubusercontent.com/fatsearch/fatsearch/v0.2.5/skills/fatsearch/SKILL.md`.
 That way the agent sees versioned text it can review, and nothing it runs comes from a website.
 
 Docs as plain Markdown for agents: [fatsearch.com/llms.txt](https://fatsearch.com/llms.txt).

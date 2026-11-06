@@ -11,6 +11,8 @@
   ],
   "sectioning": ["article", "aside", "main", "nav", "section"],
   "sectioning_roles": ["article", "complementary", "main", "navigation", "region"],
+  "row": ["tr", "row"],
+  "cell": ["td", "th", "cell", "gridcell", "columnheader", "rowheader"],
   "cookie": ["cookie", "consent", "gdpr", "onetrust", "didomi", "usercentrics", "cookiebot", "qc-cmp", "cmp-banner"],
   "skip_link": ["login", "signin", "sign-in", "signup", "sign-up", "register", "logout", "share", "vote", "edit"],
   "magic": [["%PDF", "pdf"], ["PK\u0003\u0004", "zip"]],

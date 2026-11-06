@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 /// Doc schema version: a cached doc.json with another `v` is rebuilt from raw.html.
-pub const DOC_V: u32 = 17;
+pub const DOC_V: u32 = 18;
 /// A comment's section level: `COMMENT` + its depth in the thread (beyond `h6`, so no heading is one).
 pub const COMMENT: usize = 7;
 
@@ -27,6 +27,9 @@ pub struct Lists {
     /// Elements and ARIA roles that open a scope (a cookie banner is judged inside its scope only).
     sectioning: Vec<&'static str>,
     sectioning_roles: Vec<&'static str>,
+    /// A table's row and cell elements and ARIA roles (`part`).
+    row: Vec<&'static str>,
+    cell: Vec<&'static str>,
     /// Words in an id or class that mark a cookie or consent banner.
     cookie: Vec<&'static str>,
     /// Path words of links that are site chrome (log in, share, vote), never page links.
@@ -610,7 +613,8 @@ impl Render<'_> {
         let mut shapes: IndexMap<(&str, &str), Vec<usize>> = IndexMap::new();
         // a block or a custom element (`<x-item>`), never a table row (`row`) or inline markup (citations)
         let tag = |c: usize| t.nodes[c].tag.as_str();
-        let boxed = |c: usize| tag(c) != "tr" && (LISTS.block.contains(&tag(c)) || tag(c).contains('-'));
+        let boxed =
+            |c: usize| !part(&t.nodes[c], &LISTS.row) && (LISTS.block.contains(&tag(c)) || tag(c).contains('-'));
         for &c in kids.iter().filter(|&&c| boxed(c)) {
             shapes.entry(shape(&t.nodes[c])).or_default().push(c);
         }
@@ -710,8 +714,8 @@ impl Render<'_> {
         }
         match tag.as_bytes() {
             [b'h', d @ b'1'..=b'6'] if top && !quoted() => self.heading(id, scoped, usize::from(d - b'0')),
-            b"tr" if top => self.row(id, scoped),
             b"pre" if top => self.pre(id),
+            _ if top && part(n, &LISTS.row) => self.row(id, scoped),
             _ => self.inline_or_block(id, scoped, top),
         }
         if let Some((h, _)) = self.by.take_if(|b| b.1 == id).filter(|_| self.inline == 0) {
@@ -729,16 +733,17 @@ impl Render<'_> {
         self.lines.extend((!t.is_empty()).then_some(Line::H(level, t)));
     }
 
-    /// A table row: `| cell | cell |`. A layout row (a cell holds a table, shown) is its cells' blocks.
+    /// A table row (`part`): `| cell | cell |`. A layout row (a cell holds a table, shown) or one with no cell of its
+    /// own (a `role=row` around wrappers) is its blocks.
     fn row(&mut self, id: usize, scoped: bool) {
         self.flush();
         let tree = self.tree;
-        if held(tree, id, &|n| n.tag == "table") {
+        let td: Vec<usize> =
+            tree.nodes[id].kids.iter().filter_map(Kid::node).filter(|&c| part(&tree.nodes[c], &LISTS.cell)).collect();
+        if td.is_empty() || held(tree, id, &|n| n.tag == "table") {
             return self.kids(id, scoped);
         }
-        let td = |&c: &usize| matches!(tree.nodes[c].tag.as_str(), "td" | "th");
-        let td = tree.nodes[id].kids.iter().filter_map(Kid::node).filter(td);
-        let cells: Vec<String> = td.map(|c| self.text_of(c, scoped)).collect();
+        let cells: Vec<String> = td.into_iter().map(|c| self.text_of(c, scoped)).collect();
         self.lines.extend(cells.iter().any(|c| !c.is_empty()).then(|| Line::T(format!("| {} |", cells.join(" | ")))));
     }
 
@@ -900,6 +905,12 @@ fn byline(t: &Tree, tlen: &[usize], id: usize) -> bool {
 /// An element's shape for `groups`: its tag and first class.
 fn shape(n: &Node) -> (&str, &str) {
     (n.tag.as_str(), n.attr("class").and_then(|c| c.split_whitespace().next()).unwrap_or(""))
+}
+
+/// A table's row or cell (`row`, `cell` in clean.json) by its tag or its ARIA role: the role is the element's
+/// meaning (WAI-ARIA 1.2), so a `div` grid of `role=row` / `role=cell` reads as the table it says it is.
+fn part(n: &Node, of: &[&str]) -> bool {
+    of.contains(&n.tag.as_str()) || n.attr("role").is_some_and(|r| of.contains(&r.to_lowercase().as_str()))
 }
 
 /// Some element below `id` (never `id` itself) is `f`.
@@ -1425,16 +1436,19 @@ fn render<'a>(t: &'a Tree, tlen: &'a [usize], base: &str, mode: Mode, js: bool) 
     r
 }
 
-/// JSON one value per line, nesting shown by one space (indent costs tokens); not JSON → as it is.
-fn one_space(text: &str) -> Vec<u8> {
+/// JSON one value per line, nesting shown by one space (indent costs tokens).
+pub fn pretty(v: &Value) -> String {
     let mut out = serde_json::Serializer::with_formatter(Vec::new(), PrettyFormatter::with_indent(b" "));
-    // keys sorted (Python's `sort_keys=True` order)
+    v.serialize(&mut out).map_or_else(|_| v.to_string(), |()| String::from_utf8_lossy(&out.into_inner()).into())
+}
+
+/// `pretty` with keys sorted (Python's `sort_keys=True` order); not JSON → as it is.
+fn one_space(text: &str) -> Vec<u8> {
     let sorted = |mut v: Value| {
         v.sort_all_objects();
-        v.serialize(&mut out)
+        pretty(&v).into_bytes()
     };
-    let ok = matches!(serde_json::from_str::<Value>(text).map(sorted), Ok(Ok(())));
-    if ok { out.into_inner() } else { text.as_bytes().to_vec() }
+    serde_json::from_str::<Value>(text).map_or_else(|_| text.as_bytes().to_vec(), sorted)
 }
 
 /// Islands (what the served copy hides in templates and data scripts), after the served sections: `<template>` contents
@@ -2038,6 +2052,19 @@ mod tests {
 
     fn has(d: &Doc, needle: &str) -> bool {
         d.sections.iter().flat_map(|s| s.lines.iter()).any(|l| l.contains(needle))
+    }
+
+    /// A `div` grid with ARIA table roles (`row`, `columnheader`, `cell` around a `<p>`) is a table: a row a line.
+    #[test]
+    fn aria_rows_are_table_rows() {
+        let h = include_str!("../tests/fixtures/table-aria.html");
+        let d = build_doc(&parse(h), "https://docs.example/limits", "https://docs.example/limits", false);
+        let rows: Vec<&String> =
+            d.sections.iter().flat_map(|s| s.lines.iter()).filter(|l| l.starts_with('|')).collect();
+        assert_eq!(rows.len(), 9, "{rows:?}");
+        assert_eq!(rows[0], "| Plan | Traffic, GB | Total req/s | Render req/s |");
+        assert_eq!(rows[1], "| Free trial | 1 | 10 | 3 |");
+        assert_eq!(rows[8], "| Custom + | Custom | Custom | Custom |");
     }
 
     #[test]

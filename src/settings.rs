@@ -5,7 +5,7 @@
 use crate::telemetry::Level;
 use std::path::{Path, PathBuf, absolute};
 use std::sync::{LazyLock, OnceLock};
-use std::{collections::BTreeMap, env::home_dir, ops::RangeInclusive};
+use std::{collections::BTreeMap, env::home_dir, fmt::Debug, ops::RangeInclusive};
 
 /// A value and its source (`env FATS_X`, `default`).
 pub struct Set<T> {
@@ -191,8 +191,7 @@ pub fn on(name: &str) -> bool {
 
 /// Switch `name` on or off (`switched`). Err = the reason (`! refused · <it>`).
 pub fn set_on(name: &str, on: bool) -> Result<(), String> {
-    let off = switched(name, on)?;
-    save(PREFS, |f| f.off = off)
+    switched(name, on).and_then(|off| save(PREFS, |f| f.off = off))
 }
 
 /// THE switch rule: `settings.json`'s `off` with `name` switched, never leaving nothing that can fetch: after it,
@@ -214,12 +213,48 @@ pub fn switched(name: &str, on: bool) -> Result<Vec<String>, String> {
 }
 
 /// The settings `config set` takes besides the thresholds: the env readers', by their env name less `FATS_`.
-const READERS: [&str; 12] = [
-    "json", "nocache", "offline", "allow_private", "accept_md", "country", "chunk", "account_ttl", "session", "cache",
-    "telemetry", "telemetry_debug",
+const READERS: [&str; 10] = [
+    "json", "nocache", "offline", "accept_md", "country", "chunk", "account_ttl", "session", "telemetry",
+    "telemetry_debug",
 ];
-/// The env readers `config set` never takes: the key folder (where `settings.json` lives) and the human switch.
-const ENV_ONLY: [&str; 2] = ["key_dir", "human"];
+/// The env readers no command sets and `settings.json` never holds: the fences (the private-address fence; the
+/// cache dir, which bounds the MCP file fence), the key folder (where `settings.json` lives) and the human switch.
+/// A tool call can run `fats`, never set the env of the host that runs it.
+const ENV_ONLY: [&str; 4] = ["allow_private", "cache", "key_dir", "human"];
+/// The changes a tool call never makes (under MCP, `guard`): the home-IP brake and the usage counts, besides every
+/// `setup <name> on|off|<level>`. The speed knobs stay settable.
+const NOT_UNDER_MCP: [&str; 2] = ["plain_host_pace_ms", "telemetry"];
+
+/// How env-only setting `name` is set: `set FATS_CACHE=<dir> in the host's env, never from a tool call`.
+fn env_way(name: &str) -> String {
+    let v = if matches!(name, "cache" | "key_dir") { "<dir>" } else { "1" };
+    format!("set FATS_{}={v} in the host's env, never from a tool call", name.to_uppercase())
+}
+
+/// THE fence rule of a change (`config set|unset <name> …`, `setup <name> <on|off|level>`; `words` = what follows the
+/// verb): Some = (code, the `!` row). An env-only setting is never set, on the CLI and under MCP alike (`unset`
+/// removes an older fats' value: it only closes a fence); under MCP (`mcp`) so is every `setup` switch and a
+/// `NOT_UNDER_MCP` name, whatever the value.
+pub fn guard(words: &[&str], setup: bool, mcp: bool) -> Option<(&'static str, String)> {
+    let name = *if setup { words.first() } else { words.get(1) }?;
+    if !setup && ENV_ONLY.contains(&name) && words[0] == "set" {
+        return Some(("env_only", format!("! env_only {name} · {}", env_way(name))));
+    }
+    let verb = if setup { "setup" } else { "config" };
+    let row = format!("! not_under_mcp {verb} {} · run it in a terminal", words.join(" "));
+    (mcp && (setup || NOT_UNDER_MCP.contains(&name))).then_some(("not_under_mcp", row))
+}
+
+/// The same fence on a mod (under MCP, `cli::run`): a tool call never lowers a `NOT_UNDER_MCP` threshold below its
+/// setting for itself (`plain_host_pace_ms:0`); the whole call is refused, as `config set` is. Raising it is allowed.
+pub fn lowered(mods: &[(String, String)]) -> Option<crate::lang::Out> {
+    crate::cli::FENCE.get()?;
+    let set = |k: &str| get().limits.get(k).map_or(LIMITS.get(k), |s| Some(&s.value))?.as_f64();
+    let low = |(k, v): &&(String, String)| fits(k, v).and_then(|m| m.as_f64()).is_some_and(|m| Some(m) < set(k));
+    let (k, v) = mods.iter().filter(|m| NOT_UNDER_MCP.contains(&m.0.as_str())).find(low)?;
+    let row = format!("! not_under_mcp {k}:{v} · run it in a terminal");
+    Some(crate::lang::Out::fail("not_under_mcp", format!("= ! not_under_mcp {k}:{v} · $0"), row))
+}
 
 /// A name in the env (`FATS_<NAME>`) or `settings.json` that no setting reads (a removed or mistyped one): one
 /// `! unknown_setting` row each in `fats config`, never on every answer. Unit tests read no env.
@@ -233,7 +268,10 @@ pub fn unknown(s: &Settings) -> Vec<String> {
         None => format!("{} config unset {}", crate::lang::bin(), at.rsplit(' ').next().unwrap_or_default()),
     };
     let rows = env.chain(file).filter(|(n, _)| !known(n));
-    rows.map(|(_, at)| format!("! unknown_setting {at} · read by nothing → {}", fix(&at))).collect()
+    let rows = rows.map(|(_, at)| format!("! unknown_setting {at} · read by nothing → {}", fix(&at)));
+    // an older fats took `config set cache|allow_private`: such a value is never read, its row says how instead
+    let fenced = s.saved.set.keys().filter(|n| ENV_ONLY.contains(&n.as_str())).map(|n| format!("{PREFS} {n}"));
+    rows.chain(fenced.map(|at| format!("! env_only {at} · ignored → {}", fix(&at)))).collect()
 }
 
 /// `fats config set <name> <value>` into `settings.json`: a threshold of limits.json or a reader, checked by THE
@@ -477,22 +515,17 @@ impl Reader<'_> {
     /// Env `src` (`env FATS_JSON`), else its `settings.json` value (`json`): (value as text, source).
     fn raw(&self, src: &'static str) -> Option<(String, &'static str)> {
         let k = src.trim_start_matches("env ");
-        let v = self.file.get(&k.trim_start_matches("FATS_").to_lowercase());
+        let n = k.trim_start_matches("FATS_").to_lowercase();
+        let v = self.file.get(&n).filter(|_| !ENV_ONLY.contains(&n.as_str()));
         let file = v.map(|v| (v.as_str().map_or_else(|| v.to_string(), String::from), "settings.json"));
         (self.env)(k).map(|v| (v, src)).or(file)
     }
 
-    /// Env `k` (`src` = `env k`), else `settings.json`, as `parse` reads it, else `default`; a value it refuses
+    /// Env `k` (`src` = `env k`), else `settings.json`, as `fit` reads it, else `default`; a value it refuses
     /// gets a `! bad_setting` row naming `want`.
-    fn read<T: std::fmt::Debug>(
-        &mut self,
-        src: &'static str,
-        default: T,
-        want: &str,
-        parse: impl Fn(&str) -> Option<T>,
-    ) -> Set<T> {
+    fn read<T: Debug>(&mut self, src: &'static str, default: T, want: &str, fit: impl Fn(&str) -> Option<T>) -> Set<T> {
         let Some((v, from)) = self.raw(src) else { return Set { value: default, src: "default" } };
-        if let Some(value) = parse(&v) {
+        if let Some(value) = fit(&v) {
             return Set { value, src: from };
         }
         self.refuse(src.trim_start_matches("env "), from, &v, want, &format!("{default:?}"));
@@ -611,8 +644,8 @@ pub(crate) mod tests {
                 ("errors", 53),
                 ("check", 86),
                 ("sites", 69),
-                ("clean", 186),
-                ("words", 1613),
+                ("clean", 194),
+                ("words", 1620),
                 ("limits", 55),
                 ("telemetry", 10)
             ]

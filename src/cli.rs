@@ -5,12 +5,15 @@ use crate::cache::{Asset, Cache, Cursor, Detached, Done, Entry, HopRow, Meta, No
 use crate::clean::{Doc, host_of};
 use crate::fetch::{self, Hop, Plan};
 use crate::lang::{
-    At, CARD, Cmd, Flag, GUIDE, Id, Match, Out, WORDS, bang, bin, emit, fix, ksize, mib, parse, short, to_guide,
+    At, CARD, Cmd, Flag, GUIDE, Id, Match, Out, WORDS, bang, bin, emit, fix, ksize, mib, parse, restamp, short,
+    to_guide,
 };
 use crate::outline::{self, Page, Shown};
 use crate::provider::{self, Ask, Hit, Tier};
 use crate::{search, settings, stats};
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -38,15 +41,11 @@ pub fn fence(dirs: Vec<PathBuf>) {
 /// whether a path out there exists: `/x/y words` searches and `/x/y` is refused either way.
 pub fn outside(path: &Path) -> bool {
     let Some(dirs) = FENCE.get() else { return false };
-    let mut p = PathBuf::new();
-    for c in std::env::current_dir().unwrap_or_default().join(path).components() {
-        match c {
-            std::path::Component::ParentDir => {
-                p.pop();
-            }
-            c => p.push(c),
-        }
-    }
+    let up = |p: PathBuf, c| match c {
+        std::path::Component::ParentDir => p.parent().map(PathBuf::from).unwrap_or(p),
+        c => p.join(c),
+    };
+    let p = std::env::current_dir().unwrap_or_default().join(path).components().fold(PathBuf::new(), up);
     !dirs.iter().any(|d| p.starts_with(d) || d.canonicalize().is_ok_and(|d| p.starts_with(d)))
 }
 
@@ -88,7 +87,7 @@ fn json_of(cmd: &Cmd) -> bool {
 /// on user input.
 pub fn run(argv: &[String]) -> (String, i32, Option<String>) {
     let cmd = parse(argv);
-    if let Some(o) = crate::setup::key_in_argv(&cmd, argv) {
+    if let Some(o) = crate::setup::key_in_argv(&cmd, argv).or_else(|| settings::lowered(&cmd.mods)) {
         return (emit(&o, json_of(&cmd)), o.rc, None);
     }
     settings::mods(&cmd.mods);
@@ -168,11 +167,13 @@ fn footer(c: &Cache, lines: &[String], show: bool) -> String {
 }
 
 /// Every accepted mod is honoured or named here: a `!` row, never silently dropped. Honoured: match, dry, json,
-/// fresh, limit, max, cost, provider, js, country, timeout, wait; site and since by a web search; from by a list.
+/// fresh, limit, max, cost, provider, js, country, timeout, wait; site and since by a web search; from by a list or a
+/// JSON path.
 /// `more` beside a list (the old hint `u1 links more`) is named too: lists page by `from:K`.
 fn ignored(cmd: &Cmd) -> Vec<String> {
     let search = is_search(cmd);
     let (list, at) = (paged(cmd), cmd.ids.first().map(|i| i.page() + " "));
+    let path = cmd.words.iter().any(|w| w.starts_with('.')); // a JSON path pages too (`text::path`)
     let fix = |w| format!("! ignored more · lists page by from:K → {} {}{w} from:K", bin(), at.unwrap_or_default());
     let more = list.filter(|_| cmd.has("more")).map(fix);
     let row = |(k, v): &(String, String)| {
@@ -182,7 +183,7 @@ fn ignored(cmd: &Cmd) -> Vec<String> {
             "site" | "since" if !search || is_gh(cmd) => ("ignored", "only a web search uses it"),
             "country" if is_gh(cmd) => ("ignored", "only a web search or a page fetch uses it"),
             "zone" if !cmd.has("setup") => ("ignored", "only setup uses it"),
-            "from" if list.is_none() => ("ignored", "only a links, cards, media or comments list pages"),
+            "from" if list.is_none() && !path => ("ignored", "only a links, cards, media or comments list pages"),
             _ => return None,
         };
         // the arrow only to a command that does something without the mod (`fats u1`, never a bare `fats open`)
@@ -301,8 +302,7 @@ fn web(cmd: &Cmd, c: &mut Cache) -> Result<Out, Out> {
         return Ok(nothing_searched(&s, &what, rows));
     }
     let job = c.job_of(&cmd.raw).map_err(cache_write)?;
-    let served = found.as_ref().map_or("", |f| f.0.spec().name);
-    let meta = search_meta(&s, run.iter().map(Hop::row).collect(), served, t0);
+    let meta = search_meta(&s, run.iter().map(Hop::row).collect(), found.as_ref().map_or("", |f| f.0.spec().name), t0);
     let o = match found {
         Some((_, hits)) => listed(c, job, meta, &hits)?,
         // every provider failed: the record is kept (`j<N>`, the error answers in `error.txt`), then its row
@@ -554,8 +554,8 @@ fn serp_list(c: &mut Cache, job: usize, off: usize, new: bool) -> Out {
     o
 }
 
-/// `dry:true` of a search: the providers in order, the ids it would add, the most it can cost.
-fn search_dry(cmd: &Cmd, c: &Cache) -> Result<Out, Out> {
+/// `dry:true` of a search, its rows: the providers in order, the ids it would add, the most it can cost.
+fn search_dry(cmd: &Cmd, c: &Cache) -> Result<Vec<String>, Out> {
     let search = search_of(cmd)?;
     let (runs, max) = fetch::route(&search.plan);
     let cc = search.country.as_ref().map(|cc| format!(" · country:{cc}")).unwrap_or_default();
@@ -571,17 +571,18 @@ fn search_dry(cmd: &Cmd, c: &Cache) -> Result<Out, Out> {
     };
     let n = prefetch_n(cmd).min(search.limit);
     let pre = format!("then fetch:{n} prefetches the top {n} detached · free, plain only");
-    let mut o = Out::new(vec![
-        format!("= dry {} · spends nothing now", cmd.canon()),
-        line,
-        fetch::hedges(cmd.get("hedge")),
-        format!("run it: {} {}", bin(), cmd.with_mod("dry", None)),
-    ]);
-    if n > 0 && !runs.is_empty() && !off {
-        o.lines.insert(2, pre);
-    }
+    Ok(std::iter::once(line).chain((n > 0 && !runs.is_empty() && !off).then_some(pre)).collect())
+}
+
+/// A `dry:true` answer: its `=` line, `rows`, then the hedge and the command to run it, unless nothing would run
+/// (`none`: rc 1).
+fn dried(cmd: &Cmd, rows: Vec<String>, none: bool) -> Out {
+    let head = format!("= dry {} · spends nothing now", cmd.canon());
+    let tail = [fetch::hedges(cmd.get("hedge")), format!("run it: {} {}", bin(), cmd.with_mod("dry", None))];
+    let mut o = Out::new(std::iter::once(head).chain(rows).chain(tail.into_iter().filter(|_| !none)).collect());
+    o.rc = i32::from(none);
     o.set("cost", 0.0).set("dry", true);
-    Ok(o)
+    o
 }
 
 /// ` · ! no_key oxy · would try … → fats setup oxy` for the plan's tiers without a key (`fetch::no_key`)
@@ -627,10 +628,10 @@ pub fn plan(cmd: &Cmd, c: &Cache) -> Out {
         return out;
     }
     if is_search(cmd) {
-        return merged(search_dry(cmd, c));
+        return merged(search_dry(cmd, c).map(|rows| dried(cmd, rows, false)));
     }
     let mut dry = Dry { cmd, c, next: c.st.u.len(), refused: 0, total: 0.0 };
-    let mut lines = vec![format!("= dry {} · spends nothing now", cmd.canon())];
+    let mut lines = Vec::new();
     // a file: the run's own verdict on its path (`fenced`), refused or missing as the run would say, else its size
     for f in &cmd.files {
         let size = match fenced(f, &crate::lang::local_path(f)) {
@@ -654,8 +655,7 @@ pub fn plan(cmd: &Cmd, c: &Cache) -> Out {
         let cap = plan_of(cmd, None).cap;
         lines.push(format!("batch up to ${:.4} · cap ${cap:.4}", dry.total.min(cap)));
     }
-    let cur = c.st.cursor.clone().unwrap_or_default();
-    let ids = match (&cmd.ids[..], cur.u) {
+    let ids = match (&cmd.ids[..], c.st.cursor.as_ref().map_or(0, |k| k.u)) {
         ([], u) if u > 0 && cmd.urls.is_empty() && cmd.files.is_empty() => vec![Id { u, ..Id::default() }],
         (ids, _) => ids.to_vec(),
     };
@@ -667,15 +667,8 @@ pub fn plan(cmd: &Cmd, c: &Cache) -> Out {
         lines.push(dry.id_row(id));
     }
     // every row refused: there is nothing to run, and the plan is a failure
-    let none = dry.refused > 0 && dry.refused == lines.len() - 1;
-    if !none {
-        lines.push(fetch::hedges(cmd.get("hedge")));
-        lines.push(format!("run it: {} {}", bin(), cmd.with_mod("dry", None)));
-    }
-    let mut o = Out::new(lines);
-    o.rc = i32::from(none);
-    o.set("cost", 0.0).set("dry", true);
-    o
+    let none = dry.refused > 0 && dry.refused == lines.len();
+    dried(cmd, lines, none)
 }
 
 /// One `dry:true` run: the rows it prints come from here.
@@ -747,8 +740,7 @@ impl Dry<'_> {
     fn id_row(&mut self, i: &Id) -> String {
         let (cmd, c, page) = (self.cmd, self.c, i.page());
         if let Some(&li) = cmd.links.first() {
-            let link = load(c, i).and_then(|l| l.doc.ok()).and_then(|d| d.links.get(li.wrapping_sub(1)).cloned());
-            return match link {
+            return match load(c, i).and_then(|l| l.doc.ok()).and_then(|d| d.links.get(li.wrapping_sub(1)).cloned()) {
                 Some(u) => self.would(&format!("{page}{} l{li} {}", i.sec_tail(), short(&u, 60)), &u, None),
                 None => format!("{page}{} l{li} unknown · $0", i.sec_tail()),
             };
@@ -787,8 +779,7 @@ fn job_read(cmd: &Cmd, c: &mut Cache, j: usize) -> Out {
     let failed = c.serp(j).filter(|m| !m.ok).zip(c.job(j)).map(|(m, x)| search_out(c, &parse(&[x.cmd]), j, &m));
     let mut o = failed.map(merged).or_else(|| search_pending(c, j)).unwrap_or_else(|| job_view(c, j));
     if !cmd.words.is_empty() {
-        let q = cmd.words.join(" ");
-        o.warn(vec![format!("j{j} ! not_in_v1 multi-page filter → {} j{j}.u1 {q}", bin())]);
+        o.warn(vec![format!("j{j} ! not_in_v1 multi-page filter → {} j{j}.u1 {}", bin(), cmd.words.join(" "))]);
     }
     o
 }
@@ -921,6 +912,9 @@ fn dispatch_one(cmd: &Cmd, c: &mut Cache, cur: &Cursor, id: Id, new: bool) -> Ou
     // (`more`, `up`)
     let missed = || c.run(id.u).is_some_and(|(r, _)| r.done.as_ref().is_some_and(|d| !d.ok) && is_prefetch(&r));
     let again = refetch || (!cmd.ids.is_empty() && missed());
+    if cmd.has("raw") || cmd.has("headers") {
+        return kept(c, &id, cmd.has("raw"));
+    }
     if let Some(url) = c.st.result(id.u).filter(|e| mine && (e.dir.is_empty() || again)).map(|e| e.url.clone()) {
         return open_result(cmd, c, cur, id, &url);
     }
@@ -928,9 +922,25 @@ fn dispatch_one(cmd: &Cmd, c: &mut Cache, cur: &Cursor, id: Id, new: bool) -> Ou
         return fetch_again(cmd, c, &id);
     }
     if let Some(&li) = cmd.links.first() {
-        return open_link(cmd, c, &id, li);
+        return merged(open_link(cmd, c, &id, li));
     }
     if let Some(&k) = cmd.media.first() { asset(c, &id, k, cmd.fresh()) } else { read(cmd, c, cur, &id, new) }
+}
+
+/// `fats u3 raw`: one `=` line with the stored body's kind, size and the grep to run on its path; `fats u3 headers`:
+/// the served answer's status and headers as stored at fetch time. A cache read only, never a fetch.
+fn kept(c: &Cache, id: &Id, raw: bool) -> Out {
+    let Some(page) = load(c, id) else { return unknown(c, id) };
+    let (pid, path) = (&page.pid, page.dir.join(crate::cache::raw_name(&page.meta.kind)));
+    let Some(n) = std::fs::metadata(&path).ok().filter(|_| page.dir.is_dir()).map(|m| ksize(m.len() as usize)) else {
+        let why = if page.meta.hops.is_empty() { "not fetched" } else { "failed fetch" };
+        return Out::ask(&format!("? {pid} {} · no body kept ({why})", if raw { "raw" } else { "headers" }));
+    };
+    let (p, m) = (path.display(), &page.meta);
+    let none = if m.headers.is_empty() { " · none kept (a local file, or kept by an older fats)" } else { "" };
+    let row = format!("= {pid} raw · {} {n}B · grep: rg <re> {p}", m.kind);
+    let head = if raw { row } else { format!("= {pid} headers{none}") };
+    Out::new(std::iter::once(head).chain(m.headers.lines().map(String::from).filter(|_| !raw)).collect())
 }
 
 /// Pictures fetched on demand (`asset`): plain only, never a paid tier; an `image/*` answer of at most
@@ -1025,39 +1035,27 @@ fn open_result(cmd: &Cmd, c: &mut Cache, cur: &Cursor, id: Id, url: &str) -> Out
     out
 }
 
-/// A new id of `url` that a stored page points at (`u3 fresh`, `u3 l4`): its label says where it came from.
-fn refetch(c: &mut Cache, cmd: &Cmd, url: &str, from: &str) -> Out {
-    merged(fetch(c, Want { url, prov: Some(from), slot: None }, cmd))
-}
-
 /// `fresh:true` on a stored page: a refetch is a new id; the old snapshot stays readable.
 fn fetch_again(cmd: &Cmd, c: &mut Cache, id: &Id) -> Out {
     let Some(l) = load(c, id) else { return unknown(c, id) };
+    let (pid, b) = (&l.pid, bin());
     match l.meta.url.strip_prefix("file://") {
         Some(f) => merged(local(c, f, cmd)),
-        None if l.meta.url == "stdin:" => {
-            Out::ask(&format!("? {} came from stdin · pipe it again: … | {} -", l.pid, bin()))
-        }
-        None if l.meta.url.is_empty() => no_doc(&l.pid, &l.eq, &l.meta, &[], &NoDoc::Missing, None), // forgotten
-        None => refetch(c, cmd, &l.meta.url, &format!("{} fresh", l.pid)),
+        None if l.meta.url == "stdin:" => Out::ask(&format!("? {pid} came from stdin · pipe it again: … | {b} -")),
+        None if l.meta.url.is_empty() => no_doc(pid, &l.eq, &l.meta, &[], &NoDoc::Missing, None), // forgotten
+        None => merged(fetch(c, Want { url: &l.meta.url, prov: Some(&format!("{pid} fresh")), slot: None }, cmd)),
     }
 }
 
 /// `u3 l4`: fetch the page's link 4 as a new id.
-fn open_link(cmd: &Cmd, c: &mut Cache, id: &Id, li: usize) -> Out {
-    let Some(l) = load(c, id) else { return unknown(c, id) };
-    let doc = match &l.doc {
-        Ok(d) => d,
-        Err(why) => return no_doc(&l.pid, &l.eq, &l.meta, &[], why, None),
-    };
-    let sec = id.sec_tail();
+fn open_link(cmd: &Cmd, c: &mut Cache, id: &Id, li: usize) -> Result<Out, Out> {
+    let l = load(c, id).ok_or_else(|| unknown(c, id))?;
+    let doc = l.doc.as_ref().map_err(|why| no_doc(&l.pid, &l.eq, &l.meta, &[], why, None))?;
+    let n = doc.links.len();
+    let have = if n == 0 { "no links".into() } else { format!("have l1-l{n}") };
     match li.checked_sub(1).and_then(|i| doc.links.get(i)) {
-        Some(u) => refetch(c, cmd, u, &format!("{}{sec} l{li}", l.pid)),
-        None => {
-            let n = doc.links.len();
-            let have = if n == 0 { "no links".into() } else { format!("have l1-l{n}") };
-            Out::ask(&format!("? l{li} unknown on {} · {have} · {} {} links", l.pid, bin(), l.pid))
-        }
+        Some(url) => fetch(c, Want { url, prov: Some(&format!("{}{} l{li}", l.pid, id.sec_tail())), slot: None }, cmd),
+        None => Err(Out::ask(&format!("? l{li} unknown on {} · {have} · {} {} links", l.pid, bin(), l.pid))),
     }
 }
 
@@ -1071,10 +1069,16 @@ fn read(cmd: &Cmd, c: &mut Cache, cur: &Cursor, id: &Id, new: bool) -> Out {
     page_cmd(c, id, new, |p| {
         Ok(if let Some(kind) = WORDS.lists.iter().find(|w| cmd.has(w)) {
             outline::list(p, from, limit, &cmd.words, kind)
+        } else if p.doc.mode == "json" && cmd.words.len() == 1 && cmd.words[0].starts_with('.') {
+            crate::text::path(p, &cmd.words[0], (from, limit))?
         } else if !cmd.words.is_empty() {
             // `price\|cost`: its words are filtered, the `=` line says which (`filter "price cost"`)
             let split = search::unpiped(&cmd.words);
-            search::grep(p, split.as_deref().unwrap_or(&cmd.words), (rung, pinned), id.sec, limit)?
+            let mut s = search::grep(p, split.as_deref().unwrap_or(&cmd.words), (rung, pinned), id.sec, limit)?;
+            // `from:` beside a dot word on a page that is no JSON (`ignored` cannot see the page) is named too
+            let from = cmd.get("from").filter(|_| cmd.words.iter().any(|w| w.starts_with('.')));
+            s.0.extend(from.map(|v| format!("! ignored from:{v} · only a links, cards, media or comments list pages")));
+            s
         } else if cmd.has("all") {
             outline::outline_all(p)
         } else if cmd.has("media") {
@@ -1082,7 +1086,8 @@ fn read(cmd: &Cmd, c: &mut Cache, cur: &Cursor, id: &Id, new: bool) -> Out {
         } else if cmd.has("comments") {
             outline::comments(p, id.sec, from, limit)
         } else if cmd.has("full") && (1..=p.doc.sections.len()).contains(&id.sec.unwrap_or(1)) || more && cur.full {
-            outline::read_full(p, id.sec.or(cur.k.filter(|_| more)), if more && cur.full { cur.part + 1 } else { 0 })
+            let part = if more && cur.full { cur.part + 1 } else { 0 };
+            outline::read_full(p, id.sec.or(cur.k.filter(|_| more)), part, json_of(cmd))
         } else if let Some(k) = id.sec.or(cur.k.filter(|_| more)) {
             outline::read_sec(p, k, if more && cur.k == Some(k) { cur.part + 1 } else { id.part })?
         } else if cmd.has("more") {
@@ -1365,8 +1370,9 @@ pub(crate) fn no_doc(id: &str, eq: &str, m: &Meta, others: &[Meta], why: &NoDoc,
     let row = Flag { code: code.into(), what: detail, next, row: true }.bang(id) + &provider::pages(code, owners);
     // a copy the cap stopped: its `budget_hit` row (`fetch::skipped`) is its row, the arrow its own, unless a newer
     // copy served (the row points there)
-    let budget = fetch::budget_row(m, id, others).filter(|_| !newer);
-    let row = budget.map_or(row, |r| format!("{id} {r}"));
+    // a run that called no tier: its first key row is its row (`! off bd · turned off (key kept) → fats setup bd on`)
+    let key = fetch::no_key_left(m).first().filter(|_| m.hops.is_empty()).map(|r| restamp(r, id, &m.url));
+    let row = fetch::budget_row(m, id, others).or(key).filter(|_| !newer).map_or(row, |r| format!("{id} {r}"));
     let mut o = Out::fail(code, format!("= {eq} ! {code} {what}"), row);
     if let NoDoc::Zip(path) = why {
         o.set("kind", "zip").set("path", path.to_string_lossy().into_owned());
@@ -1389,8 +1395,7 @@ fn fetch_all(cmd: &Cmd, c: &mut Cache) -> Out {
             started.push(None);
             continue;
         }
-        let now = at_once(c, want(u), cmd).map(Err);
-        let id = now.unwrap_or_else(|| id_of(c, want(u), cmd).map(Ok));
+        let id = at_once(c, want(u), cmd).map(Err).unwrap_or_else(|| id_of(c, want(u), cmd).map(Ok));
         if let Ok(Ok((n, true))) = id {
             queued.push((n, want(u)));
         }
@@ -1574,25 +1579,42 @@ pub(crate) fn detach(id: String, log: &std::path::Path, lock: Option<std::fs::Fi
     std::os::unix::process::CommandExt::process_group(&mut p, 0);
     #[cfg(windows)] // CREATE_NO_WINDOW: no console window flashes up for the detached run (learn.microsoft.com)
     std::os::windows::process::CommandExt::creation_flags(&mut p, 0x0800_0000);
+    #[cfg(windows)] // the run inherits every inheritable handle: this process's stdio would hold its caller's pipe open
+    for out in [std::io::stdout().as_raw_handle(), std::io::stderr().as_raw_handle()] {
+        no_inherit(out, 1, 0);
+    }
     let mut child = p.spawn().map_err(|e| format!("fats --continue {id}: {e}"))?;
     // reaped when it ends while this process still runs (`fats mcp`); else the system reaps the orphan
     std::thread::spawn(move || (child.wait().ok(), keep));
     Ok(())
 }
 
+#[cfg(windows)]
+#[expect(unsafe_code, reason = "kernel32 declarations, safe to call with any handle value")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// HANDLE_FLAG_INHERIT off (`no_inherit(h, 1, 0)`): a handle a parent passed down stays inheritable, and a
+    /// child spawned with bInheritHandles (std's `Command`) gets it whatever its STARTUPINFO names
+    /// (learn.microsoft.com SetHandleInformation, CreateProcessW). Any handle value: an invalid one is an error.
+    #[link_name = "SetHandleInformation"]
+    safe fn no_inherit(handle: std::os::windows::io::RawHandle, mask: u32, flags: u32) -> i32;
+    /// A handle's device kind: 1 disk file, 2 console or NUL, 3 pipe or socket (learn.microsoft.com GetFileType).
+    #[link_name = "GetFileType"]
+    pub(crate) safe fn file_type(handle: std::os::windows::io::RawHandle) -> u32;
+}
+
 /// Windows: a detached run takes its lane's lock (`detach`) on a thread that waits while the launcher holds it,
 /// then keeps it while this process lives (the lock is a run's sign of life, `cache::run_at`).
 fn hold_lane(c: &Cache, n: usize) {
-    if let Ok(f) = std::fs::File::open(c.run_file(n, "lock")) {
-        std::thread::spawn(move || {
-            // held until the process exits (`main` exits with this thread parked); a spurious wake parks again
-            if f.lock().is_ok() {
-                loop {
-                    std::thread::park();
-                }
+    let Ok(f) = std::fs::File::open(c.run_file(n, "lock")) else { return };
+    std::thread::spawn(move || {
+        // held until the process exits (`main` exits with this thread parked); a spurious wake parks again
+        if f.lock().is_ok() {
+            loop {
+                std::thread::park();
             }
-        });
-    }
+        }
+    });
 }
 
 /// Run `n` as it ended, waiting while it lives (its lock held: a run that has not started yet answers `starting`)
@@ -1755,15 +1777,16 @@ fn routed(c: &mut Cache, run: &Detached, n: usize, seen: fetch::Seen) -> Done {
     // a page the cap left without a paid try failed on the budget, not the site (`budget_hit` on its `=` line and in
     // `stats`); one that bought a rung failed on what the rung met
     let starved = !hops.iter().any(|h| h.tier.spec().price > 0.0) && skipped.iter().any(|r| r.contains("budget_hit"));
-    got.meta.code = if starved { "budget_hit".into() } else { got.meta.code };
+    // a run that called no tier failed on its first skipped row (`! off bd`, `! no_key oxy`), never a blanket no_key
+    let first = skipped.first().filter(|_| hops.is_empty()).and_then(|r| r.split(' ').nth(1)).map(String::from);
+    got.meta.code = if starved { "budget_hit".into() } else { first.unwrap_or(got.meta.code) };
     let code = got.meta.code.clone();
     got.meta.extra.insert("skipped".into(), skipped.into());
     // who spent a batch's pool is read at each print (`fetch::budget_row`)
     got.meta.extra.extend(p.pool.as_ref().map(|(at, _)| ("pool".into(), at.to_string_lossy().into())));
     let file = got.file.as_ref().map(|(name, body)| (name.as_str(), body.as_slice()));
     let (index, error, doc) = (ok.then_some(url), got.error.as_deref(), got.doc.as_ref());
-    let snap = Snap { file, error, doc, meta: got.meta, index, slot: Some(n) };
-    if let Err(e) = c.ingest(snap, run.job, t0) {
+    if let Err(e) = c.ingest(Snap { file, error, doc, meta: got.meta, index, slot: Some(n) }, run.job, t0) {
         return Done { ok, code, cost, fail: Some(e), ..Done::default() };
     }
     Done { ok, code, cost, warn: fetch::ignored(&ask, &hops, &id).into_iter().collect(), fail: None }

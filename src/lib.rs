@@ -6,7 +6,7 @@
 //! cli (dispatch) · mcp (`fats mcp`, one tool) · settings (every knob + source) · tables (generated data) · telemetry
 //! (notice, update check, weekly counts).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)] // one reasoned exception: Windows kernel32 declarations (`cli::no_inherit`)
 
 pub mod cache;
 pub mod clean;

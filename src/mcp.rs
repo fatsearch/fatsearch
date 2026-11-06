@@ -6,7 +6,7 @@
 //! model, not the user, picks the path), and `-` (stdin) is refused because stdin carries the protocol.
 //! Failures are `!` rows in the text; protocol errors only for requests that are not a `fats` call.
 
-use crate::lang::{CARD, WORDS, local_path};
+use crate::lang::{CARD, Out, WORDS, bin, local_path};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult,
     PaginatedRequestParams, ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerConfig, Tool,
@@ -14,6 +14,7 @@ use rmcp::model::{
 };
 use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
+use std::path::PathBuf;
 
 /// The tool description: one line + two examples (~60 tokens) for clients that drop `instructions`.
 pub const DESCRIPTION: &str = "Web pages, PDFs and local documents as small cached Markdown with ids. \
@@ -34,11 +35,8 @@ pub fn instructions() -> String {
 }
 
 fn tool() -> Tool {
-    let schema = serde_json::json!({
-        "type": "object",
-        "properties": {"cmd": {"type": "string", "description": "e.g. u1#3"}},
-        "required": ["cmd"],
-    });
+    let cmd = serde_json::json!({"type": "string", "description": "e.g. u1#3"});
+    let schema = serde_json::json!({"type": "object", "properties": {"cmd": cmd}, "required": ["cmd"]});
     let schema = schema.as_object().cloned().unwrap_or_default();
     // not read-only (MCP ToolAnnotations): a call may spend provider credit and adds to the cache; additive only
     let hints = ToolAnnotations::new().read_only(false).destructive(false).open_world(true);
@@ -136,12 +134,15 @@ fn pixels(path: &std::path::Path) -> Option<(String, &'static str)> {
     Some((b64(out.into_inner()), "image/jpeg"))
 }
 
-/// The status row of the hosts: which of words.json `mcp_hosts` hold a server named `fats` where their own `mcp add`
-/// writes it (`read`): a TOML `[mcp_servers.fats]` table (Codex) or a JSON `mcpServers.fats` at the top level
-/// (Claude Code's user scope and project `.mcp.json`, Cursor) or under `projects.<this working dir>` (Claude Code's
-/// local scope: another project's server is not this one's; its key matched as `cli::dir_key`). Never `ready` while
-/// none does: a model relays that word as "connected".
-pub fn hosts_row(b: &str) -> String {
+/// A words.json `mcp_hosts` row: (name, the config files its `mcp add` writes, that command by hand with `{b}` =
+/// the server's command, or none: fats writes the first file itself; the name a person knows).
+pub type Host = (&'static str, Vec<&'static str>, &'static str, &'static str);
+
+/// THE added rule: the first of `h`'s files (`read`) holding a server named `fats`: a TOML `[mcp_servers.fats]`
+/// table (Codex) or a JSON `mcpServers.fats` at the top level (Claude Code's user scope and project `.mcp.json`,
+/// Cursor) or under `projects.<this working dir>` (Claude Code's local scope: another project's server is not this
+/// one's; its key matched as `cli::dir_key`). As words.json names it.
+pub fn added_at(h: &Host) -> Option<&'static str> {
     let here = crate::cli::dir_key(&std::env::current_dir().unwrap_or_default().to_string_lossy());
     let json = |v: serde_json::Value| {
         let local = v["projects"].as_object().into_iter().flatten().filter(|(k, _)| crate::cli::dir_key(k) == here);
@@ -150,20 +151,144 @@ pub fn hosts_row(b: &str) -> String {
     let toml = |t: &str| t.lines().any(|l| l.trim() == "[mcp_servers.fats]");
     // a file that never names `fats` is never parsed (`~/.claude.json` keeps every project's state)
     let on = |t: String| toml(&t) || t.contains("fats") && serde_json::from_str(&t).is_ok_and(json);
-    let added: Vec<&str> =
-        WORDS.mcp_hosts.iter().filter(|h| h.1.iter().filter_map(read).any(on)).map(|h| h.0).collect();
-    let all = WORDS.mcp_hosts.iter().map(|h| h.0).collect::<Vec<_>>().join(", ");
-    match WORDS.mcp_hosts.first().filter(|_| added.is_empty()) {
-        Some(h) => format!("mcp: not added to {all} · add: {}", h.2.replace("{b}", b)),
-        None => format!("mcp: added to {} · stdio, one tool fats(cmd)", added.join(", ")),
+    h.1.iter().copied().find(|p| std::fs::read_to_string(path_of(p)).is_ok_and(on))
+}
+
+/// The hosts' names joined by `sep`: those holding fats (`added_at`) when `added` is true, those that do not when
+/// false, else all of them.
+fn names(added: Option<bool>, sep: &str) -> String {
+    let on = |h: &&Host| added.is_none_or(|a| a == added_at(h).is_some());
+    WORDS.mcp_hosts.iter().filter(on).map(|h| h.0).collect::<Vec<_>>().join(sep)
+}
+
+/// The status row of the hosts (`added_at`) and the command that adds fats to one; under `fats mcp` the server's
+/// own. Never `ready` while none holds it: a model relays that word as "connected". The add is `· add:`, never an
+/// arrow: a status with no key has one next move (`→ fats setup oxy`), and a second arrow gets relayed as a step.
+pub fn hosts_row(b: &str) -> String {
+    let (added, left) = (names(Some(true), ", "), names(Some(false), "|"));
+    let add = if left.is_empty() { String::new() } else { format!(" · add: {b} setup mcp {left}") };
+    match (crate::cli::FENCE.get(), added.is_empty()) {
+        (Some(_), _) => "mcp: serving (this process) · local files from the working directory + the cache".into(),
+        (None, true) => format!("mcp: not added to {}{add}", names(None, ", ")),
+        (None, false) => format!("mcp: added to {added} · stdio, one tool fats(cmd){add}"),
     }
 }
 
-/// A host's config file as words.json `mcp_hosts` names it (`lang::local_path`: `~/` = the home dir), its text:
+/// The menu's agent connection buttons (`p` = `mcp`, else none): `Add to <host>` each, `· added ✓` once it holds
+/// fats (`added_at`).
+pub fn buttons(p: &str) -> impl Iterator<Item = String> {
+    let row = |h: &Host| format!("Add to {}{}", h.3, ["", " · added ✓"][usize::from(added_at(h).is_some())]);
+    WORDS.mcp_hosts.iter().filter(move |_| p == "mcp").map(row)
+}
+
+/// Button `at` of screen `p` pressed: fats added to that host (`add`), the row it said. None = no host's button.
+pub fn pressed(p: &str, at: usize, dry: bool) -> Option<String> {
+    add(&[WORDS.mcp_hosts.get(at).filter(|_| p == "mcp")?.0], dry).lines.pop()
+}
+
+/// A host's config file as words.json `mcp_hosts` names it (`lang::local_path`: `~/` = the home dir):
 /// `VAR=dir/file` = `$VAR/file` while `$VAR` is set (`settings::env`), else `dir/file` (Codex's `CODEX_HOME`).
-fn read(p: &&str) -> Option<String> {
+fn path_of(p: &str) -> std::path::PathBuf {
     let set = p.split_once('=').and_then(|(v, p)| Some(crate::settings::env(v)? + &p[p.rfind('/')?..]));
-    std::fs::read_to_string(local_path(set.as_deref().unwrap_or(p.rsplit('=').next().unwrap_or(p)))).ok()
+    local_path(set.as_deref().unwrap_or(shown(p)))
+}
+
+/// `fats setup mcp [<host>]`: no host = which hosts hold fats and the command per host; a host = fats added to it
+/// for the user: its own `mcp add` run when the host has one (`run`), else its file written (`write`); `dry` names
+/// the command or the file and touches nothing. A tool call never gets here (`settings::guard`: `not_under_mcp`).
+pub fn add(host: &[&str], dry: bool) -> Out {
+    let Some(name) = host.first() else { return Out::new(vec![format!("= setup {}", hosts_row(bin()))]) };
+    let Some(h) = WORDS.mcp_hosts.iter().find(|h| h.0 == *name) else {
+        return Out::ask(&format!("? setup mcp {name} · hosts: {} setup mcp {}", bin(), names(None, "|")));
+    };
+    match (added_at(h), h.2.contains("{b}")) {
+        (Some(at), _) => Out::new(vec![format!("= setup mcp {name} already added · {} · $0", shown(at))]),
+        (None, true) => run(h, dry),
+        (None, false) if dry => Out::new(vec![format!("= dry setup mcp {name} · would write {} · $0", h.1[0])]),
+        (None, false) => write(h),
+    }
+}
+
+/// A config file as a person reads it: `~/.codex/config.toml`, never `CODEX_HOME=`.
+fn shown(p: &str) -> &str {
+    p.rsplit('=').next().unwrap_or(p)
+}
+
+/// The server's command: this binary by the name a shell finds it when that is this same file (`/opt/homebrew/bin/
+/// fats` outlives an upgrade; the versioned path behind it does not), else its own path; on Windows behind `cmd /c`.
+fn server() -> Vec<String> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| bin().into());
+    let same = |p: &PathBuf| std::fs::canonicalize(p).ok() == std::fs::canonicalize(&exe).ok();
+    let path = on_path(bin()).filter(same).unwrap_or(exe).display().to_string();
+    if cfg!(windows) { vec!["cmd".into(), "/c".into(), path] } else { vec![path] }
+}
+
+/// The first `name` in `PATH`'s dirs (Windows: `.exe`, `.cmd`, `.bat`), as a shell finds it.
+fn on_path(name: &str) -> Option<PathBuf> {
+    let ext: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat"] } else { &[""] };
+    let dirs = std::env::var_os("PATH")?;
+    std::env::split_paths(&dirs)
+        .flat_map(|d| ext.iter().map(move |e| d.join(format!("{name}{e}"))))
+        .find(|p| p.is_file())
+}
+
+/// The host's own `mcp add` (`h.2`, `{b}` = `server`), run when its binary is on `PATH`; its rc and first line of
+/// output said when it fails. Without the binary: `no_host` and the command to type, never a success.
+fn run(h: &Host, dry: bool) -> Out {
+    let server = server();
+    let words: Vec<String> =
+        h.2.split(' ').flat_map(|w| if w == "{b}" { server.clone() } else { vec![w.into()] }).collect();
+    let quote = |w: &String| if w.contains(' ') { format!("'{w}'") } else { w.clone() };
+    let line = words.iter().map(quote).collect::<Vec<_>>().join(" ");
+    let (name, tool) = (h.0, words[0].as_str());
+    let fail = |code: &str, why: String| {
+        Out::fail(code, format!("= ! {code} setup mcp {name} · nothing added · $0"), format!("! {code} {name} · {why}"))
+    };
+    let Some(exe) = on_path(tool) else {
+        return fail("no_host", format!("{tool} not on PATH · install {} first, or add by hand: {line}", h.3));
+    };
+    if dry {
+        return Out::new(vec![format!("= dry setup mcp {name} · would run {line} · $0")]);
+    }
+    let ran = std::process::Command::new(exe).args(&words[1..]).stdin(std::process::Stdio::null()).output();
+    // `added` only once the host's own file holds fats (an alias or a wrapper can exit 0 and write nothing)
+    match ran {
+        Ok(_) if added_at(h).is_some() => Out::new(vec![format!("= setup mcp {name} added · {line} · $0")]),
+        Ok(o) if o.status.success() => fail("host_failed", format!("ran {line}, fats not in {}", shown(h.1[0]))),
+        Ok(o) => {
+            let said = [o.stderr, o.stdout].map(|b| String::from_utf8_lossy(&b).trim().to_string());
+            let first = said.iter().find_map(|s| s.lines().next()).unwrap_or("no output");
+            fail("host_failed", format!("rc {} · {first}", o.status.code().unwrap_or(-1)))
+        }
+        Err(e) => fail("host_failed", format!("{tool} did not start: {e}")),
+    }
+}
+
+/// A host with no `mcp add` (Cursor): `mcpServers.fats` = `{command, args}` written into its first file, every
+/// other server and key kept; a file that is not a JSON object is left as it is (`host_failed`).
+fn write(h: &Host) -> Out {
+    let (name, at) = (h.0, shown(h.1[0]));
+    let server = [server(), vec!["mcp".into()]].concat();
+    let entry = serde_json::json!({"command": server[0], "args": server[1..]});
+    let fail = |why: String| {
+        let row = format!("! host_failed {name} · {at} {why} · add by hand: mcpServers.fats = {entry}");
+        Out::fail("host_failed", format!("= ! host_failed setup mcp {name} · nothing written · $0"), row)
+    };
+    let file = path_of(h.1[0]);
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut v: serde_json::Value = match serde_json::from_str(if text.trim().is_empty() { "{}" } else { &text }) {
+        Ok(v) => v,
+        Err(e) => return fail(format!("is not JSON ({e})")),
+    };
+    let servers = v.as_object_mut().map(|o| o.entry("mcpServers").or_insert_with(|| serde_json::json!({})));
+    let Some(servers) = servers.and_then(serde_json::Value::as_object_mut) else {
+        return fail("holds no mcpServers object".into());
+    };
+    servers.insert("fats".into(), entry.clone());
+    match crate::cache::jsave(&file, &v) {
+        Ok(()) => Out::new(vec![format!("= setup mcp {name} added · {at} · $0")]),
+        Err(e) => fail(format!("not written: {e}")),
+    }
 }
 
 /// Serve on stdin/stdout until the client closes stdin (the parent exited). Exit code for `main`.

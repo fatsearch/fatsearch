@@ -45,16 +45,20 @@ pub struct Words {
     file_tlds: Vec<&'static str>,
     /// Key and credential file names (`.env.*` = a prefix), matched on the bare name: `cli::secret`.
     pub secret_names: Vec<&'static str>,
+    /// Headers that carry a credential, the site's or ours: never kept with a page (`provider::header_lines`).
+    pub secret_headers: Vec<&'static str>,
     /// A filter for only these words that finds nothing points to the page's media list (`search::grep`).
     pub media: Vec<&'static str>,
     /// Agent hosts by the env marker each sets for the commands it runs (`stats::host_of`): `CLAUDECODE` (Claude
     /// Code's shell), `CODEX_THREAD_ID` (Codex's exec env), `PI_CODING_AGENT` (pi); the first set one wins.
     pub hosts: Vec<(&'static str, &'static str)>,
-    /// The hosts `fats status` names: the files its `mcp add` writes (`mcp::read`), then how to add fats (`{b}` =
-    /// the binary): Claude Code's user and local scopes in `~/.claude.json`, its project scope in `./.mcp.json`
+    /// The hosts `fats status` names and `fats setup mcp <host>` adds fats to: the files its `mcp add` writes
+    /// (`mcp::read`), that command (`{b}` = the server's command; none = fats writes the first file), the name a
+    /// person knows: Claude Code's user and local scopes in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` while
+    /// that is set, code.claude.com/docs/en/claude-directory), its project scope in `./.mcp.json`
     /// (code.claude.com/docs/en/mcp), Codex's `$CODEX_HOME/config.toml` (developers.openai.com/codex/mcp), Cursor's
-    /// global and project files (cursor.com/docs/context/mcp). The first one's way is the row's while none holds fats.
-    pub mcp_hosts: Vec<(&'static str, Vec<&'static str>, &'static str)>,
+    /// global and project files (cursor.com/docs/context/mcp).
+    pub mcp_hosts: Vec<(&'static str, Vec<&'static str>, &'static str, &'static str)>,
     /// What an SSH login sets (OpenSSH, ssh(1) ENVIRONMENT): `fats setup <p>` adds the key's SSH way only then.
     pub ssh: Vec<&'static str>,
     /// Words a filter never looks for (`search::terms_of`, the title query).
@@ -180,10 +184,12 @@ pub struct At<'a> {
 pub fn fix(code: &str, at: &At) -> String {
     let hit = |k: &str| k.strip_suffix('*').map_or(k == code, |p| code.starts_with(p));
     let t = FIX.iter().find(|r| hit(r.0)).map_or(RETRY, |r| r.1);
-    let f = draw(t, &[("b", bin()), ("id", at.id), ("url", at.url), ("arg", at.arg)]);
+    // a missing key the environment holds (`settings::env_key`, never sent) is copied in, never typed again
+    let env = code == "no_key" && crate::settings::env_key(at.arg).is_some();
+    let f = draw(t, &[("b", bin()), ("id", at.id), ("url", at.url), ("arg", if env { "import-env" } else { at.arg })]);
     // a missing key's move: a human at a terminal runs its setup; an agent runs it itself and hands the user the
     // numbered steps it prints (read as a command for the user, an agent asked a plain user to run it)
-    if code == "no_key" && !at.arg.is_empty() && HUMAN.get() != Some(&true) {
+    if code == "no_key" && !at.arg.is_empty() && !env && HUMAN.get() != Some(&true) {
         return format!("run {f}, give the user its 3 lines");
     }
     // `js:true` = the table's first render rung (`Tier::renders`: oxyjs), the render it adds to bd's
@@ -359,8 +365,7 @@ impl Id {
     }
 
     pub fn page(&self) -> String {
-        let job = self.job.map(|j| format!("j{j}.")).unwrap_or_default();
-        format!("{job}u{}", self.u)
+        format!("{}u{}", self.job.map(|j| format!("j{j}.")).unwrap_or_default(), self.u)
     }
 }
 
@@ -610,6 +615,15 @@ fn modifier(k: &str, v: &str) -> Result<(String, String), String> {
         return Err(format!("? {k}: unknown · keys {}", WORDS.keys.join(" ")));
     }
     value(&k, v).map(|v| (k, v))
+}
+
+/// A key that is no mod, alias or threshold and not one edit from a mod: a search word as typed (`og:image`,
+/// `schema:org`); a mistyped mod (`wiat:30`, `jsn:true`) asks.
+fn free_key(k: &str, v: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    let near = WORDS.keys.iter().any(|m| strsim::osa_distance(&k, m) < 2);
+    // an alias (`n:`, `geo:`) renames its key, or errs on its value (`loose:x`)
+    !near && alias(&k, v).is_ok_and(|a| a.0 == k) && !crate::settings::LIMITS.contains_key(k.as_str())
 }
 
 /// A key's other spellings (`n` `geo` `budget` `ua` `loose`) → (key, value).
@@ -924,7 +938,9 @@ fn class_of(t: &str, has_id: bool, any_id: bool, verb: bool) -> Result<Class, St
     if let Some(r) = WORDS.reserved.iter().copied().find(|r| *r == low).or(alias) {
         return Ok(Class::Res(r));
     }
-    if shaped(t) && !low.starts_with("file:") {
+    // beside a page a dot-led word with no path separator is the page's to read (`u5 .data.chains[0]`: a JSON path,
+    // else a filter)
+    if shaped(t) && !low.starts_with("file:") && !(has_id && t.starts_with('.') && !t.contains(['/', '\\'])) {
         // a drive (`C:\x`) before any `key:value` reading: a path, never `? c: unknown`
         return Ok(Class::File(t.to_string()));
     }
@@ -937,8 +953,9 @@ fn class_of(t: &str, has_id: bool, any_id: bool, verb: bool) -> Result<Class, St
         return path.ok_or(format!("? {t}: a file URL names a local path: {} /path/to/file", bin()));
     }
     if let Some((k, v)) = key_value(t) {
-        // a search engine's own query key (`filetype:pdf`) goes to the search as typed
-        if WORDS.operators.contains(&k.to_ascii_lowercase().as_str()) {
+        // a search engine's own query key (`filetype:pdf`) goes to the search as typed, a free key too (`og:image`);
+        // beside an id a key can only be a mod: an unknown one asks
+        if WORDS.operators.contains(&k.to_ascii_lowercase().as_str()) || !has_id && free_key(k, v) {
             return Ok(Class::Word);
         }
         return modifier(k, v).map(|(k, v)| Class::Mod(k, v));
@@ -1050,12 +1067,13 @@ fn number_ask(cmd: &Cmd, n: &str) -> String {
     }
 }
 
-/// `setup <name> [on|off]`, `config set <name> <value>`, `config unset <name>`: the command's own words, from
+/// `setup <name> [on|off|stop]`, `config set <name> <value>`, `config unset <name>`: the command's own words, from
 /// `toks[i]` (`plain` = the free switch's other name). Nothing else follows `setup` but mods and command words: a
 /// word there is a `?` (`? setup oxi → fats setup oxy`, a switch or on/off one edit away), never a paid search.
 fn own_words(cmd: &mut Cmd, toks: &mut Vec<String>, i: usize) {
     let at = |k: usize| toks.get(i + k).map(|t| t.to_lowercase()).unwrap_or_default();
-    let (verb, on, switches) = (toks[i].to_lowercase(), at(2) == "on" || at(2) == "off", crate::settings::SWITCHES);
+    let (verb, on, switches) =
+        (toks[i].to_lowercase(), ["on", "off", "stop"].contains(&at(2).as_str()), crate::settings::SWITCHES);
     let own = |t: &String| {
         !HELP_FLAGS.contains(&t.as_str())
             && t != "json"
@@ -1064,7 +1082,7 @@ fn own_words(cmd: &mut Cmd, toks: &mut Vec<String>, i: usize) {
     let n = match (verb.as_str(), at(1).as_str()) {
         ("setup", w) if switches.contains(&w) || w == "plain" => 1 + usize::from(on),
         // the level is checked by `settings::set`, which names the levels
-        ("setup", "telemetry") => 1 + usize::from(toks.get(i + 2).is_some_and(own)),
+        ("setup", "telemetry" | "mcp") => 1 + usize::from(toks.get(i + 2).is_some_and(own)),
         ("telemetry", "show") | ("setup", "import-env") => 1,
         // the value is every word up to the mods, whole (`~/Library/Application Support/x` is a cache dir)
         ("config", "set") => 3 + toks.iter().skip(i + 4).take_while(|t| own(t)).count(),
@@ -1081,9 +1099,10 @@ fn own_words(cmd: &mut Cmd, toks: &mut Vec<String>, i: usize) {
     }
     let word = |t: &&String| own(t) && matches!(class_of(t, false, false, true), Ok(Class::Word));
     let Some(w) = toks[i + 1..].iter().find(word).filter(|_| verb == "setup") else { return };
-    let near = switches.into_iter().chain(["on", "off"]).find(|n| strsim::osa_distance(&w.to_lowercase(), n) == 1);
+    let near =
+        switches.into_iter().chain(["on", "off", "stop"]).find(|n| strsim::osa_distance(&w.to_lowercase(), n) == 1);
     let (raw, b, all) = (&cmd.raw, bin(), switches.join("|"));
-    let fix = near.map_or(format!(" · {b} setup <{all}|plain> [on|off] · zone:<name>"), |n| {
+    let fix = near.map_or(format!(" · {b} setup <{all}|plain> [on|off|stop] · zone:<name>"), |n| {
         format!(" → {b} {}", raw.replace(w.as_str(), n))
     });
     cmd.ask = Some(format!("? {raw}{fix}"));
@@ -1209,18 +1228,14 @@ pub fn redact(text: &str, secrets: &[String]) -> String {
             }
         }
     }
-    if !hide.contains(&true) {
-        return text.to_string();
-    }
+    // a hidden run is whole chars (a secret's substring), so the byte before a char says whether its run goes on
     let mut out = String::with_capacity(text.len());
-    let mut masked = false;
     for (i, c) in text.char_indices() {
-        match (hide[i], masked) {
-            (true, false) => out.push_str(MASK),
-            (false, _) => out.push(c),
-            _ => {}
+        if !hide[i] {
+            out.push(c);
+        } else if i == 0 || !hide[i - 1] {
+            out.push_str(MASK);
         }
-        masked = hide[i];
     }
     out
 }
@@ -1448,6 +1463,9 @@ pub(crate) mod tests {
         ("docs.rs/tokio/latest/tokio spawn", "https://docs.rs/tokio/latest/tokio spawn"),
         // a dot-led name is a path wherever it stands; one leading a TLD, a digit or no name is a word
         ("summary .env", ".env summary"),
+        // a key that is no mod nor near one is a search word as typed
+        ("discord embed og:image gif", "discord embed og:image gif"),
+        ("x foo:1 schema:org", "x foo:1 schema:org"),
         (".ssh/config", ".ssh/config"),
         ("learn .NET core .io ... .5mm", "learn .NET core .io ... .5mm"),
     ];
@@ -1455,7 +1473,10 @@ pub(crate) mod tests {
     /// Inputs that ask: input → the start of the `?` line.
     const ASKS: &[(&str, &str)] = &[
         ("u2#3 4", "? 4: link → "),
-        ("x foo:1", "? foo: unknown · keys limit match"),
+        // beside an id a key can only be a mod; in a search a mod one edit away is a typo
+        ("u1 og:image", "? og: unknown · keys limit match"),
+        ("x wiat:30", "? wiat: unknown · keys"),
+        ("x jsn:true", "? jsn: unknown · keys"),
         ("rust countr:lt", "? countr: unknown · keys"),
         ("notes.md hello", "? notes.md: a missing file or a site · type ./notes.md or https://notes.md"),
         // a lone name ending in a file's extension that is no file here asks; beside words it leads a site search

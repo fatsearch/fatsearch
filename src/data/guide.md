@@ -1,7 +1,6 @@
 # fatsearch (`fats`): read pages without flooding context
 
 `fats` (package fatsearch): CLI + MCP server (`fats mcp`, one tool `fats(cmd)`, same command line).
-One screen: `fats help`.
 Reference: github.com/fatsearch/fatsearch docs/reference.md.
 
 ## Rules (each one an agent mistake)
@@ -31,18 +30,19 @@ fats u1 links       # numbered; fats l7 opens one, fats l7 dry:true = price firs
 fats u1 comments    # top level, most replies first; fats u1#5 = one + replies
 fats u1 media       # photos; fats u1 m1 saves one (MCP: returns it)
 fats u1 all         # every section, one line (outline says +N sections)
-fats u1 full        # whole cleaned page, paged
+fats u1 full > f    # whole page; then grep f
 fats rust async runtime limit:5  # web search: unfetched ids, top one prefetched free; site:docs.rs
 fats gh <words>     # GitHub repos by stars, free
 fats ./x.pdf        # section per page; fats ./page.html too
 fats a b c          # batch: 8 in parallel, one summary
 fats stats          # session index: a row per fetch, provider ms cost tok
-fats stats full     # + bytes → tokens, numbers lost
 fats                # status: keys, cache, provider health
 fats config         # every setting + its source
 fats telemetry show # anonymous usage stats (no URL, search, key), as sent
 fats setup telemetry off  # stop them
 ```
+
+JSON API URL: fats <url> = key map; fats u5 .data.chains reads a path
 
 Mods: dry:true plan + worst price, $0 · js:true force render · fresh:true refetch, paid, new id · wait:30 s
 before pending · timeout:150 · max:1k cap output · country:de · provider:plain|bd|oxy|decodo ·
@@ -83,7 +83,7 @@ only, no search). Keys live in auth.json only; `fats | grep '^keys'` shows each 
 `fats config` rows build · limits.json = knobs. Try as mod (batch_parallel:8), then env FATS_BATCH_PARALLEL=8,
 or keep: `fats config set batch_parallel 8` (`fats config unset batch_parallel` = default); `fats config` shows
 the source. Useful: batch_parallel (8 lanes), cache_idle_s / cache_ttl_s, read_cap, plain_host_pace_ms
-(home-IP brake: lower only on user's say-so). Per call: hedge: wait: timeout: cost:
+(home-IP brake: the user lowers it, in a terminal). Per call: hedge: wait: timeout: cost:
 
 ## Not yet
 

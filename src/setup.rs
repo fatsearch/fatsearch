@@ -7,7 +7,7 @@
 
 use crate::cache::{Cache, jload, jsave, now};
 use crate::clean::esc;
-use crate::lang::{Cmd, NO_HOLES, Out, bin, draw, paint};
+use crate::lang::{At, Cmd, NO_HOLES, Out, bang, bin, draw, paint};
 use crate::provider::{KEYS, Links, PROVIDERS, links};
 use crate::settings::{self, SWITCHES};
 use crate::telemetry::Level;
@@ -261,8 +261,7 @@ fn rows() -> Vec<&'static str> {
 /// The main list until q or Done: the done line.
 fn walk(t: &mut Term, only: Option<&'static str>) -> String {
     // `only`'s screen first: q there (None) quits; the marks are read after the walk (what it changed)
-    let quit = only.is_some_and(|p| open(t, p).is_none());
-    if !quit {
+    if only.is_none_or(|p| open(t, p).is_some()) {
         list_loop(t, &rows(), page("intro").trim_end());
     }
     format!("= setup done · {} · try: {} example.com", marks(), bin())
@@ -301,18 +300,21 @@ fn open(t: &mut Term, p: &'static str) -> Option<()> {
 }
 
 /// A row's screen buttons that work now: a switch (Turn on/off, Remove this key = off) that THE switch rule
-/// (`settings::switched`) refuses is not shown, so no button answers "can't".
-fn buttons(p: &str) -> Vec<&'static str> {
+/// (`settings::switched`) refuses is not shown, nor Stop the waiting form while no form waits (`waiting_at`), so no
+/// button answers "can't"; the agent connection's one per host first (`added ✓` once it holds fats); ← Back last.
+fn buttons(p: &str) -> Vec<String> {
     let turn = ["Turn on", "Turn off"][usize::from(settings::on(p))];
+    let stop = waiting_at(&Cache::open(), p).map(|_| "Stop the waiting form");
     let all: Vec<&str> = match (p, settings::key(p).is_some()) {
-        ("free", _) => vec![turn, "← Back"],
-        ("mcp", _) => vec!["← Back"],
-        ("telemetry", _) => LEVELS.iter().map(|l| l.1).chain(["← Back"]).collect(),
-        (_, true) => vec!["Paste a new key", turn, "Remove this key", "← Back"],
-        _ => vec!["Add a key", "← Back"],
+        ("free", _) => vec![turn],
+        ("mcp", _) => vec![],
+        ("telemetry", _) => LEVELS.iter().map(|l| l.1).collect(),
+        (_, true) => vec!["Paste a new key", turn, "Remove this key"],
+        _ => vec!["Add a key"],
     };
     let switch = |b: &&str| matches!(*b, "Turn on" | "Turn off" | "Remove this key");
-    all.into_iter().filter(|b| !switch(b) || settings::switched(p, *b == "Turn on").is_ok()).collect()
+    let shown = all.into_iter().filter(|b| !switch(b) || settings::switched(p, *b == "Turn on").is_ok());
+    crate::mcp::buttons(p).chain(shown.chain(stop).chain(["← Back"]).map(String::from)).collect()
 }
 
 /// One row's screen until Back (Some) or q (None); every button's answer is its message.
@@ -321,8 +323,10 @@ fn screen(t: &mut Term, p: &'static str) -> Option<()> {
     loop {
         let (text, on, items) = (text(p), settings::on(p), buttons(p));
         let (at, end) = t.menu(&|_| text.clone(), &msg, &items, "← back · q quit");
-        let done = match (end, items.get(at).copied().unwrap_or_default(), links(p)) {
+        let done = match (end, items.get(at).map_or("", String::as_str), links(p)) {
             ('q', ..) => return None,
+            // a test (`in_process`) only names the add: no host config edited
+            ('\r', ..) if let Some(said) = crate::mcp::pressed(p, at, crate::provider::in_process()) => Ok(said),
             // saved or not, the screen stays: its rows and Status show the key at once
             ('\r', "Add a key" | "Paste a new key", Some(l)) => Ok(paste(t, l).unwrap_or_else(|m| m)),
             // removed = off, so THE switch rule refuses removing the last key that fetches
@@ -333,6 +337,7 @@ fn screen(t: &mut Term, p: &'static str) -> Option<()> {
                 settings::set("telemetry", level.name()).map(|()| format!("✓ telemetry {word} · from the next command"))
             }
             ('\r', "Turn on" | "Turn off", _) => settings::set_on(p, !on).map(|()| format!("✓ {}", state(p).1)),
+            ('\r', "Stop the waiting form", _) => stop(p, false).map(|said| format!("✓ {said}")),
             _ => return Some(()),
         };
         msg = done.unwrap_or_else(|e| format!("✗ Can't: {e}"));
@@ -352,25 +357,27 @@ fn paste(t: &mut Term, l: &'static Links) -> Result<String, String> {
         Some(_) => return Err(String::new()),
         None => zones.first(),
     };
-    let what = zone.map_or(what, |z| format!("zone {z}"));
-    let saved = settings::save_key(l.short, &key, zone.map(String::as_str));
-    let tail = crate::stats::tail(&key);
-    saved.map(|()| format!("✓ {} works · {what} · key saved {tail}", l.name)).map_err(|e| format!("✗ not saved: {e}"))
+    settings::save_key(l.short, &key, zone.map(String::as_str)).map_err(|e| format!("✗ not saved: {e}"))?;
+    Ok(format!("✓ {} works · {} saved", l.name, key_row(what, zone, &key)))
+}
+
+/// A saved key as both setups print it: Bright Data's zone (else what the check said), then the key's tail.
+fn key_row(what: String, zone: Option<&String>, key: &str) -> String {
+    format!("{} · key {}", zone.map_or(what, |z| format!("zone {z}")), crate::stats::tail(key))
 }
 
 /// Way 1 (`main`): `fats setup [provider]` with a terminal on both ends and `stty`, `provider`'s screen first; None
 /// = piped, an agent, no `stty`, or another command.
 pub fn tty(argv: &[String]) -> Option<i32> {
     let cmd = crate::lang::parse(argv);
-    let telemetry = (cmd.sub.first().map(String::as_str) == Some("telemetry")).then_some("telemetry");
-    let only = cmd.sub.first().and_then(|p| links(p)).map(|l| l.short).or(telemetry);
+    let own = cmd.sub.first().and_then(|w| ["telemetry", "mcp"].into_iter().find(|p| p == w));
+    let only = cmd.sub.first().and_then(|p| links(p)).map(|l| l.short).or(own);
     let term = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     (term && cmd.has("setup") && cmd.sub.len() < 2 && cmd.words.is_empty() && cmd.mods.is_empty()).then_some(())?;
     let saved = stty(&["-g"]).filter(|_| stty(&["raw", "-echo", "min", "1", "time", "0"]).is_some())?;
     // a menu that exits (q, Done): the done line printed after the terminal is restored (`Term` dropped)
     print!("\x1b[?1049h\x1b[?25l");
-    let done = walk(&mut Term(Some(saved), Default::default()), only);
-    println!("{done}");
+    println!("{}", walk(&mut Term(Some(saved), Default::default()), only));
     Some(0)
 }
 
@@ -425,7 +432,6 @@ pub fn masked(line: &str) -> String {
 /// = what search needs and the key to add first (`keys none · search needs oxy or bd (…) → fats setup oxy`); ` · bak`
 /// last while `auth.json.bak` holds an old key (`bak_row`).
 pub fn keys_line() -> String {
-    let names = || settings::SWITCHES.into_iter().filter(|p| *p != "free");
     let off = if settings::get().offline.value { " · network off" } else { "" };
     let net = format!("{off}{}", if bak().is_some() { " · bak" } else { "" });
     if no_keys() {
@@ -438,7 +444,7 @@ pub fn keys_line() -> String {
         ("bd", k) if k.starts_with('…') => format!("bd {k} zone {}", settings::zone().unwrap_or("none")),
         (p, k) => format!("{p} {k}"),
     };
-    let keys = names().map(named).collect::<Vec<_>>().join(" · ");
+    let keys = SWITCHES.into_iter().filter(|p| *p != "free").map(named).collect::<Vec<_>>().join(" · ");
     format!("keys {keys} · {}{net}", settings::AUTH)
 }
 
@@ -468,13 +474,13 @@ pub fn env_row(p: &str) -> Option<String> {
     let env = crate::stats::tail(&env);
     Some(match settings::key(p) {
         Some(k) => format!("env {var} {env} ≠ saved {} · not used · replace: {b} setup {p}", crate::stats::tail(&k)),
-        None => format!("! no_key {p} · env {var} {env} not imported → {b} setup import-env"),
+        None => bang("", "no_key", &format!("{p} · env {var} {env} not imported"), &At { arg: p, ..At::default() }),
     })
 }
 
-/// `env_row` for every provider: the status rows.
+/// `env_row` for every provider, and the proxy env plain ignores (`provider::proxy_note`): the status rows.
 pub fn env_rows() -> Vec<String> {
-    SWITCHES.into_iter().filter_map(env_row).collect()
+    SWITCHES.into_iter().filter_map(env_row).chain(crate::provider::proxy_note().map(String::from)).collect()
 }
 
 /// THE argv key rule: a key-shaped word on a command line led by `setup` or a word people type for it (`login`,
@@ -532,17 +538,10 @@ pub fn piped(cmd: &Cmd) -> Option<Out> {
     if let Err(e) = settings::save_key(p, &key, zone.as_deref()) {
         return not_saved("cache_write", &e);
     }
-    let pick = if p == "bd" && zone.is_none() {
-        format!(" · no zone yet → {b} setup bd zone:<name>")
-    } else {
-        String::new()
-    };
-    let what = match zone {
-        Some(z) => format!("zone {z}"),
-        None => what,
-    };
-    let tail = crate::stats::tail(&key);
-    Some(Out::new(vec![format!("= setup {p} ok {what} · key {tail} saved auth.json (600){kept} · $0{pick}")]))
+    let pick = (p == "bd" && zone.is_none()).then(|| format!(" · no zone yet → {b} setup bd zone:<name>"));
+    let pick = pick.unwrap_or_default();
+    let what = key_row(what, zone.as_ref(), &key);
+    Some(Out::new(vec![format!("= setup {p} ok {what} saved auth.json (600){kept} · $0{pick}")]))
 }
 
 /// Bright Data's Web Unlocker zone from its zone names: `zone:`, else the configured one, else the only one.
@@ -564,7 +563,8 @@ pub fn pick_zone(names: &[String], arg: Option<&str>) -> Result<String, String> 
 
 /// A key form's run file `<session>/run/setup-<p>.<ext>`: `json` = token, port, deadline (the cache root is its
 /// owner's only, `cache::private_root`), there while the run serves (its port written once it listens) and after its
-/// deadline (`form_row`: dead), gone once a key is saved or a new form starts; `log` = the run's output.
+/// deadline (`form_row`: dead), gone once a key is saved or the form is stopped; `log` = the run's output. The run
+/// serves only while this file holds its token (`serve`): removed or replaced by a new form's, the run exits.
 fn run_file(c: &Cache, p: &str, ext: &str) -> PathBuf {
     c.root.join(&c.session).join("run").join(format!("setup-{p}.{ext}"))
 }
@@ -593,6 +593,22 @@ pub fn form_row(p: &str) -> Option<String> {
     let dead =
         || format!("! form_expired {p} · the link the user got is dead → {} setup {p} · new link, same 3 steps", bin());
     Some(waiting_at(&c, p).map_or_else(dead, |url| format!("{p} form waiting · {left} min left · {url}")))
+}
+
+/// `fats setup <p> stop` and the menu's Stop the waiting form: ends `p`'s key form (its run file removed: the run
+/// exits within one 50 ms turn, `serve`), a dead one's file too; `dry` removes nothing. The words said; Err = the
+/// file is still there (the form still serves): what the remove said.
+pub fn stop(p: &str, dry: bool) -> Result<&'static str, String> {
+    let c = Cache::open();
+    let waiting = waiting_at(&c, p).is_some();
+    if dry {
+        return Ok(if waiting { "would stop the waiting form" } else { "no form waiting" });
+    }
+    let file = run_file(&c, p, "json");
+    match std::fs::remove_file(&file) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {e}", file.display())),
+        _ => Ok(if waiting { "form stopped" } else { "no form waiting" }),
+    }
 }
 
 /// Way 2: the key form for `l`, served by a detached run (`--continue setup-<p>`, `serve`) on 127.0.0.1: the block
@@ -626,7 +642,8 @@ fn told(l: &'static Links, url: &str, ssh: bool) -> Out {
     Out::new(page.lines().map(String::from).collect()).with("cost", 0.0)
 }
 
-/// The detached run of `fats setup <p>`: serves its form until one good key or `LIFE`, then exits. Exit code.
+/// The detached run of `fats setup <p>`: serves its form until one good key, `LIFE` or its run file no longer holds
+/// its token (`stop`, a new form), then exits. Exit code.
 pub fn serve(p: &str) -> i32 {
     let c = Cache::open();
     let (Some(l), Some(mut f)) = (links(p), jload::<Form>(&run_file(&c, p, "json"))) else { return 2 };
@@ -635,7 +652,7 @@ pub fn serve(p: &str) -> i32 {
     if jsave(&run_file(&c, p, "json"), &f).is_err() || lis.set_nonblocking(true).is_err() {
         return 1;
     }
-    while now() < f.until {
+    while now() < f.until && jload::<Form>(&run_file(&c, p, "json")).is_some_and(|g| g.token == f.token) {
         match lis.accept() {
             // a key saved: no file = no form waits (one past its deadline stays: `form_row` says it is dead)
             Ok((stream, _)) if answer(&stream, &f, l) => {
@@ -787,7 +804,7 @@ mod tests {
                     "settings" => &[ESC, b"q"],
                     "back" | "cache" | "stats" => &[b"q"],
                     _ => {
-                        buttons(p).into_iter().enumerate().for_each(|(k, b)| press(&reset, &to, p, k, b, &what));
+                        buttons(p).iter().enumerate().for_each(|(k, b)| press(&reset, &to, p, k, b, &what));
                         continue;
                     }
                 };
@@ -829,6 +846,13 @@ mod tests {
                 assert!(frames.iter().any(|f| f.contains(bak)), "{what}: the backup named");
             }
             "Add a key" | "Paste a new key" if no_check => pasted_frames(&frames, 18, what),
+            // the add's own row inline (dry here: a unit test edits no host config)
+            _ if b.starts_with("Add to ") => {
+                let said = |f: &&String| {
+                    f.contains("   = dry setup mcp ") || f.contains("   = setup mcp ") || f.contains("   ! no_host ")
+                };
+                assert!(frames.iter().any(|f| said(&f)), "{what}: the add's row");
+            }
             _ if level.is_some() => assert_eq!(settings::saved(settings::PREFS).set.get("telemetry"), level.as_ref()),
             _ => {}
         }
@@ -848,7 +872,7 @@ mod tests {
         let (check, screen) = (frames.get(at + n + 1), frames.get(at + n + 2));
         assert!(check.is_some_and(|f| f.contains("… checking the key with ")), "{what}: {check:?}");
         let saved =
-            screen.is_some_and(|f| f.contains(" works · unchecked · key saved …0123") && f.contains(". Paste a"));
+            screen.is_some_and(|f| f.contains(" works · unchecked · key …0123 saved") && f.contains(". Paste a"));
         assert!(saved && settings::key("gh").as_deref() == Some("fake-gh-token-0123"), "{what}: {screen:?}");
     }
 
@@ -978,6 +1002,27 @@ mod tests {
         assert!(wide.is_empty(), "rows over 100 columns: {wide:?}");
     }
 
+    /// A provider's screen shows Stop the waiting form only while its form answers on its port; pressed, the form's
+    /// run file is gone (its run exits on that), the screen says so and the button goes.
+    #[test]
+    fn a_waiting_form_has_a_stop_button() {
+        let (c, stop) = (Cache::open(), "Stop the waiting form");
+        let run = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = run.local_addr().expect("port").port();
+        let file = run_file(&c, "decodo", "json");
+        std::fs::create_dir_all(file.parent().expect("run dir")).expect("run dir");
+        assert!(!buttons("decodo").contains(&stop.into()), "no form, no button");
+        jsave(&file, &Form { token: "ab12".into(), until: now() + 600.0, port }).expect("form");
+        let shown = buttons("decodo");
+        let (i, k) = (rows().iter().position(|p| *p == "decodo"), shown.iter().position(|b| *b == stop));
+        let (Some(i), Some(k)) = (i, k) else { panic!("{shown:?}") };
+        crate::lang::tests::NO_COLOR.set(Some(true));
+        let frames = walked(vec![digit(i), digit(k), b"q"], "stop");
+        crate::lang::tests::NO_COLOR.set(None);
+        assert!(frames.iter().any(|f| f.contains("   ✓ form stopped")) && !file.exists(), "the run file is gone");
+        assert!(!buttons("decodo").contains(&stop.into()), "the button goes with the form");
+    }
+
     /// A Bright Data key with zones but none picked: saved, the page names the zones and the agent's move;
     /// the account's only zone is saved with the key.
     #[test]
@@ -1003,12 +1048,15 @@ mod tests {
             "{:?}",
             ssh.lines
         );
-        // the agent's last line: what to do when the 30 min passed (the SSH way after it, only over SSH)
+        // the agent's last lines: what to do when the 30 min passed, how to end the form (the SSH way after them,
+        // only over SSH)
         let dead = "link dead (30 min passed)? run fats setup oxy again and give the user the new line 3";
-        assert!(here.lines.last().is_some_and(|r| r.replace(bin(), "fats") == dead), "{:?}", here.lines);
+        let stop = "no key coming (the user stopped)? fats setup oxy stop ends the form, $0";
+        let last: Vec<String> = here.lines.iter().rev().take(2).map(|r| r.replace(bin(), "fats")).collect();
+        assert_eq!(last, [stop, dead], "{:?}", here.lines);
         assert!(
             here.lines[0].ends_with(" · 30 min · $0")
-                && ssh.lines.iter().rev().nth(1).is_some_and(|r| r.starts_with("link dead"))
+                && ssh.lines.iter().rev().nth(1).is_some_and(|r| r.starts_with("no key coming"))
         );
         let page = html(l, 2, &[("save", "/k/t/oxy/save"), ("err", "")]);
         assert!(page.contains("action=\"/k/t/oxy/save\"") && page.contains(l.mint) && !page.contains("<script"));

@@ -3,7 +3,8 @@
 //! per section (`u1#2` = lines 301-600). Never the page path: a text body judged as a page reads as a JS shell and goes
 //! to every provider.
 
-use crate::clean::{Doc, Section, collapse};
+use crate::clean::{Doc, Section, collapse, pretty};
+use crate::outline::{Page, Shown, paged};
 use serde_json::Value;
 
 /// Lines per section.
@@ -43,7 +44,7 @@ fn list(names: impl Iterator<Item = String>) -> String {
 }
 
 /// `keys: ok, data[20], meta{3}` for an object; `120 items · item keys: id, name` for an array; keys in document
-/// order (as the server wrote them).
+/// order (as the server wrote them); else the value, cut at 60 chars.
 fn json_outline(v: &Value) -> String {
     let shape = |v: &Value| match v {
         Value::Array(a) => format!("[{}]", a.len()),
@@ -57,7 +58,52 @@ fn json_outline(v: &Value) -> String {
                 a.first().and_then(Value::as_object).map(|o| format!(" · item keys: {}", list(o.keys().cloned())));
             format!("{} items{}", a.len(), keys.unwrap_or_default())
         }
-        _ => String::new(),
+        _ => crate::lang::short(&v.to_string(), 60),
+    }
+}
+
+/// A path into a JSON document (`fats u5 .data.chains`, `.data.chains[0].name`): the value as JSON, pretty; one `[]`
+/// reads the rest of the path in every item, a value a row (a second `[]` is refused, never read as `.`). A path that is not there names the keys where it stops:
+/// `? u5 .data.foo · keys at .data: currency, chains[12]`.
+pub fn path(p: &Page, path: &str, (off, limit): (usize, Option<usize>)) -> Result<Shown, String> {
+    let body = p.doc.sections.iter().map(|s| s.lines.join("\n")).collect::<Vec<_>>().join("\n");
+    let root: Value = serde_json::from_str(&body).map_err(|e| format!("? {} {path} · {e}", p.id))?;
+    let (head, each) = path.split_once("[]").map_or((path, None), |(h, t)| (h, Some(t)));
+    each.filter(|r| r.contains("[]")).map_or(Ok(()), |_| Err(format!("? {} {path} · one [] per path", p.id)))?;
+    let value = root.pointer(&pointer(head)).ok_or_else(|| stop(&p.id, path, &root, head))?;
+    let (kind, rows) = match each {
+        None => (json_outline(value), pretty(value).lines().map(String::from).collect()),
+        Some(rest) => {
+            let items = value.as_array().map_or(&[][..], Vec::as_slice);
+            let found: Vec<String> =
+                items.iter().filter_map(|v| Some(v.pointer(&pointer(rest))?.to_string())).collect();
+            // none found: where the first item's path stops (a value that is no array: the path stops at it)
+            if found.is_empty() && value.as_array().is_none_or(|a| !a.is_empty()) {
+                return Err(stop(&p.id, path, &root, &format!("{head}[0]{rest}")));
+            }
+            (format!("{} values", found.len()), found)
+        }
+    };
+    let head = format!("= {} {path} · {kind} · {}tok", p.eq, crate::lang::ksize(crate::clean::tok(&rows.join("\n"))));
+    Ok(paged(&p.id, head, &rows, (off, limit, crate::settings::limit("read_cap"), path)))
+}
+
+/// `.data.chains[0]` → the JSON pointer `/data/chains/0` (RFC 6901; `.` alone = the whole document): a key holding
+/// `.`, `[` or `/` is out of reach.
+fn pointer(path: &str) -> String {
+    path.replace(['[', ']'], ".").split('.').filter(|s| !s.is_empty()).map(|s| format!("/{s}")).collect()
+}
+
+/// Where `path` stops in `root`: the keys there, else what is there (`.[0]` = a root array's first item).
+fn stop(id: &str, typed: &str, root: &Value, path: &str) -> String {
+    let ptr = pointer(path);
+    let found = ptr.match_indices('/').rev().find_map(|(i, _)| Some((&ptr[..i], root.pointer(&ptr[..i])?)));
+    let (prefix, here) = found.unwrap_or(("", root));
+    let step = |s: &str| if s.parse::<usize>().is_ok() { format!("[{s}]") } else { format!(".{s}") };
+    let at = format!(".{}", prefix.split('/').skip(1).map(step).collect::<String>().trim_start_matches('.'));
+    match json_outline(here) {
+        shape if shape.starts_with("keys: ") => format!("? {id} {typed} · keys at {at}: {}", &shape[6..]),
+        shape => format!("? {id} {typed} · {at} is {shape}"),
     }
 }
 

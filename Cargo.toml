@@ -1,6 +1,6 @@
 [package]
 name = "fatsearch"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 # pinned to rust-toolchain.toml; the oldest toolchain that builds this tree has not been measured yet
 rust-version = "1.99"
@@ -32,11 +32,11 @@ blake3 = "=1.8.7"
 chrono = { version = "=0.4.45", default-features = false, features = ["alloc"] }
 dirs = "=7.0.0"
 # Charset decoding (WHATWG labels, BOM, windows-1250 & co.); already in the tree via wreq and pdf_oxide.
-encoding_rs = "=0.8.42"
+encoding_rs = "=0.8.44"
 # `fats setup <provider>`: the local key form's one-time 128-bit path token from the OS. Already in the tree via
 # pdf_oxide and uuid.
 getrandom = "=0.4.3"
-html5ever = "=0.39.0"
+html5ever = "=0.40.1"
 # `fats u3 m1`: a picture's real size from its header; `fats mcp` downscales it to what Claude views. Already in
 # the tree via pdf_oxide (png, jpeg); webp and gif (pure Rust, image-rs) are what this adds.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
@@ -46,7 +46,7 @@ http-body = "=1.1.0"
 # A page's `info` and JSON-LD objects keep document order (a key set again keeps its first place).
 indexmap = { version = "=2.14.2", features = ["serde"] }
 # A server's own Markdown (`text/markdown`, Cloudflare's Markdown for Agents) → HTML for the page cleaner.
-pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "=0.13.6", default-features = false, features = ["html"] }
 # PDF text per page. No OCR/ML/rendering features; `legacy-crypto` opens RC4/AES-128 password-less PDFs.
 # Cargo.lock keeps its office_oxide at 0.1.9, the version pdf_oxide 0.3.78 ships with (0.1.13 does not
 # compile with it): after any `cargo update`, run `cargo update -p office_oxide --precise 0.1.9`.
@@ -54,19 +54,19 @@ pdf_oxide = { version = "=0.3.78", default-features = false, features = ["legacy
 # Size words and the end of a picture's file name in its URL (`clean::key_of`). Already in the tree via pdf_oxide.
 regex = "=1.13.1"
 # `fats mcp`: the official MCP SDK, stdio server only (no macros, no HTTP, no auth).
-rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.8.0", default-features = false, features = ["server", "transport-io"] }
 # Percent-decoding a link before `links <words>` matches it (already in the tree through `url`).
 percent-encoding = "=2.3.2"
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = { version = "=1.0.152", features = ["float_roundtrip", "preserve_order"] }
+serde_json = { version = "=1.0.154", features = ["float_roundtrip", "preserve_order"] }
 # Typo distance for command words (optimal string alignment).
 strsim = "=0.11.1"
 # Network: wreq (BoringSSL, browser TLS/HTTP2 settings), tokio only for its current-thread runtime + timers.
-tokio = { version = "=1.53.2", default-features = false, features = ["rt", "time"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "time"] }
 url = "=2.5.8"
 # Browser profiles for wreq (same author); the `emulation` feature carries the certificate decompressors.
 wreq-util = { version = "=0.2.0", default-features = false, features = ["emulation", "emulation-compression"] }
-wreq = { version = "=0.16.1", default-features = false, features = ["webpki-roots", "tokio-rt", "gzip", "brotli", "deflate", "zstd"] }
+wreq = { version = "=0.16.3", default-features = false, features = ["webpki-roots", "tokio-rt", "gzip", "brotli", "deflate", "zstd"] }
 
 [dev-dependencies]
 # tests/redact.rs: a loopback TLS listener with a self-signed certificate (a real verify failure). Already in the tree

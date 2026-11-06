@@ -4,8 +4,8 @@
 //! way. One table holds names, keys, timeouts and list prices; the router (fetch.rs) decides which to call.
 
 use serde_json::{Value, json};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+use std::{net::ToSocketAddrs, sync::LazyLock};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Tier {
@@ -290,10 +290,9 @@ pub fn host_check(url: &str, wall: Option<Duration>) -> Option<(&'static str, St
     // Ok = the system resolver's word (true: every address private); on no address, Err = the second resolver's
     // (Some(true): it holds an address the system's did not give; Some(false): none, NXDOMAIN or NODATA) and the
     // system resolver's error
-    let private = |all: &[std::net::SocketAddr]| all.iter().all(|a| private_ip(a.ip()));
     let second = || block(exists(&host)).flatten();
     let got = all.map(|all| match all {
-        Ok(all) if !all.is_empty() => Ok(private(&all)),
+        Ok(all) if !all.is_empty() => Ok(all_private(&all)),
         all => Err((second(), all.err())),
     });
     // an error back under `dns_fast_ms` was no wait cut short: `dns_wait:` cures nothing there
@@ -308,16 +307,22 @@ pub fn host_check(url: &str, wall: Option<Duration>) -> Option<(&'static str, St
     Some((code, why.unwrap_or_default()))
 }
 
+/// Some addresses, every one private (`host_check`, a redirect hop's `follow`).
+fn all_private(all: &[std::net::SocketAddr]) -> bool {
+    !all.is_empty() && all.iter().all(|a| private_ip(a.ip()))
+}
+
 /// The system resolver's addresses for `host`, or its own error (getaddrinfo's words, `said_short`: `nodename nor
-/// servname provided, or not known`). Under a test's fake transport, the whole network: that error, a `lag.*`
-/// name's after 2 s (`host_check`'s wait).
+/// servname provided, or not known`). Under a test's fake transport and in unit tests, the whole network: that
+/// error, a `lag.*` name's after 2 s (`host_check`'s wait), 10.0.0.1 for a `lan.*` name.
 pub fn lookup(host: &str) -> Result<Vec<std::net::SocketAddr>, String> {
     if in_process() {
         std::thread::sleep(Duration::from_secs(if host.starts_with("lag.") { 2 } else { 0 }));
-        return Err(said_short("nodename nor servname provided, or not known"));
+        let lan = host.starts_with("lan.").then(|| vec![([10, 0, 0, 1], 443).into()]);
+        return lan.ok_or_else(|| said_short("nodename nor servname provided, or not known"));
     }
     let said = |e: std::io::Error| said_short(&e.to_string().rsplit(": ").next().unwrap_or_default().to_lowercase());
-    std::net::ToSocketAddrs::to_socket_addrs(&(host, 443)).map(Iterator::collect).map_err(said)
+    (host, 443).to_socket_addrs().map(Iterator::collect).map_err(said)
 }
 
 /// THE billing rule, one for both providers: an answer below 500 is billed; a refusal, a 5xx or a timeout is not,
@@ -332,10 +337,14 @@ pub fn charged(t: Tier, status: Result<u16, &Fail>) -> bool {
     t != Tier::Plain && status.is_ok_and(|s| s < 500 || t.spec().bills_site_5xx)
 }
 
-/// THE list of the provider's own refusals (its error envelope, bd's `x-brd-error`, a rate limit): no answer, so
-/// never billed (`charged` gets them as an `Err`); a tried path says `$0 (not charged)`, a priced retry after one
+/// The codes that carry the provider's own reason (`reason`: its error envelope, its refusal of the URL): a 4xx of
+/// one settles its tier (`fetch::settled`), `stats` and a failed row print that reason.
+pub const OWN_REASON: [&str; 2] = ["provider_error", "provider_refused"];
+
+/// THE list of the provider's own refusals (`OWN_REASON`, bd's `x-brd-error`, a rate limit): no answer, so never
+/// billed (`charged` gets them as an `Err`); a tried path says `$0 (not charged)`, a priced retry after one
 /// ` · last try not charged`.
-pub const REFUSED: &[&str] = &["provider_error", "provider_refused", "rate_limited"];
+pub const REFUSED: &[&str] = &[OWN_REASON[0], OWN_REASON[1], "rate_limited"];
 
 /// THE money total: from +0.0, so nothing spent prints `$0.0000` (`sum::<f64>()` of nothing is −0.0 → `$-0.0000`).
 pub fn spend(costs: impl IntoIterator<Item = f64>) -> f64 {
@@ -351,8 +360,7 @@ fn net(e: &wreq::Error) -> Fail {
         if s.is::<Private>() {
             return Fail::from("private_address");
         }
-        let said = s.to_string();
-        if let Some(r) = said.strip_prefix('[').and_then(|r| r.split(']').next()) {
+        if let Some(r) = s.to_string().strip_prefix('[').and_then(|r| r.split(']').next()) {
             tls = format!("tls:{}", r.to_lowercase().replace('_', "-"));
         }
         src = s.source();
@@ -370,14 +378,28 @@ fn pairs(h: &wreq::header::HeaderMap) -> Vec<(String, String)> {
     h.iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into())).collect()
 }
 
-/// Headers as `Raw::headers` keeps them: `name: value` lines, all lower case (wall vendors are matched on them).
+/// Headers as `Raw::headers` keeps them: `name: value` lines, all lower case (wall vendors are matched on them; the
+/// HTTP stack hands names in lower case anyway), never one that carries a credential (words.json
+/// `secret_headers`: the site's session cookie, an auth challenge; `fats u1 headers` prints them to a model).
 fn header_lines<'a>(h: impl Iterator<Item = (&'a String, &'a str)>) -> String {
-    h.map(|(k, v)| format!("{}: {}\n", k.to_lowercase(), v.to_lowercase())).collect()
+    let safe = |(k, _): &(&String, &str)| !crate::lang::WORDS.secret_headers.contains(&k.to_lowercase().as_str());
+    h.filter(safe).map(|(k, v)| format!("{}: {}\n", k.to_lowercase(), v.to_lowercase())).collect()
+}
+
+/// Plain is your own connection, so its client takes no proxy (`no_proxy`): through one, the proxy resolves the
+/// name and `Fence` never runs. wreq 0.16.3 takes `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (either case) by
+/// default and, without its `system-proxy` feature, nothing else (proxy/matcher.rs `Builder::from_env`). Some =
+/// one is set: the one line status and `config` print.
+pub fn proxy_note() -> Option<&'static str> {
+    let vars = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"].map(|k| [k.to_string(), k.to_lowercase()]);
+    let set = vars.as_flattened().iter().any(|k| crate::settings::env(k).is_some());
+    set.then_some("proxy env ignored on plain (your own connection); paid tiers are the proxies")
 }
 
 async fn plain(ask: &Ask, wait: Duration) -> Result<Raw, Fail> {
     let client = wreq::Client::builder()
         .emulation(browser())
+        .no_proxy()
         .redirect(wreq::redirect::Policy::none())
         .dns_resolver(Fence)
         .timeout(wait)
@@ -465,8 +487,7 @@ fn refresh(raw: &Raw) -> Option<String> {
     let origin = scheme && (at.host_str(), at.port()) == (to.host_str(), to.port());
     let alone = !tree.nodes.iter().any(|n| n.tag == "script") && origin;
     let small = crate::fetch::visible(&tree).0.chars().count() < crate::settings::limit("page_chars");
-    let zero = !delay.is_empty() && delay.bytes().all(|b| b == b'0');
-    (zero && alone && small).then(|| to.into())
+    (!delay.is_empty() && delay.bytes().all(|b| b == b'0') && alone && small).then(|| to.into())
 }
 
 /// Text is kept as UTF-8: a body with no file magic is decoded from what the header or page declares (else
@@ -564,10 +585,10 @@ impl std::error::Error for Private {}
 
 impl wreq::dns::Resolve for Fence {
     fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
-        let all = wreq::dns::GaiResolver::new().resolve(name);
         Box::pin(async move {
+            let all = tokio::task::spawn_blocking(move || (name.as_str(), 0).to_socket_addrs());
             let open = crate::settings::get().allow_private.value;
-            let keep: Vec<_> = all.await?.filter(|a| open || !private_ip(a.ip())).collect();
+            let keep: Vec<_> = all.await??.filter(|a| open || !private_ip(a.ip())).collect();
             if keep.is_empty() {
                 return Err(Box::new(Private) as Box<dyn std::error::Error + Send + Sync>);
             }
@@ -577,15 +598,17 @@ impl wreq::dns::Resolve for Fence {
 }
 
 /// Redirects, followed here rather than by the client so every hop's host passes `private_host` (an IP literal
-/// in a `Location` never reaches the resolver). `send` = one request → (status, Location, response).
-/// Ok = (final URL, response); at most 10 redirects.
+/// in a `Location` never reaches the resolver) and every redirect's name `hop_private`. The first URL's name is
+/// `host_check`'s for a page; a picture (`cli::download`), a meta-refresh target and the http fallback have only
+/// `Fence` at connect, so a private name there ends `net_error`, never `private_address`. `send` = one request → (status, Location, response). Ok = (final URL, response); at most 10
+/// redirects.
 async fn follow<R, E: From<&'static str>, F>(url: &str, send: impl Fn(String) -> F) -> Result<(String, R), E>
 where
     F: Future<Output = Result<(u16, Option<String>, R), E>>,
 {
     let mut at = url.to_string();
-    for _ in 0..=10 {
-        if private_host(&at) {
+    for hop in 0..=10 {
+        if private_host(&at) || hop > 0 && hop_private(&at).await == Some(true) {
             return Err("private_address".into());
         }
         match send(at.clone()).await? {
@@ -596,6 +619,17 @@ where
         }
     }
     Err("redirect_loop".into())
+}
+
+/// A redirect's name resolves to private addresses only (the system resolver, `lookup`, within `dns_wait`), checked
+/// before its request, as `host_check` checks the first URL's: `Fence` judges the connect too, this keeps the rule
+/// whatever carries the request. None = an IP literal (`private_host`'s) or no answer in time: the connect's
+/// `Fence` still judges.
+async fn hop_private(url: &str) -> Option<bool> {
+    let url::Host::Domain(host) = url::Url::parse(url).ok()?.host()?.to_owned() else { return None };
+    let wait = Duration::from_secs(crate::settings::limit("dns_wait"));
+    let all = tokio::time::timeout(wait, tokio::task::spawn_blocking(move || lookup(&host))).await.ok()?.ok()?.ok()?;
+    Some(all_private(&all) && !crate::settings::get().allow_private.value)
 }
 
 /// The body, frame by frame, refused as soon as it passes `cap` bytes: a chunked or lying server never fills
@@ -701,8 +735,7 @@ pub struct Links {
 
 /// A provider's pages by any tier name that uses its key (`oxyjs` → Oxylabs).
 pub fn links(short: &str) -> Option<&'static Links> {
-    let owner = Tier::parse(short).map_or(short, |t| t.owner().spec().short);
-    PROVIDERS.links.iter().find(|l| l.short == owner)
+    PROVIDERS.links.iter().find(|l| l.short == Tier::parse(short).map_or(short, |t| t.owner().spec().short))
 }
 
 /// THE page a `!` row about a provider's key or money ends with: `no_key` → sign-up, `bad_key` → the keys
@@ -748,11 +781,10 @@ impl Reply {
     fn retry_in(&self) -> Option<u64> {
         let num = |name: &str| self.header(name).and_then(|s| s.trim().parse::<u64>().ok());
         let after = num("retry-after").filter(|s| (1..=3600).contains(s));
-        let title =
-            serde_json::from_slice::<Value>(&self.body).ok().and_then(|j| j["title"].as_str().map(String::from));
+        let titled = serde_json::from_slice::<Value>(&self.body).is_ok_and(|j| j["title"] == "RATE_LIMIT_EXCEEDED");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let reset = num("x-ratelimit-reset").filter(|_| num("x-ratelimit-remaining") == Some(0));
-        let rate = self.status == 429 && title.as_deref() == Some("RATE_LIMIT_EXCEEDED");
+        let rate = self.status == 429 && titled;
         after.or(if rate { Some(RETRY_AFTER) } else { reset.map(|t| t.saturating_sub(now).max(1)) })
     }
 
@@ -783,8 +815,7 @@ fn reason(status: u16, body: &[u8], secrets: &[String]) -> String {
         d if !d.is_empty() => (text(&e["pointer"]).rsplit('/').next().unwrap_or_default().to_string(), d),
         _ => (faulted, text(&j["title"]).replace('_', " ")),
     };
-    let label = if label.is_empty() { label } else { label + ":" };
-    said_short(&format!("{status} {label} {said}"))
+    said_short(&format!("{status} {} {said}", if label.is_empty() { label } else { label + ":" }))
 }
 
 /// Words as a printable reason: those of `[a-z0-9.,:/#-]` only, at most `reason_chars` chars, no trailing `.` or `:`.
@@ -820,13 +851,13 @@ pub fn fake(f: Fake) {
 }
 
 /// A test's fake transport answers (`fake`): it lives in this process only, so a detached fetch runs on a
-/// thread here, not in a new process (`cli::detach`).
+/// thread here, not in a new process (`cli::detach`). A unit test has no network at all: the same.
 pub fn in_process() -> bool {
     #[cfg(feature = "fake")]
     if FAKE.get().is_some() {
         return true;
     }
-    false
+    cfg!(test)
 }
 
 /// Call a provider API; Ok = the body of a 200. `cap` = the largest body kept (a JSON-escaped page can be twice
@@ -874,9 +905,15 @@ type Answer = (Vec<u8>, Option<Limit>, Option<u16>);
 /// sent (a key `fats setup` checks is saved by none yet).
 /// A 200 with an empty body is a failure too: no API answers a good call with nothing. A rate limit that says
 /// when to retry (`Reply::retry_in`) gets `retry in Ns`; another 429 may be an exhausted quota (Oxylabs' docs give
-/// no title for it), so it gets no retry time; another 403 is a refused key.
+/// no title for it), so it gets no retry time; another 403 is a refused key. A 400 whose field error names the URL
+/// (Oxylabs: `url: value not supported` on a host it serves no one) refuses this URL: the same call is refused
+/// again ("No, fix all entries", developers.oxylabs.io/products/web-api/troubleshooting). One naming `location`
+/// refuses the country we sent, not the URL: a `provider_error`, settled for that country only (`fetch::settled`).
 fn read(to: Api, key: &str, r: Reply) -> Result<Answer, Fail> {
     let limit = r.limit();
+    // the account's own cap (`Limit`: the plan's, not the key's; no window is sent), beside its wait: `cap 10 on
+    // this account · retry in 5s`
+    let cap = limit.map(|l| format!("cap {} on this account · ", l.limit)).filter(|_| !key.is_empty());
     let target = r.header("x-brd-status-code").and_then(|s| s.trim().parse().ok());
     // our setup: Bright Data's 400 naming the zone we sent (`zone "nozone" not found`:
     // its own APIs, the name quoted, a 200 never decoded), its zone-cost read's 422 `Unknown zone` (live
@@ -892,7 +929,9 @@ fn read(to: Api, key: &str, r: Reply) -> Result<Answer, Fail> {
         (false, 200) => ("provider_error", "empty".into()),
         (true, _) => bd_refused(token(r.header("x-brd-error-code")), r.header("x-brd-status-code"), r.retry_in()),
         (_, 400 | 422) if let Some(z) = zone => ("bad_zone", z.into()),
-        (_, 403 | 429) if let Some(s) = r.retry_in() => ("rate_limited", format!("retry in {s}s")),
+        (_, 403 | 429) if let Some(s) = r.retry_in() => {
+            ("rate_limited", format!("{}retry in {s}s", cap.unwrap_or_default()))
+        }
         (_, 401 | 403) => ("bad_key", String::new()),
         (_, 408) => ("provider_timeout", String::new()),
         (_, 429) => ("rate_limited", String::new()),
@@ -901,6 +940,8 @@ fn read(to: Api, key: &str, r: Reply) -> Result<Answer, Fail> {
     let mut secrets = crate::settings::secrets();
     secrets.extend(Some(key.to_string()).filter(|k| !k.is_empty()));
     let why = if code == "provider_error" && why.is_empty() { reason(r.status, &r.body, &secrets) } else { why };
+    // the call's own field error on the URL refuses this URL (`reason`: `400 url: …`)
+    let code = if why.starts_with("400 url:") { "provider_refused" } else { code };
     // a JSON answer is read as decoded (a key spelled in `\u00XX` escapes is a key), then masked
     let text = serde_json::from_slice::<Value>(&r.body)
         .map_or_else(|_| String::from_utf8_lossy(&r.body).into(), |j| j.to_string());
@@ -1527,6 +1568,12 @@ mod tests {
         assert_eq!(r(403, false, "").map_err(|f| f.code), Err("bad_key"));
         assert_eq!(r(408, false, "").map_err(|f| f.code), Err("provider_timeout"));
         assert_eq!(r(429, false, "").map_err(|f| (f.code, f.why)), Err(("rate_limited", String::new())), "quota?");
+        assert_eq!(r(500, false, "<html>oops").map_err(|f| (f.code, f.why)), Err(("provider_error", "500".into())));
+    }
+
+    /// A rate limit says when to retry (`retry-after`, else Oxylabs' 5 s) and the key's own cap beside it.
+    #[test]
+    fn a_rate_limit_says_when_and_its_cap() {
         let acct = |h: &[(&str, &str)]| Reply {
             status: 429,
             headers: h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -1538,26 +1585,36 @@ mod tests {
             ("x-ratelimit-system_search_total_dynamic_europe-remaining", "9999"),
         ];
         let f = read(Api::OxyScrape, "", acct(&h)).expect_err("429");
-        assert_eq!((f.why.as_str(), f.limit), ("retry in 5s", Some(Limit { limit: 10, remaining: 0 })));
+        assert_eq!(
+            (f.why.as_str(), f.limit),
+            ("retry in 5s", Some(Limit { limit: 10, remaining: 0 })),
+            "no key, no cap"
+        );
+        let f = read(Api::OxyScrape, "k3y", acct(&h)).expect_err("429");
+        assert_eq!(f.why, "cap 10 on this account · retry in 5s", "the account's own cap beside its wait");
         let f = read(Api::OxyScrape, "", acct(&[("retry-after", "7")])).expect_err("429");
         assert_eq!((f.why.as_str(), f.limit), ("retry in 7s", None), "retry-after wins; no budget sent");
         assert_eq!(
             read(Api::OxyScrape, "", acct(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")])).map_err(|f| f.why),
             Err("retry in 5s".into())
         );
-        assert_eq!(r(500, false, "<html>oops").map_err(|f| (f.code, f.why)), Err(("provider_error", "500".into())));
     }
 
     /// The provider's own reason (`reason`): an RFC 9457 field error, its faulted title; fields only, ≤ 50 chars.
     #[test]
     fn a_refusal_keeps_its_reason() {
-        let why = |status, body: &str| {
+        let fail = |status, body: &str| {
             let r = Reply { status, headers: vec![], body: body.into() };
-            read(Api::OxyScrape, "", r).map_err(|f| f.why).expect_err("refused")
+            read(Api::OxyScrape, "", r).map_err(|f| (f.code, f.why)).expect_err("refused")
         };
+        let why = |status, body: &str| fail(status, body).1;
         let url =
             r##"{"title":"INVALID_BODY_PROPERTY","errors":[{"detail":"Value not supported.","pointer":"#/url"}]}"##;
-        assert_eq!(why(400, url), "400 url: value not supported");
+        assert_eq!(fail(400, url), ("provider_refused", "400 url: value not supported".into()), "it refuses the URL");
+        let zip = r##"{"errors":[{"detail":"Value should be in zip/postal codes.","pointer":"#/location"}]}"##;
+        assert_eq!(fail(400, zip), ("provider_error", "400 location: value should be in zip/postal codes".into()));
+        let field = r##"{"errors":[{"detail":"Input should be less than or equal to 20","pointer":"#/max_results"}]}"##;
+        assert_eq!(fail(400, field).0, "provider_error", "our own field: no refusal of the URL");
         let faulted =
             r#"{"status":500,"state":"faulted","title":"REQUEST_FAILED_AFTER_TOO_MANY_RETRIES","detail":"x"}"#;
         assert_eq!(why(500, faulted), "500 faulted: request failed after too many retries");
@@ -1783,11 +1840,11 @@ mod tests {
         assert_eq!(to(200, &tag("0; url=/one/"), &"<p>A page of its own. </p>".repeat(80)), None, "a page");
     }
 
-    /// Redirects run through the fence: a public page that bounces to the metadata address is refused before
-    /// the second request; relative Locations resolve; an endless chain stops.
+    /// Redirects run through the fence: a public page that bounces to the metadata address or a name that
+    /// resolves private is refused before the second request; relative Locations resolve; an endless chain stops.
     #[test]
     fn redirects_are_fenced() {
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let calls = std::cell::RefCell::new(Vec::<String>::new());
         let fake = |to: Option<&'static str>| {
             let calls = &calls;
@@ -1801,6 +1858,11 @@ mod tests {
             }
         };
         let r = rt.block_on(follow("https://ex.com/a", fake(Some("http://169.254.169.254/latest/meta-data/"))));
+        assert_eq!(r.err(), Some("private_address"));
+        assert_eq!(*calls.borrow(), ["https://ex.com/a"], "the private hop is never requested");
+        calls.borrow_mut().clear();
+        // a name that resolves private (the fake resolver's `lan.`) is refused at the hop, not only at the first URL
+        let r = rt.block_on(follow("https://ex.com/a", fake(Some("http://lan.ex.com:8765/admin"))));
         assert_eq!(r.err(), Some("private_address"));
         assert_eq!(*calls.borrow(), ["https://ex.com/a"], "the private hop is never requested");
         calls.borrow_mut().clear();

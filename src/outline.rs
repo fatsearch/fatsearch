@@ -915,12 +915,13 @@ pub fn chunks_of(text: &[String]) -> Vec<Vec<String>> {
     let (mut parts, mut cur, mut n) = (Vec::new(), Vec::new(), 0);
     for ln in text {
         let mut ln = ln.as_str();
-        // one huge line: parts of 95% of the cap, each cut found in one pass (a 660k-char JSON island line)
+        // a line longer than a part fills this part's room to 95% of the cap, then whole parts of that, each cut
+        // found in one pass (a 660k-char JSON island line); a heading above it stays with its first piece
         while tok_cut(ln, limit::<usize>("read_cap")) < ln.len() {
-            let h = ln[..tok_cut(ln, limit::<usize>("read_cap") - 50)].to_string();
-            ln = &ln[h.len()..];
-            parts.extend((!cur.is_empty()).then(|| std::mem::take(&mut cur)));
-            parts.push(vec![h]);
+            let h = tok_cut(ln, (limit::<usize>("read_cap") - 50).saturating_sub(n));
+            cur.extend((h > 0).then(|| ln[..h].to_string()));
+            ln = &ln[h..];
+            parts.push(std::mem::take(&mut cur));
             n = 0;
         }
         if n + tok(ln) > limit::<usize>("read_cap") && !cur.is_empty() {
@@ -1003,17 +1004,37 @@ fn whole(doc: &Doc, id: &str, ks: &[usize]) -> Vec<String> {
 }
 
 /// `full`: the whole page as served, or (`uN#k full`, k a section: cli `read`) section k with all of its
-/// subsections (a comment: its tree).
-pub fn read_full(p: &Page, k: Option<usize>, part: usize) -> Shown {
+/// subsections (a comment: its tree). A regular file (`fats u1 full > page.md`) and `json` get all of it in one
+/// answer; a terminal, a pipe and MCP read it a part at a time, `more` the next, the `=` line naming the file move
+/// (a shell tool reads stdout through a pipe: one answer stays one part). A `more` after the whole text is
+/// `full complete`, never the text again.
+pub fn read_full(p: &Page, k: Option<usize>, part: usize, json: bool) -> Shown {
     let (doc, id, b, at) = (p.doc, &p.id, bin(), k.map(|k| format!("#{k}")).unwrap_or_default());
-    let parts = chunks_of(&whole(doc, id, &k.map_or_else(|| (1..=doc.served()).collect(), |k| span(doc, k))));
+    let text = whole(doc, id, &k.map_or_else(|| (1..=doc.served()).collect(), |k| span(doc, k)));
+    let fence = crate::cli::FENCE.get().is_some();
+    let at_once = part == 0 && !fence && (json || to_file());
+    let chunks = chunks_of(&text);
+    let (read, parts) = if at_once { (chunks.len().saturating_sub(1), vec![text]) } else { (part, chunks) };
     if part >= parts.len() {
         return (vec![format!("= {}{at} full complete · {} parts · up {b} {id}", p.eq, parts.len())], None);
     }
-    let mut lines = vec![format!("= {}{at} full · part {}/{} · up {b} {id}", p.eq, part + 1, parts.len())];
+    let size = ksize(parts[part].iter().map(|l| tok(l)).sum());
+    let of = if at_once { format!("{size}tok") } else { format!("part {}/{}", part + 1, parts.len()) };
+    let to = (!fence && parts.len() > 1).then(|| format!(" · whole: {b} {id}{at} full > page.md"));
+    let mut lines = vec![format!("= {}{at} full · {of} · up {b} {id}{}", p.eq, to.unwrap_or_default())];
     lines.extend(parts[part].iter().cloned());
     lines.extend(more(&parts, part, &format!("{b} more")));
-    (lines, Some(Cursor { full: true, part, k, ..Cursor::default() }))
+    (lines, Some(Cursor { full: true, part: read, k, ..Cursor::default() }))
+}
+
+/// stdout is a regular file (a shell's `> page.md`), never a terminal, a pipe or the null device: `/dev/stdout`
+/// is the fd's own file on Linux (a /proc link) and macOS (fdesc); Windows has none, and a pipe's handle has file
+/// metadata there: its device kind is asked (`cli::file_type`, 1 = disk).
+fn to_file() -> bool {
+    #[cfg(windows)]
+    return crate::cli::file_type(std::os::windows::io::AsRawHandle::as_raw_handle(&std::io::stdout())) == 1;
+    #[cfg(not(windows))]
+    std::fs::metadata("/dev/stdout").is_ok_and(|m| m.is_file())
 }
 
 /// The served sections that are comments (`clean::COMMENT`), in page order (`clean::build_doc` keeps a thread).
@@ -1089,12 +1110,12 @@ pub fn lead(l: &str) -> String {
     short(&pieces.map(|x| x.1).collect::<Vec<_>>().join(PIECE), 200)
 }
 
-type Pager<'a> = (usize, Option<usize>, usize, &'a str);
+pub type Pager<'a> = (usize, Option<usize>, usize, &'a str);
 
 /// THE paged list (`links`, `cards`, `media`, `comments`): the rows from `off` under the `cap` tokens (or `limit`
 /// rows), then `+N → … <word> from:K` (the next page named in the hint, no session cursor: it works after any other
-/// command), else `(end of <word>, N)`: the last page says so.
-fn paged(at: &str, head: String, rows: &[String], (off, limit, cap, word): Pager) -> Shown {
+/// command), else `(end of <word>, N)`: the last page says so (past one row: one value is its own end).
+pub fn paged(at: &str, head: String, rows: &[String], (off, limit, cap, word): Pager) -> Shown {
     let rest = &rows[off.min(rows.len())..];
     // `limit:` = at most the rows asked, `list_rows` at most, under the cap too; a bigger one is named
     let max = crate::settings::limit("list_rows");
@@ -1102,7 +1123,7 @@ fn paged(at: &str, head: String, rows: &[String], (off, limit, cap, word): Pager
     lines.extend(limit.filter(|&n| n > max).map(|n| format!("! ignored limit:{n} · max {max}")));
     let shown = cap_rows(&mut lines, rest, 0, (cap, 1, n));
     match rest.len() - shown {
-        0 if rows.is_empty() => {}
+        0 if rows.len() < 2 => {}
         0 => lines.push(format!("(end of {word}, {})", rows.len())),
         n => lines.push(format!("+{n} → {} {at} {word} from:{}", bin(), off + shown + 1)),
     }

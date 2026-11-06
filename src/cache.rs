@@ -263,6 +263,10 @@ pub struct Meta {
     pub charset: String,
     /// `off` = a paid ask, one provider at a time (`fetch::Plan::hedged`), said on every read; empty = hedged.
     pub hedge: String,
+    /// The served answer's status (`HTTP 200`) and its headers, lower case as `Raw::headers` keeps them, no
+    /// credential (`provider::header_lines`): `fats u3 headers`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub headers: String,
     /// Keys this build does not know survive a rewrite.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -327,7 +331,7 @@ impl Meta {
                 _ if h.upto > 0.0 => format!("{p}:{}✗≤${:.4} (unverified)", h.code, h.upto),
                 // `stats` adds the provider's own reason (`provider::reason`, ≤ 50 chars, no body text)
                 c if p != "plain" && (unbilled(c) || c.starts_with("http_5") || c.starts_with("blocked_")) => {
-                    let why = if shape && c == "provider_error" && !h.why.is_empty() {
+                    let why = if shape && crate::provider::OWN_REASON.contains(&c) && !h.why.is_empty() {
                         format!(", {}", h.why)
                     } else {
                         String::new()
@@ -584,11 +588,12 @@ impl Cache {
         jsave(&self.run_file(n, "json"), r)
     }
 
-    /// Run `n`'s end was shown (`cli::footer`): written under its lock, read again there; a busy lock = it runs
-    /// (or a reader probes): told next time.
+    /// Run `n`'s end was shown (`cli::footer`): the file read again after the lock is probed, written when the lock
+    /// is free or the file holds `done` (the run's last write: its lock outlives it while the process exits, on
+    /// Windows until its launcher reaps it); a busy lock and no `done` = it runs (or a reader probes): told next time.
     pub fn run_tell(&self, n: usize) {
-        let Some(_lock) = File::create(self.run_file(n, "lock")).ok().filter(|f| f.try_lock().is_ok()) else { return };
-        if let Some(r) = jload::<Detached>(&self.run_file(n, "json")) {
+        let free = File::create(self.run_file(n, "lock")).ok().filter(|f| f.try_lock().is_ok());
+        if let Some(r) = jload::<Detached>(&self.run_file(n, "json")).filter(|r| free.is_some() || r.done.is_some()) {
             self.run_put(n, &Detached { told: true, ..r }).ok(); // a footer line, shown again at worst
         }
     }
@@ -936,20 +941,25 @@ mod tests {
     }
 
     /// The footer read a run, the run's process wrote `done` and let go, the footer wrote its stale copy
-    /// back without `done` (`! abandoned` from then on). `told` is now written under the run's lock, read again.
+    /// back without `done` (`! abandoned` from then on). `told` is written after the lock is probed, read again:
+    /// under a free lock, or once the file holds `done` (a lock still held while the run's process exits).
     #[test]
     fn a_run_is_told_under_its_lock() {
         let root = crate::scratch::Scratch::new("tell");
         let c = Cache::at(root.to_path_buf(), "t".into());
-        let ended = Detached { url: "https://ex.com/".into(), done: Some(Done::default()), ..Detached::default() };
-        c.run_put(1, &ended).expect("run file");
+        let running = Detached { url: "https://ex.com/".into(), ..Detached::default() };
+        c.run_put(1, &running).expect("run file");
         let lock = c.run_claim(1).expect("the run's lock");
         assert!(c.run(1).is_some_and(|r| r.1), "a held lock = alive");
         c.run_tell(1);
-        assert!(c.run(1).is_some_and(|r| !r.0.told), "busy: nothing written");
-        drop(lock);
+        assert!(c.run(1).is_some_and(|r| !r.0.told), "busy, no done: nothing written");
+        c.run_put(1, &Detached { done: Some(Done::default()), ..running.clone() }).expect("done");
         c.run_tell(1);
-        assert!(c.run(1).is_some_and(|r| r.0.told && r.0.done.is_some() && !r.1), "free: told, its done kept");
+        assert!(c.run(1).is_some_and(|r| r.0.told && r.0.done.is_some() && r.1), "done, lock still held: told");
+        c.run_put(2, &running).expect("run file");
+        drop(lock);
+        c.run_tell(2);
+        assert!(c.run(2).is_some_and(|r| r.0.told && r.0.done.is_none() && !r.1), "free: told (abandoned)");
     }
 
     /// A cache hit logs its job on the page once, never for the job that fetched it.

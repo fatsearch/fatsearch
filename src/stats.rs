@@ -86,10 +86,7 @@ pub fn status(c: &Cache) -> Out {
     lines.extend(health(&metas));
     lines.push(account_line(c, crate::cache::now()));
     lines.push(crate::telemetry::status());
-    lines.push(match FENCE.get() {
-        Some(_) => "mcp: serving (this process) · local files from the working directory + the cache".into(),
-        None => crate::mcp::hosts_row(b),
-    });
+    lines.push(crate::mcp::hosts_row(b));
     let at = c.st.cursor.as_ref().filter(|k| k.u > 0);
     let at = at.map(|k| format!("at u{}{} · ", k.u, k.k.map(|s| format!("#{s}")).unwrap_or_default()));
     let n = c.st.u.len();
@@ -409,7 +406,7 @@ pub fn config() -> Out {
     lines.push(format!(
         "env: FATS_SESSION FATS_CACHE FATS_KEY_DIR FATS_JSON FATS_NOCACHE FATS_OFFLINE FATS_ALLOW_PRIVATE FATS_CHUNK FATS_ACCOUNT_TTL FATS_ACCEPT_MD FATS_TELEMETRY FATS_TELEMETRY_DEBUG DO_NOT_TRACK · status: {b}"
     ));
-    let mut out = Out::new(lines);
+    let mut out = Out::new(lines.into_iter().chain(crate::provider::proxy_note().map(String::from)).collect());
     out.warn(settings::unknown(s));
     out
 }
@@ -532,22 +529,33 @@ fn instant_row() -> Row {
     ("instant", instant, "default · wait:0..300 fetch:N".into())
 }
 
-/// `fats setup <name>` (its key form, `setup::agent`); `fats setup <name> on|off`, `fats config set <name> <value>`,
-/// `fats config unset <name>`: one `settings.json` change, read from the next command on; `dry:true` names it and
-/// writes nothing. Refused = `! refused · <why>`.
+/// `fats setup <name>` (its key form, `setup::agent`; `stop` ends it, `setup::stop`); `fats setup <name> on|off`,
+/// `fats config set <name> <value>`, `fats config unset <name>`: one `settings.json` change, read from the next
+/// command on; `dry:true` names it and writes nothing. Refused = `! refused · <why>`, or the fence rule's own row
+/// (`settings::guard`), dry too.
 pub fn change(cmd: &crate::lang::Cmd) -> Out {
     let s: Vec<&str> = cmd.sub.iter().map(String::as_str).collect();
+    let (fenced, dry) = (settings::guard(&s, cmd.has("setup"), FENCE.get().is_some()), cmd.flag("dry"));
+    let head = if cmd.has("setup") { "setup" } else { "config" };
+    // a refused change prints its `=` line first, as every whole-command failure does
+    let fail = |code: &str, row: String| Out::fail(code, format!("= ! {code} {head} {} · $0", s.join(" ")), row);
     let r = match s[..] {
-        [n] if cmd.has("setup") => return crate::setup::agent(n, cmd.flag("dry")),
-        _ if cmd.flag("dry") => Ok(()),
+        // the hosts' state is read anywhere; a host's config is never edited from a tool call
+        ["mcp", ref h @ ..] if h.is_empty() || fenced.is_none() => return crate::mcp::add(h, dry),
+        [n] if cmd.has("setup") => return crate::setup::agent(n, dry),
+        [n, "stop"] if cmd.has("setup") => match crate::setup::stop(n, dry) {
+            Ok(said) => return Out::new(vec![format!("= {}setup {n} {said} · $0", if dry { "dry " } else { "" })]),
+            Err(e) => return fail("cache_write", format!("! cache_write setup {n} · {e}")),
+        },
+        _ if let Some((code, row)) = fenced => return fail(code, row),
+        _ if dry => Ok(()),
         ["telemetry", v] if cmd.has("setup") => settings::set("telemetry", v),
         [n, v] if cmd.has("setup") => settings::set_on(n, v == "on"),
         ["set", n, v] => settings::set(n, v),
         ["unset", n] => settings::unset(n),
         _ => Err(format!("{} config set <name> <value> · names: {} config", bin(), bin())),
     };
-    let head = if cmd.has("setup") { "setup" } else { "config" };
-    let what = if cmd.flag("dry") { "would save" } else { "saved" };
+    let what = if dry { "would save" } else { "saved" };
     match r {
         Ok(()) => {
             let row = format!("= {head} {} · {what} {} · from the next command", s.join(" "), settings::PREFS);
@@ -555,7 +563,7 @@ pub fn change(cmd: &crate::lang::Cmd) -> Out {
             let off = matches!(s[..], [_, "off"]) && cmd.has("setup");
             Out::new([row].into_iter().chain(crate::setup::bak_row().filter(|_| off)).collect())
         }
-        Err(e) => Out { rc: 1, ..Out::new(vec![format!("! refused · {e}")]).with("error", "refused") },
+        Err(e) => fail("refused", format!("! refused · {e}")),
     }
 }
 
@@ -621,8 +629,7 @@ const READS: [(Api, &str); 4] =
 pub fn account_rows(a: &Account, limits: Option<&str>) -> Vec<String> {
     let p = a.provider.as_str();
     // a read cut at `wait:` (`provider::late`) gets more time
-    let arg = if a.why.starts_with("wait:") { "wait:30" } else { "" };
-    let at = At { id: "account", arg, ..Default::default() };
+    let at = At { id: "account", arg: if a.why.starts_with("wait:") { "wait:30" } else { "" }, ..Default::default() };
     let bang = |code: &str, what: &str| crate::lang::bang(p, code, what, &at) + &crate::provider::pages(code, [p]);
     let n = |v: Option<u64>| v.map_or("n/a".into(), group);
     match a.code.as_str() {
@@ -735,9 +742,12 @@ pub fn setup(zone: Option<&str>, import: bool, dry: bool, wait: Duration) -> Out
     let keyed = KEYS.iter().zip(&found).filter_map(|(t, k)| Some((*t, k.as_ref()?.0.clone())));
     let calls = if dry { Vec::new() } else { keyed.map(|(t, key)| crate::provider::check_key(t, key)).collect() };
     let mut reads = crate::provider::all_within(calls, wait).into_iter();
+    // no key at all: one choice, the cheapest searcher's row (the `=` line's arrow), never every provider's
+    let first = found.iter().all(Option::is_none).then(|| fetch::searchers().first().copied()).flatten();
     for (t, found) in KEYS.into_iter().zip(found) {
         let (s, keyed) = (t.spec(), found.is_some());
         let (head, mut rows) = match found {
+            None if first.is_some_and(|f| f != s.short) => ("none".into(), Vec::new()),
             None => ("none".into(), no_key_rows(s.short, true)),
             Some((k, at)) if dry => {
                 let row = crate::provider::check_call(t).0.row();
@@ -1022,9 +1032,7 @@ pub fn weekly_of(root: &Path, week: &str) -> Value {
         }
     }
     let tiers = v["tier"].as_object_mut().into_iter().flat_map(|t| t.values_mut()).filter_map(Value::as_object_mut);
-    for t in tiers {
-        ["ok", "fail", "billed", "upto"].into_iter().for_each(|k| _ = t.entry(k).or_insert(0.into()));
-    }
+    tiers.for_each(|t| ["ok", "fail", "billed", "upto"].into_iter().for_each(|k| _ = t.entry(k).or_insert(0.into())));
     v
 }
 

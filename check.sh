@@ -5,7 +5,6 @@
 #   ./check.sh full    at task end and in CI: quick + clippy (shipped features) · deny · cooldown (skipped
 #                      offline: CI runs it in its own job, with the network) · the release build · no fake hook in
 #                      it · its size
-# Parity (tests/parity.rs) needs a reference output that is not in this repository: it skips without FATS_PARITY.
 set -u
 cd "$(dirname "$0")" || exit 2
 mode=${1:-quick}

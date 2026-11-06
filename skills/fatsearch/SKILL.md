@@ -6,7 +6,7 @@ description: >-
   inside (`fats u1 price`), cards, links. Free fetch first, then the user's key; cached. Use for ANY question
   whose answer is on the web now: a price, "what X said today", "X vs Y", "cheapest", news, "that page" with no URL
   (search for it), "read / check this URL or PDF". Never answer such a question from memory, never ask for a URL
-  first. Not for scrapers, bulk data, logins.
+  first. API URLs too (JSON gets a key map). Not for: repo facts (`gh`), logged-in pages (a browser), bulk pipelines.
 ---
 
 # fatsearch (command: `fats`)

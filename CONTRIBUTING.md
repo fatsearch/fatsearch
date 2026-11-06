@@ -16,8 +16,6 @@ reflink: no copy, no extra disk) and touches every source file, so it skips a co
 Never share one `target/` between worktrees: cargo names a path crate's artifacts relative to its workspace, so
 every worktree would run another worktree's `fats` build.
 
-The parity test (`tests/parity.rs`) compares the output with a private reference and skips unless `FATS_PARITY`
-points at that reference's output. You do not need it to contribute.
 
 - A wrong output is a wrong rule in the function that owns it: fix the rule and add the failing case as a
   test. Tests never touch the network.
